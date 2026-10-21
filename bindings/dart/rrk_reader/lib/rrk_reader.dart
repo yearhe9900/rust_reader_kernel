@@ -12,7 +12,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 /// ABI 版本（与 rrk-ffi 的 RRK_ABI_VERSION 对齐，启动校验）。
-const int kRrkAbiVersion = 1;
+const int kRrkAbiVersion = 2;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -35,10 +35,24 @@ typedef _QueryNative = Uint32 Function(Uint64, Pointer<Pointer<Uint8>>, Pointer<
 typedef _QueryDart = int Function(int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _ErrorNative = Uint32 Function(Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _ErrorDart = int Function(Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
-typedef _PagesNative = Uint32 Function(Uint64, Uint32, Float, Float, Float, Float,
-    Float, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
-typedef _PagesDart = int Function(int, int, double, double, double, double, double,
-    Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PagesNative = Uint32 Function(Uint64, Uint32, Pointer<Utf8>, IntPtr, Float, Float,
+    Float, Float, Float, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PagesDart = int Function(int, int, Pointer<Utf8>, int, double, double, double, double,
+    double, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PageAtNative = Uint32 Function(Uint64, Uint32, Uint32, Pointer<Utf8>, IntPtr, Float,
+    Float, Float, Float, Float, Pointer<Uint32>);
+typedef _PageAtDart = int Function(int, int, int, Pointer<Utf8>, int, double, double, double,
+    double, double, Pointer<Uint32>);
+typedef _HitNative = Uint32 Function(Uint64, Uint32, Uint32, Float, Float, Pointer<Utf8>,
+    IntPtr, Float, Float, Float, Float, Float, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _HitDart = int Function(int, int, int, double, double, Pointer<Utf8>, int, double,
+    double, double, double, double, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PrefetchNative = Uint32 Function(Uint64, Uint32, Pointer<Utf8>, IntPtr, Float, Float,
+    Float, Float, Float);
+typedef _PrefetchDart = int Function(int, int, Pointer<Utf8>, int, double, double, double,
+    double, double);
+typedef _CacheCfgNative = Uint32 Function(Pointer<Utf8>, IntPtr, IntPtr);
+typedef _CacheCfgDart = int Function(Pointer<Utf8>, int, int);
 typedef _RenderNative = Uint32 Function(
     Uint64, Uint32, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint32>, Pointer<Uint32>);
 typedef _RenderDart = int Function(
@@ -64,6 +78,11 @@ class _Bindings {
         loadChapter =
             lib.lookupFunction<_LoadChapterNative, _LoadChapterDart>('rrk_load_chapter'),
         pagesJson = lib.lookupFunction<_PagesNative, _PagesDart>('rrk_pages_json'),
+        pageAt = lib.lookupFunction<_PageAtNative, _PageAtDart>('rrk_page_at'),
+        hitTest = lib.lookupFunction<_HitNative, _HitDart>('rrk_hit_test'),
+        prefetch = lib.lookupFunction<_PrefetchNative, _PrefetchDart>('rrk_prefetch'),
+        cacheConfigure =
+            lib.lookupFunction<_CacheCfgNative, _CacheCfgDart>('rrk_cache_configure'),
         renderPage = lib.lookupFunction<_RenderNative, _RenderDart>('rrk_render_page'),
         bufFree = lib.lookupFunction<_BufFreeNative, _BufFreeDart>('rrk_buf_free'),
         abiVersion = lib.lookupFunction<_AbiNative, _AbiDart>('rrk_abi_version');
@@ -77,6 +96,10 @@ class _Bindings {
   final _ErrorDart lastError;
   final _LoadChapterDart loadChapter;
   final _PagesDart pagesJson;
+  final _PageAtDart pageAt;
+  final _HitDart hitTest;
+  final _PrefetchDart prefetch;
+  final _CacheCfgDart cacheConfigure;
   final _RenderDart renderPage;
   final _BufFreeDart bufFree;
   final _AbiDart abiVersion;
@@ -108,6 +131,18 @@ class RrkEngine {
       throw RrkException(1999, 'ABI 版本不匹配：内核=$abi，封装=$kRrkAbiVersion');
     }
     _b = b;
+  }
+
+  /// 配置三要素缓存（目录 + 内存上限 MB）。
+  static void configureCache(String dir, {int memBytes = 64 * 1024 * 1024}) {
+    final b = _bindings;
+    final p = dir.toNativeUtf8();
+    try {
+      final code = b.cacheConfigure(p, utf8.encode(dir).length, memBytes);
+      if (code != 0) throw _lastError(b);
+    } finally {
+      malloc.free(p);
+    }
   }
 
   /// 打开一本书（文件路径）。
@@ -394,6 +429,7 @@ class RrkBook {
   /// 排版一章 → 页数组（几何模式）。
   List<ReaderPage> pagesOf(
     int chapterId, {
+    String fontFamily = '',
     double fontSize = 18.0,
     double lineHeight = 1.6,
     double width = 390.0,
@@ -404,17 +440,89 @@ class RrkBook {
     final b = _bindings;
     final outPtr = malloc<Pointer<Uint8>>();
     final outLen = malloc<IntPtr>();
+    final fontPtr = fontFamily.toNativeUtf8();
     try {
-      final code = b.pagesJson(_handle, chapterId, fontSize, lineHeight, width, height, dpr,
-          outPtr, outLen);
+      final code = b.pagesJson(_handle, chapterId, fontPtr, utf8.encode(fontFamily).length, fontSize,
+          lineHeight, width, height, dpr, outPtr, outLen);
       if (code != 0) _throwCode(code);
       final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '[]';
       return (jsonDecode(json) as List<dynamic>)
           .map((e) => ReaderPage._fromJson(e as Map<String, dynamic>))
           .toList();
     } finally {
+      malloc.free(fontPtr);
       malloc.free(outPtr);
       malloc.free(outLen);
+    }
+  }
+
+  /// 语义偏移 → 页下标（进度恢复；缓存命中免排版）。
+  int pageAt(int chapterId, int charOffset,
+      {String fontFamily = '',
+      double fontSize = 18.0,
+      double lineHeight = 1.6,
+      double width = 390.0,
+      double height = 842.0,
+      double dpr = 3.0}) {
+    _check();
+    final b = _bindings;
+    final fontPtr = fontFamily.toNativeUtf8();
+    final out = malloc<Uint32>();
+    try {
+      final code = b.pageAt(_handle, chapterId, charOffset, fontPtr, utf8.encode(fontFamily).length,
+          fontSize, lineHeight, width, height, dpr, out);
+      if (code != 0) _throwCode(code);
+      return out.value;
+    } finally {
+      malloc.free(fontPtr);
+      malloc.free(out);
+    }
+  }
+
+  /// 页内命中测试（页内 x,y → 语义偏移，run 级粒度）。
+  (int offset, int line) hitTest(int chapterId, int pageIndex, double x, double y,
+      {String fontFamily = '',
+      double fontSize = 18.0,
+      double lineHeight = 1.6,
+      double width = 390.0,
+      double height = 842.0,
+      double dpr = 3.0}) {
+    _check();
+    final b = _bindings;
+    final fontPtr = fontFamily.toNativeUtf8();
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.hitTest(_handle, chapterId, pageIndex, x, y, fontPtr, utf8.encode(fontFamily).length,
+          fontSize, lineHeight, width, height, dpr, outPtr, outLen);
+      if (code != 0) _throwCode(code);
+      final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '{}';
+      final m = jsonDecode(json) as Map<String, dynamic>;
+      return (m['offset'] as int, m['line'] as int);
+    } finally {
+      malloc.free(fontPtr);
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 远跳预取：预热本章 + 相邻章（走缓存链路）。
+  void prefetch(int chapterId,
+      {String fontFamily = '',
+      double fontSize = 18.0,
+      double lineHeight = 1.6,
+      double width = 390.0,
+      double height = 842.0,
+      double dpr = 3.0}) {
+    _check();
+    final b = _bindings;
+    final fontPtr = fontFamily.toNativeUtf8();
+    try {
+      final code = b.prefetch(_handle, chapterId, fontPtr, utf8.encode(fontFamily).length, fontSize,
+          lineHeight, width, height, dpr);
+      if (code != 0) _throwCode(code);
+    } finally {
+      malloc.free(fontPtr);
     }
   }
 

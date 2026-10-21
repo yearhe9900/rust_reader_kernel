@@ -2,6 +2,8 @@
 //
 // 走通 Dart → C ABI → Rust 内核全链路：打开书 → meta/toc/章索引 → 加载一章。
 
+import 'dart:io';
+
 import 'package:rrk_reader/rrk_reader.dart';
 
 void main(List<String> args) {
@@ -13,6 +15,7 @@ void main(List<String> args) {
   RrkEngine.init(args[0]);
   print('ABI 版本校验通过 (${kRrkAbiVersion})');
 
+  RrkEngine.configureCache('${Directory.systemTemp.path}/rrk_smoke_cache');
   final book = RrkEngine.openBook(args[1]);
   print('打开耗时: ${sw.elapsedMilliseconds} ms');
 
@@ -51,6 +54,15 @@ void main(List<String> args) {
       print('  页 ${pg.index}: ${pg.lines.length} 行 / ${pg.runs.length} run '
           '(${pg.start}..${pg.end})');
     }
+  }
+
+  if (chapters.isNotEmpty) {
+    final t0 = Stopwatch()..start();
+    final again = book.pagesOf(chapters.length > 1 ? 1 : 0, width: 390, height: 842);
+    final cachedMs = t0.elapsedMicroseconds / 1000.0;
+    final page = book.pageAt(chapters.length > 1 ? 1 : 0, again.first.start, width: 390, height: 842);
+    print('缓存命中 pagesOf: ${again.length} 页（${cachedMs.toStringAsFixed(1)} ms）; '
+        'pageAt(start)=${page}');
   }
 
   book.close();
