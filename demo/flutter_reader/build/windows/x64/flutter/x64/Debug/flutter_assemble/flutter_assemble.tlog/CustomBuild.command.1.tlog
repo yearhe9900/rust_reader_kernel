@@ -1,0 +1,28 @@
+^D:\WORKSPACE\PERSONAL\RUST_READER_KERNEL\DEMO\FLUTTER_READER\BUILD\WINDOWS\X64\CMAKEFILES\3DB1C0C5CF2DC89E1E3161F68AB070B1\FLUTTER_WINDOWS.DLL.RULE
+setlocal
+"D:\Microsoft Visual Studio\2022\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -E env FLUTTER_ROOT=C:\src\flutter PROJECT_DIR=D:\Workspace\personal\rust_reader_kernel\demo\flutter_reader FLUTTER_ROOT=C:\src\flutter FLUTTER_EPHEMERAL_DIR=D:\Workspace\personal\rust_reader_kernel\demo\flutter_reader\windows\flutter\ephemeral PROJECT_DIR=D:\Workspace\personal\rust_reader_kernel\demo\flutter_reader FLUTTER_TARGET=D:\Workspace\personal\rust_reader_kernel\demo\flutter_reader\lib\main.dart DART_DEFINES=UlJLX0xJQj1EOlxXb3Jrc3BhY2VccGVyc29uYWxccnVzdF9yZWFkZXJfa2VybmVsXHRhcmdldFxyZWxlYXNlXHJya19mZmkuZGxs,Qk9PSz1EOlxXb3Jrc3BhY2VccGVyc29uYWxccnVzdF9yZWFkZXJfa2VybmVsXHRtcF9ib29rXOOAiuaIkeW4iOWFhOWunuWcqOWkqueos+WBpeS6huOAi++8iOagoeWvueeJiOWFqOacrO+8ieS9nOiAhe+8muiogOW9kuato+S8oC50eHQ=,RkxVVFRFUl9CVUlMRF9OQU1FPTAuMS4w,RkxVVFRFUl9WRVJTSU9OPTMuNDcuNQ==,RkxVVFRFUl9DSEFOTkVMPXN0YWJsZQ==,RkxVVFRFUl9HSVRfVVJMPWh0dHBzOi8vZ2l0aHViLmNvbS9mbHV0dGVyL2ZsdXR0ZXIuZ2l0,RkxVVFRFUl9GUkFNRVdPUktfUkVWSVNJT049NmExOWNjYTU2NA==,RkxVVFRFUl9FTkdJTkVfUkVWSVNJT049YWY3ZTc5NmUxNg==,RkxVVFRFUl9EQVJUX1ZFUlNJT049My4xMy40 DART_OBFUSCATION=false TRACK_WIDGET_CREATION=true TREE_SHAKE_ICONS=false PACKAGE_CONFIG=D:\Workspace\personal\rust_reader_kernel\demo\flutter_reader\.dart_tool\package_config.json C:/src/flutter/packages/flutter_tools/bin/tool_backend.bat windows-x64 Debug
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\WORKSPACE\PERSONAL\RUST_READER_KERNEL\DEMO\FLUTTER_READER\BUILD\WINDOWS\X64\CMAKEFILES\1801FDF7D8F3A8094DA1ACFF89504ECC\FLUTTER_ASSEMBLE.RULE
+setlocal
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\WORKSPACE\PERSONAL\RUST_READER_KERNEL\DEMO\FLUTTER_READER\WINDOWS\FLUTTER\CMAKELISTS.TXT
+setlocal
+"D:\Microsoft Visual Studio\2022\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SD:/Workspace/personal/rust_reader_kernel/demo/flutter_reader/windows -BD:/Workspace/personal/rust_reader_kernel/demo/flutter_reader/build/windows/x64 --check-stamp-file D:/Workspace/personal/rust_reader_kernel/demo/flutter_reader/build/windows/x64/flutter/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

@@ -19,12 +19,17 @@ flutter pub get
 ## 运行（指定内核库与测试书）
 
 ```sh
-flutter run ^
+flutter run -d windows --release ^
   --dart-define=RRK_LIB=D:/Workspace/personal/rust_reader_kernel/target/release/rrk_ffi.dll ^
   --dart-define=BOOK=D:/Workspace/personal/rust_reader_kernel/tmp_book/《我师兄实在太稳健了》（校对版全本）作者：言归正传.txt
 ```
 
 Windows 用 `^` 续行（bash 用 `\`）。`rrk_ffi.dll` 先在仓库根 `cargo build --release -p rrk-ffi` 构建。
+
+> **必须带 `--release`**：`flutter run` 默认构建 Debug 版，Debug 版依赖
+> `MSVCP140D.dll`（VC++ Debug 运行时）——它只随 Visual Studio 安装、不进系统，
+> 双击 exe 会弹「由于找不到 MSVCP140D.dll，无法继续执行代码」。
+> Release 版链的是普通 `MSVCP140.dll`，任何机器都能跑（性能也对）。
 
 ## 验证（agent 可直接跑）
 
