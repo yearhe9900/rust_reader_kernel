@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 全量单测
+        run: cargo test --workspace
+      - name: rrk-inspect 冒烟（样张）
+        run: |
+          cargo build --release -p rrk-inspect
+          ./target/release/rrk-inspect tmp_book/fmt_gen_cjk_nav.epub >/dev/null
+
+  dart-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 构建 rrk_ffi
+        run: cargo build --release -p rrk-ffi
+      - name: rrk_reader analyze + 冒烟
+        working-directory: bindings/dart/rrk_reader
+        run: |
+          dart pub get
+          dart analyze
+          dart run example/smoke.dart ../../target/release/librrk_ffi.so ../../tmp_book/fmt_gen_long_line.txt
+
+  flutter-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: demo analyze + test
+        working-directory: demo/flutter_reader
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+  build-ffi:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 构建 rrk_ffi（预编译产物）
+        run: cargo build --release -p rrk-ffi
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: rrk_ffi-${{ matrix.os }}
+          path: |
+            target/release/rrk_ffi.dll
+            target/release/librrk_ffi.so
+            target/release/librrk_ffi.dylib
+          if-no-files-found: ignore

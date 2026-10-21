@@ -259,7 +259,8 @@ pub trait BookSource: Send {
 - **权重零解压**：`estimate_weights` 用压缩后大小/条目尺寸估算（《全链路》§3.1「建索引不搬内容」口径）；
 - **错误可降级**：结构损坏 → 返回 `CorruptData` 并可退「纯文本流式阅读」模式（全链路 §10.1）；
 - **全自研红线**（§0.3-4）：格式解析、解压算法（PalmDOC LZ77、HUFF/CDIC）、PDF 解析与光栅化、分章/清洗/缓存全部为本仓库自研代码；**禁止** pdfium、mupdf、unrar、WebKit、闭源 SDK、预编译黑盒二进制及其绑定；
-- **依赖白名单**：第三方 crate 仅限「纯 Rust、开源、可审计、可 fork、许可宽松（MIT/Apache-2.0/BSD）」的基础件；C 绑定原则禁用，唯一例外是构建期从源码编译并登记审计的小型压缩原语（miniz_oxide 类）。当前白名单：`bytes`/`rkyv`/`smallvec`/`memmap2`/`flate2(rust_backend)`/`ruzstd`/`chardetng`/`encoding_rs`/`zip|rc-zip`（审计不符即自研 zip 读取，中央目录解析本就不难）/`html5ever|quick-xml`/`image`/`fast_image_resize`/`tiny-skia`/`rayon`/`crossbeam`/`unicode-linebreak`/`parley|cosmic-text`（纯 Rust 可 fork；不可控即走 §4.2 逃生门收回自研）。白名单变更需评审并登记。
+- **依赖白名单**：第三方 crate 仅限「纯 Rust、开源、可审计、可 fork、许可宽松（MIT/Apache-2.0/BSD）」的基础件；C 绑定原则禁用，唯一例外是构建期从源码编译并登记审计的小型压缩原语（miniz_oxide 类）。当前白名单：`bytes`/`rkyv`/`smallvec`/`memmap2`/`flate2(rust_backend)`/`ruzstd`/`chardetng`/`encoding_rs`/`zip|rc-zip`（审计不符即自研 zip 读取，中央目录解析本就不难）/`html5ever|quick-xml`/`image`/`fast_image_resize`/`tiny-skia`/`rayon`/`crossbeam`/`unicode-linebreak`/`parley|cosmic-text`（纯 Rust 可 fork；不可控即走 §4.2 逃生门收回自研）/`swash`/`fontique`/`zeno`/`peniko`（parley 的 shaping/字形/字体库传递依赖，均纯 Rust；CFF 轮廓经自研 sfnt 封装喂 swash 光栅）。白名单变更需评审并登记。
+  **2026-10-21 启用确认**：实际引入 = `encoding_rs`/`chardetng`/`flate2`/`tiny-skia`/`swash`/`image`/`parley`（+传递 `fontique`/`zeno`/`peniko`）；`rkyv` 未用（布局缓存 payload 用自研 RLAY 编解码）；`cosmic-text` 仅对照基准（dev 依赖）。
 
 ### 3.3 EPUB 完整实现（`rrk-epub`）
 
