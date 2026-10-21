@@ -1,0 +1,15 @@
+[package]
+name = "rrk-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：排版引擎（parley：测量/断行/BiDi/分页 → LayoutPage）"
+
+[dependencies]
+rrk-model.workspace = true
+parley = "0.5"
+
+[dev-dependencies]
+rrk-format.workspace = true
+rrk-txt.workspace = true
+rrk-cache.workspace = true

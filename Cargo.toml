@@ -11,6 +11,7 @@ members = [
     "crates/rrk-cbz",
     "crates/rrk-pdf",
     "crates/rrk-cache",
+    "crates/rrk-layout",
     "crates/rrk-kernel",
     "crates/rrk-ffi",
     "crates/rrk-inspect",
@@ -33,6 +34,7 @@ rrk-mobi = { path = "crates/rrk-mobi" }
 rrk-cbz = { path = "crates/rrk-cbz" }
 rrk-pdf = { path = "crates/rrk-pdf" }
 rrk-cache = { path = "crates/rrk-cache" }
+rrk-layout = { path = "crates/rrk-layout" }
 rrk-kernel = { path = "crates/rrk-kernel" }
 
 # 依赖白名单（方案 §3.2）：纯 Rust、可审计、可 fork、许可宽松。
