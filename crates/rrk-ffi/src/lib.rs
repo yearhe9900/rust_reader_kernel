@@ -15,7 +15,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use rrk_kernel::{BookHandle, Kernel};
-use rrk_model::{Block, BookMeta, ChapterEntry, Inline, RrkError, RrkErrorKind, TocNode};
+use rrk_model::{Block, BookMeta, ChapterContent, ChapterEntry, Inline, RrkError, RrkErrorKind, TocNode};
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
 pub const RRK_ABI_VERSION: u32 = 1;
@@ -24,6 +24,8 @@ pub const RRK_ABI_VERSION: u32 = 1;
 pub const ERR_PANIC: u32 = 2001;
 
 static KERNEL: Mutex<Option<Kernel>> = Mutex::new(None);
+/// 排版器（粗粒度共享一份；parley FontContext 重量级）。
+static LAYOUTER: Mutex<Option<rrk_layout::Layouter>> = Mutex::new(None);
 
 thread_local! {
     static LAST_ERROR: RefCell<String> = RefCell::new(String::new());
@@ -443,4 +445,138 @@ mod tests {
         json_str("a\"b\\c\n", &mut s);
         assert_eq!(s, "\"a\\\"b\\\\c\\n\"");
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// 排版出口（P1）：pagesOf / renderPage
+// ---------------------------------------------------------------------------
+
+fn layout_pages_json(
+    text: &str,
+    blocks: &[Block],
+    chapter_id: u32,
+    font_size: f32,
+    line_height: f32,
+    width: f32,
+    height: f32,
+    dpr: f32,
+) -> Result<Vec<u8>, u32> {
+    let content = ChapterContent {
+        id: chapter_id,
+        text: std::sync::Arc::from(text),
+        blocks: blocks.to_vec(),
+    };
+    let mut style = rrk_model::StyleSpec::default();
+    style.font_size = font_size;
+    style.line_height = line_height;
+    let vp = rrk_model::Viewport { width, height, dpr };
+
+    let mut guard = LAYOUTER
+        .lock()
+        .map_err(|_| set_err(RrkError::io("排版器锁中毒"), RrkErrorKind::Internal.code()))?;
+    let layouter = guard.get_or_insert_with(rrk_layout::Layouter::new);
+    let pages = layouter.layout(&content, &style, &vp);
+
+    let mut s = String::with_capacity(1024 * pages.len().max(1));
+    s.push('[');
+    for (i, p) in pages.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"index\":{},\"start\":{},\"end\":{},\"height\":{},\"lines\":[",
+            p.index, p.start.char_offset, p.end.char_offset, p.height
+        ));
+        for (j, l) in p.lines.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "{{\"s\":{},\"e\":{},\"h\":{},\"p\":{}}}",
+                l.start, l.end, l.height, l.para_start
+            ));
+        }
+        s.push_str("],\"runs\":[");
+        for (j, r) in p.runs.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "{{\"l\":{},\"x\":{},\"y\":{},\"fs\":{},\"b\":{},\"i\":{},\"s\":{},\"e\":{}}}",
+                r.line, r.x, r.baseline, r.font_size, r.bold, r.italic, r.range.0, r.range.1
+            ));
+        }
+        s.push_str("]}");
+    }
+    s.push(']');
+    Ok(s.into_bytes())
+}
+
+/// 排版一章 → 页数组 JSON（几何模式数据面；三要素由调用方传入）。
+///
+/// 参数：章 id、字号、行高、视口宽高、dpr。0 = 成功。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_pages_json(
+    handle: BookHandle,
+    chapter_id: u32,
+    font_size: f32,
+    line_height: f32,
+    width: f32,
+    height: f32,
+    dpr: f32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        with_kernel(|k| {
+            let book = k.book(handle).map_err(set_kind)?;
+            let content = book.load_chapter(chapter_id).map_err(set_kind)?;
+            let json = layout_pages_json(
+                &content.text,
+                &content.blocks,
+                chapter_id,
+                font_size,
+                line_height,
+                width,
+                height,
+                dpr,
+            )?;
+            write_buf(json, out_ptr, out_len);
+            Ok(0)
+        })
+    })
+}
+
+/// 整页栅格化（PDF 原版页，模式 B）→ RGBA 缓冲 + 尺寸。0 = 成功。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_render_page(
+    handle: BookHandle,
+    page_index: u32,
+    target_width: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    out_w: *mut u32,
+    out_h: *mut u32,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() || out_w.is_null() || out_h.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        with_kernel(|k| {
+            let book = k.book(handle).map_err(set_kind)?;
+            match book.render_page(page_index, target_width).map_err(set_kind)? {
+                rrk_model::RenderResult::Bitmap { width, height, rgba } => {
+                    *out_w = width;
+                    *out_h = height;
+                    write_buf(rgba, out_ptr, out_len);
+                    Ok(0)
+                }
+                _ => Err(set_kind(RrkError::unsupported("非位图渲染结果"))),
+            }
+        })
+    })
 }

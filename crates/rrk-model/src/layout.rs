@@ -28,7 +28,9 @@ pub struct StyleSpec {
 impl Default for StyleSpec {
     fn default() -> Self {
         Self {
-            font_family: String::new(),
+            // 字体策略（2026-10-21 拍板）：重排类一律系统字体栈（CSS family 列表，
+            // 平台取首个可用）；书内字体仅固定版式（PDF 原版页）保真使用。
+            font_family: "Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif".to_string(),
             font_size: 18.0,
             line_height: 1.6,
             para_indent_em: 2.0,

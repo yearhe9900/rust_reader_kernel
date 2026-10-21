@@ -117,6 +117,12 @@ pub trait BookSource: Send + Sync {
 
     /// 零解压权重估算（章 id → 估算字数），供进度与预排预算。
     fn estimate_weights(&self) -> RrkResult<Vec<(ChapterId, u32)>>;
+
+    /// 整页栅格化（模式 B；仅固定版式实现——PDF L2）。默认不支持。
+    fn render_page(&self, index: u32, target_width_px: u32) -> RrkResult<rrk_model::RenderResult> {
+        let _ = (index, target_width_px);
+        Err(RrkError::unsupported("该格式无整页栅格化能力"))
+    }
 }
 
 /// 固定版式书源（PDF/CBZ，方案 §2.4）：页级随机读，进度 = 页码。

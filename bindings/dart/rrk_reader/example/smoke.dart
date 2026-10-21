@@ -44,6 +44,15 @@ void main(List<String> args) {
   final cover = book.cover();
   print('封面: ${cover == null ? "无" : "${cover.length} 字节"}');
 
+  if (chapters.isNotEmpty) {
+    final pages = book.pagesOf(chapters.length > 1 ? 1 : 0, width: 390, height: 842);
+    print('pagesOf: ${pages.length} 页');
+    for (final pg in pages.take(2)) {
+      print('  页 ${pg.index}: ${pg.lines.length} 行 / ${pg.runs.length} run '
+          '(${pg.start}..${pg.end})');
+    }
+  }
+
   book.close();
   print('关闭成功，全链路 OK（${sw.elapsedMilliseconds} ms）');
 }

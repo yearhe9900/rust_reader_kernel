@@ -35,6 +35,14 @@ typedef _QueryNative = Uint32 Function(Uint64, Pointer<Pointer<Uint8>>, Pointer<
 typedef _QueryDart = int Function(int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _ErrorNative = Uint32 Function(Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _ErrorDart = int Function(Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PagesNative = Uint32 Function(Uint64, Uint32, Float, Float, Float, Float,
+    Float, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PagesDart = int Function(int, int, double, double, double, double, double,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _RenderNative = Uint32 Function(
+    Uint64, Uint32, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint32>, Pointer<Uint32>);
+typedef _RenderDart = int Function(
+    int, int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint32>, Pointer<Uint32>);
 typedef _LoadChapterNative = Uint32 Function(
     Uint64, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _LoadChapterDart = int Function(
@@ -43,8 +51,6 @@ typedef _BufFreeNative = Void Function(Pointer<Uint8>, IntPtr);
 typedef _BufFreeDart = void Function(Pointer<Uint8>, int);
 typedef _AbiNative = Uint32 Function();
 typedef _AbiDart = int Function();
-
-DynamicLibrary? _libHolder;
 
 class _Bindings {
   _Bindings(DynamicLibrary lib)
@@ -57,6 +63,8 @@ class _Bindings {
         lastError = lib.lookupFunction<_ErrorNative, _ErrorDart>('rrk_last_error'),
         loadChapter =
             lib.lookupFunction<_LoadChapterNative, _LoadChapterDart>('rrk_load_chapter'),
+        pagesJson = lib.lookupFunction<_PagesNative, _PagesDart>('rrk_pages_json'),
+        renderPage = lib.lookupFunction<_RenderNative, _RenderDart>('rrk_render_page'),
         bufFree = lib.lookupFunction<_BufFreeNative, _BufFreeDart>('rrk_buf_free'),
         abiVersion = lib.lookupFunction<_AbiNative, _AbiDart>('rrk_abi_version');
 
@@ -68,6 +76,8 @@ class _Bindings {
   final _QueryDart cover;
   final _ErrorDart lastError;
   final _LoadChapterDart loadChapter;
+  final _PagesDart pagesJson;
+  final _RenderDart renderPage;
   final _BufFreeDart bufFree;
   final _AbiDart abiVersion;
 }
@@ -92,7 +102,6 @@ class RrkEngine {
   /// [libPath]：rrk_ffi 动态库路径（如 `target/release/rrk_ffi.dll`）。
   static void init(String libPath) {
     final lib = DynamicLibrary.open(libPath);
-    _libHolder = lib;
     final b = _Bindings(lib);
     final abi = b.abiVersion();
     if (abi != kRrkAbiVersion) {
@@ -217,6 +226,55 @@ class ChapterBlock {
   String toString() => 'ChapterBlock($type ${text ?? key ?? ""})';
 }
 
+/// 版式行（行表条目）。
+class ReaderLine {
+  ReaderLine._(this.start, this.end, this.height, this.paraStart);
+  final int start;
+  final int end;
+  final double height;
+  final bool paraStart;
+}
+
+/// 文本 run（字体/字号/位置；文本范围 = 章文本 UTF-8 字节偏移）。
+class ReaderRun {
+  ReaderRun._(this.line, this.x, this.baseline, this.fontSize, this.bold, this.italic,
+      this.start, this.end);
+  final int line;
+  final double x;
+  final double baseline;
+  final double fontSize;
+  final bool bold;
+  final bool italic;
+  final int start;
+  final int end;
+}
+
+/// 版式页（几何模式数据面 → Flutter 自绘）。
+class ReaderPage {
+  ReaderPage._(this.index, this.start, this.end, this.height, this.lines, this.runs);
+  final int index;
+  final int start;
+  final int end;
+  final double height;
+  final List<ReaderLine> lines;
+  final List<ReaderRun> runs;
+
+  static ReaderPage _fromJson(Map<String, dynamic> j) => ReaderPage._(
+      j['index'] as int,
+      j['start'] as int,
+      j['end'] as int,
+      (j['height'] as num).toDouble(),
+      (j['lines'] as List)
+          .map((e) => ReaderLine._(e['s'] as int, e['e'] as int, (e['h'] as num).toDouble(),
+              e['p'] as bool))
+          .toList(),
+      (j['runs'] as List)
+          .map((e) => ReaderRun._(e['l'] as int, (e['x'] as num).toDouble(),
+              (e['y'] as num).toDouble(), (e['fs'] as num).toDouble(), e['b'] as bool,
+              e['i'] as bool, e['s'] as int, e['e'] as int))
+          .toList());
+}
+
 class ChapterContent {
   ChapterContent._(this.id, this.text, this.blocks);
   final int id;
@@ -330,6 +388,54 @@ class RrkBook {
       malloc.free(textLen);
       malloc.free(blocksPtr);
       malloc.free(blocksLen);
+    }
+  }
+
+  /// 排版一章 → 页数组（几何模式）。
+  List<ReaderPage> pagesOf(
+    int chapterId, {
+    double fontSize = 18.0,
+    double lineHeight = 1.6,
+    double width = 390.0,
+    double height = 842.0,
+    double dpr = 3.0,
+  }) {
+    _check();
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.pagesJson(_handle, chapterId, fontSize, lineHeight, width, height, dpr,
+          outPtr, outLen);
+      if (code != 0) _throwCode(code);
+      final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '[]';
+      return (jsonDecode(json) as List<dynamic>)
+          .map((e) => ReaderPage._fromJson(e as Map<String, dynamic>))
+          .toList();
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 整页栅格化（PDF 原版页）→ RGBA + 尺寸。
+  (Uint8List, int, int) renderPage(int pageIndex, {int targetWidth = 900}) {
+    _check();
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    final outW = malloc<Uint32>();
+    final outH = malloc<Uint32>();
+    try {
+      final code = b.renderPage(_handle, pageIndex, targetWidth, outPtr, outLen, outW, outH);
+      if (code != 0) _throwCode(code);
+      final bytes = RrkEngine._takeBytes(b, outPtr.value, outLen.value) ?? Uint8List(0);
+      return (bytes, outW.value, outH.value);
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+      malloc.free(outW);
+      malloc.free(outH);
     }
   }
 

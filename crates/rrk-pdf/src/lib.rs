@@ -446,6 +446,10 @@ impl BookSource for PdfBook {
     fn estimate_weights(&self) -> RrkResult<Vec<(ChapterId, u32)>> {
         Ok(self.chapters.iter().map(|c| (c.id, c.char_len)).collect())
     }
+
+    fn render_page(&self, index: u32, target_width_px: u32) -> RrkResult<RenderResult> {
+        PdfBook::render_page(self, index, target_width_px)
+    }
 }
 
 impl PagedSource for PdfBook {

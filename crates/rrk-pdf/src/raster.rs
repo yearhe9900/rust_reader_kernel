@@ -30,6 +30,31 @@ struct RasterFont {
     to_unicode: Option<HashMap<u16, String>>,
     two_byte: bool,
     fallback_path: String,
+    /// CID 字体（Type0）：两字节码即 CID，经 CIDToGIDMap → GID（子集 CID 字体常无 unicode cmap）。
+    cid_mode: bool,
+    /// CID → GID 映射表（每 CID 2 字节大端）；None = Identity。
+    cid_to_gid: Option<Arc<[u8]>>,
+}
+
+/// 裸 CFF（FontFile3/Type1C）→ 最小 OTF 封装（自研 sfnt 容器：单 CFF 表），
+/// 供轮廓光栅器按 OpenType 路径解析。
+fn wrap_cff_as_otf(cff: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(cff.len() + 64);
+    out.extend_from_slice(b"OTTO"); // CFF-flavor sfnt
+    out.extend_from_slice(&1u16.to_be_bytes()); // numTables
+    out.extend_from_slice(&16u16.to_be_bytes()); // searchRange
+    out.extend_from_slice(&0u16.to_be_bytes()); // entrySelector
+    out.extend_from_slice(&0u16.to_be_bytes()); // rangeShift
+    let data_offset = 12 + 16;
+    out.extend_from_slice(b"CFF ");
+    out.extend_from_slice(&0u32.to_be_bytes()); // checksum（光栅不校验）
+    out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+    out.extend_from_slice(&(cff.len() as u32).to_be_bytes());
+    out.extend_from_slice(cff);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
 }
 
 /// 标准 14 → 系统字体文件（找不到退 arial）。
@@ -79,12 +104,37 @@ fn collect_raster_fonts(doc: &PdfDocument, resources: Option<&Object>) -> HashMa
             .map(|m| m.keys().any(|k| *k > 0xFF))
             .unwrap_or(false);
 
+        // CID 字体（Type0）：FontDescriptor/FontFile2/CIDToGIDMap 都在 DescendantFonts[0] 里
+        let mut cid_mode = false;
+        let mut cid_to_gid: Option<Arc<[u8]>> = None;
+        let mut dict_for_font = fd.clone();
+        if let Some(desc_arr) = fd.get("DescendantFonts").and_then(|d| d.as_array()) {
+            cid_mode = true;
+            if let Some(cid_fd) = desc_arr.first().map(|d| doc.resolve(d)) {
+                if let Some(d) = cid_fd.as_dict() {
+                    dict_for_font = d.clone();
+                }
+                if let Some(m) = cid_fd.get("CIDToGIDMap") {
+                    if let Object::Stream { .. } = doc.resolve(m) {
+                        if let Ok(bytes) = doc.stream_data(m) {
+                            cid_to_gid = Some(Arc::from(bytes.into_boxed_slice()));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut data: Arc<[u8]> = Arc::from(&b""[..]);
-        if let Some(desc) = fd.get("FontDescriptor").map(|d| doc.resolve(d)) {
+        if let Some(desc) = dict_for_font.get("FontDescriptor").map(|d| doc.resolve(d)) {
             for key in ["FontFile2", "FontFile3"] {
                 if let Some(ff) = desc.get(key) {
                     if let Ok(bytes) = doc.stream_data(ff) {
-                        data = Arc::from(bytes.into_boxed_slice());
+                        data = if key == "FontFile3" {
+                            // Type1C = 裸 CFF：自研 sfnt 封装成 OTF 供轮廓光栅
+                            Arc::from(wrap_cff_as_otf(&bytes).into_boxed_slice())
+                        } else {
+                            Arc::from(bytes.into_boxed_slice())
+                        };
                         break;
                     }
                 }
@@ -103,6 +153,8 @@ fn collect_raster_fonts(doc: &PdfDocument, resources: Option<&Object>) -> HashMa
                 to_unicode,
                 two_byte,
                 fallback_path: system_font_path(&base),
+                cid_mode,
+                cid_to_gid,
             },
         );
     }
@@ -119,6 +171,7 @@ struct GState {
     fill: (f32, f32, f32, f32),
     stroke: (f32, f32, f32, f32),
     line_width: f32,
+    clip: Option<tiny_skia::Mask>,
 }
 
 impl Default for GState {
@@ -128,6 +181,7 @@ impl Default for GState {
             fill: (0.0, 0.0, 0.0, 1.0),
             stroke: (0.0, 0.0, 0.0, 1.0),
             line_width: 1.0,
+            clip: None,
         }
     }
 }
@@ -417,8 +471,23 @@ impl<'a> Rasterizer<'a> {
                 self.last_path = None;
             }
             b"W" | b"W*" => {
-                // 裁剪（L3 长尾）：L2 暂不裁剪，路径清理即可
-                self.pb = None;
+                // 裁剪：当前路径 → alpha 遮罩；与既有裁剪求交（byte-min）
+                if let Some(pb) = self.pb.take() {
+                    if let Some(path) = pb.finish() {
+                        if let Some(mut mask) =
+                            tiny_skia::Mask::new(self.pixmap.width(), self.pixmap.height())
+                        {
+                            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+                            if let Some(old) = &self.gs.clip {
+                                let (a, b) = (mask.data_mut(), old.data());
+                                for (x, y) in a.iter_mut().zip(b.iter()) {
+                                    *x = (*x).min(*y);
+                                }
+                            }
+                            self.gs.clip = Some(mask);
+                        }
+                    }
+                }
             }
 
             // 文本
@@ -510,7 +579,8 @@ impl<'a> Rasterizer<'a> {
             let mut paint = Paint::default();
             let (r, g, b, a) = self.gs.fill;
             paint.set_color_rgba8(fc(r), fc(g), fc(b), fc(a));
-            self.pixmap.fill_path(&path, &paint, rule, Transform::identity(), None);
+            let clip = self.gs.clip.as_ref();
+            self.pixmap.fill_path(&path, &paint, rule, Transform::identity(), clip);
             self.last_path = Some(path);
         }
     }
@@ -535,13 +605,18 @@ impl<'a> Rasterizer<'a> {
         paint.set_color_rgba8(fc(r), fc(g), fc(b), fc(a));
         let mut stroke = tiny_skia::Stroke::default();
         stroke.width = self.gs.line_width * self.scale;
-        self.pixmap.stroke_path(path, &paint, &stroke, Transform::identity(), None);
+        let clip = self.gs.clip.as_ref();
+        self.pixmap.stroke_path(path, &paint, &stroke, Transform::identity(), clip);
     }
 
     // ---- 文本 ----
 
     fn show_text(&mut self, bytes: &[u8]) {
         let Some(fname) = self.text.font.clone() else { return };
+        let (cid_mode, cid_map) = match self.fonts.get(&fname) {
+            Some(f) => (f.cid_mode, f.cid_to_gid.clone()),
+            None => (false, None),
+        };
         let font_data = self.load_font_data(&fname);
         let Some(font_ref) = FontRef::from_index(&font_data[..], 0) else { return };
 
@@ -551,18 +626,57 @@ impl<'a> Rasterizer<'a> {
         let ppem = size * self.gs.ctm.sy.abs().max(0.0001);
         let glyph_metrics = font_ref.glyph_metrics(&[]);
         let charmap = font_ref.charmap();
-        let chars = self.decode_chars(bytes);
+
+        // 码流 → (gid, 占位宽度)：CID 字体两字节码即 CID（经 CIDToGIDMap），
+        // 其余走 ToUnicode → unicode → cmap（与 L1 同源）。汉字上屏靠 CID 路径。
+        let cid_gid = |cid: u16| -> u16 {
+            match &cid_map {
+                Some(map) => {
+                    let i = cid as usize * 2;
+                    if i + 2 <= map.len() {
+                        u16::from_be_bytes([map[i], map[i + 1]])
+                    } else {
+                        cid
+                    }
+                }
+                None => cid,
+            }
+        };
+        let targets: Vec<u16> = if cid_mode {
+            // 混合策略：ToUnicode→unicode→cmap 优先（TrueType CID 常带 unicode 表），
+            // 缺字（gid=0）时按两字节 CID→CIDToGIDMap 兜底——两条路都不中才放弃该字形
+            let chars = self.decode_chars(bytes);
+            let cids: Vec<u16> = bytes
+                .chunks(2)
+                .map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]))
+                .collect();
+            chars
+                .iter()
+                .zip(cids.iter().chain(std::iter::repeat(&0u16)))
+                .map(|(ch, cid)| {
+                    let g = if *ch != '\u{FFFD}' { charmap.map(*ch as u32) } else { 0 };
+                    if g != 0 { g } else { cid_gid(*cid) }
+                })
+                .collect()
+        } else {
+            self.decode_chars(bytes)
+                .into_iter()
+                .map(|ch| {
+                    if ch == '\u{FFFD}' {
+                        0
+                    } else {
+                        charmap.map(ch as u32)
+                    }
+                })
+                .collect()
+        };
 
         let mut render = Render::new(&[Source::Outline]);
-        for ch in chars {
-            if ch == '\u{FFFD}' {
-                continue;
-            }
-            let gid = charmap.map(ch as u32);
+        for gid in targets {
+            let ch_advance_space = false;
+            let _ = ch_advance_space;
             let adv_units = if gid == 0 { upem * 0.5 } else { glyph_metrics.advance_width(gid) };
-            let adv = adv_units / upem * size * self.text.h_scale
-                + self.text.char_space
-                + if ch == ' ' { self.text.word_space } else { 0.0 };
+            let adv = adv_units / upem * size * self.text.h_scale + self.text.char_space;
 
             if gid != 0 {
                 // 设备位置 = CTM ∘ Tm（文本空间先作用）

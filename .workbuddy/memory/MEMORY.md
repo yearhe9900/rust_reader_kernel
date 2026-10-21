@@ -6,6 +6,7 @@
 - **文档统一存放 `docs/` 目录**（2026-10-21 用户规定）；新增文档一律放 docs/，仓库根目录不放 md。
 
 ## 关键决策（用户拍板）
+- **字体策略（2026-10-21 拍板，硬口径）**：**除必须使用书内字体的书籍（PDF 原版页/CBZ 固定版式），其余全部系统字体**。重排类忽略书内嵌字体；StyleSpec.font_family 默认系统字体栈（Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif）；换字体=styleHash 变=布局缓存精确失效。
 - **对接方向（2026-10-21）**：不考虑 MReader 既有约束（如 RUST-09）；**本项目是契约唯一来源，MReader 等 Flutter 宿主按本项目 API 对接**。内核不反向迁就宿主实现；宿主只留呈现面，解析/排版/缓存按迁移路径收敛到内核。降级接入 = P0 只用解析层（loadChapter 喂宿主现有排版）。
 - **全自研、代码可控（2026-10-21 用户拍板，硬红线）**：格式解析/解压算法（MOBI PalmDOC LZ77 + HUFF/CDIC）/PDF 解析与光栅化/排版管线全自研；禁止 pdfium/mupdf/unrar/闭源 SDK/预编译黑盒二进制。第三方仅限「纯 Rust、可审计、可 fork、许可宽松」白名单件（白名单见方案 §3.2），变更需评审登记。
 - **格式支持（六格式全部落地）**：TXT/EPUB/MOBI/AZW3 重排 + CBZ 页级图库 + **PDF L1 文本抽取/重排（自研：对象扫描+ObjStm、五种流过滤器、文本算子、ToUnicode）**；PDF L2 自研光栅待做。固定版式走 `PagedSource` 页级变体（§2.4），PDF 支持「原版页 + 重排阅读」双模式（L1 重排已可用）。

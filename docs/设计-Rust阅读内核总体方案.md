@@ -348,6 +348,14 @@ pub fn page_at(chapter: &ChapterContent, pos: SemanticPos, style: &StyleSpec, vp
 
 纯函数 ⇒ 可缓存、可后台计算、可流式替换、可 rayon 并行（全链路 §5.1）。长章自动按逻辑块排版，`LayoutPage.start/end` 语义坐标保证任何页可独立定位（`page_at` 即「渲染指定页面」的内核入口）。
 
+**字体策略（2026-10-21 拍板）**：除必须使用书内字体的书籍外，**其余全部使用系统字体**。
+- **重排类**（TXT/EPUB/MOBI/AZW3、PDF 重排模式）：一律**系统字体栈**（`StyleSpec.font_family`
+  默认 `Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif`，平台取首个可用；
+  宿主提供字体切换 = 改 styleHash → 布局缓存精确失效秒切）。书内嵌字体忽略，
+  「使用书籍字体」开关属可选增强（默认关）。
+- **固定版式**（PDF 原版页、CBZ）：**书内字体保真**（版式复刻语义，换字体即毁版式）；
+  系统字体仅作标准 14/缺字兜底。
+
 ### 4.2 排版引擎选型
 
 | 候选 | 组成 | 优势 | 短板 | 结论 |
