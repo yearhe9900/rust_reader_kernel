@@ -156,7 +156,9 @@ impl Layouter {
                     let range = run.text_range();
                     runs.push(FlatRun {
                         x: gr.offset(),
-                        baseline: metrics.baseline,
+                        // parley 的 metrics.baseline 是布局坐标系（累计）——
+                        // 换算成「行内基线」（baseline - 行顶），分页时再加页内行光标 y
+                        baseline: metrics.baseline - metrics.min_coord,
                         font_size: run.font_size(),
                         start: base_offset + (range.start as u32).saturating_sub(shift),
                         end: base_offset + (range.end as u32).saturating_sub(shift),
@@ -325,7 +327,7 @@ mod tests {
     use super::*;
     use rrk_model::{Inline, StyleFlags, TextRange};
 
-    fn chapter() -> ChapterContent {
+    pub(crate) fn chapter() -> ChapterContent {
         let long = "这是用于验证排版引擎分页与行切割能力的长文本内容，会折成多行并跨页。".repeat(20);
         let text: std::sync::Arc<str> = format!("{long}\n\n第二段比较短。").as_str().into();
         let blocks = vec![
@@ -374,5 +376,36 @@ mod tests {
         let bytes = rrk_model::encode_pages(&pages);
         let back = rrk_model::decode_pages(&bytes).unwrap();
         assert_eq!(pages, back);
+    }
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::tests::chapter;
+    use super::*;
+
+    /// 回归：多行段落的 run 基线必须「页内单调递增且间距≈行高」——
+    /// 基线若重复叠加布局累计值，第二行起逐行下坠压行（2026-10-21 真机截图 bug）。
+    #[test]
+    fn run_baselines_do_not_drift() {
+        let mut l = Layouter::new();
+        let c = chapter();
+        let style = StyleSpec::default();
+        let vp = Viewport { width: 390.0, height: 842.0, dpr: 3.0 };
+        let pages = l.layout(&c, &style, &vp);
+        for p in &pages {
+            let mut prev = -1.0f32; // 页内单调（跨页 y 会归零）
+            for r in &p.runs {
+                if (r.baseline - prev).abs() < 1e-3 {
+                    continue;
+                }
+                assert!(r.baseline > prev, "基线必须单调递增");
+                if prev >= 0.0 {
+                    let gap = r.baseline - prev;
+                    assert!(gap < style.font_size * 4.0, "相邻 run 基线间距异常: {gap}");
+                }
+                prev = r.baseline;
+            }
+        }
     }
 }
