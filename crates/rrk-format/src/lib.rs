@@ -93,7 +93,8 @@ pub trait FormatAdapter: Send + Sync {
 }
 
 /// 统一书源：所有格式的输出契约（吸收 foliate-js `sections.load/unload/size` 思想）。
-pub trait BookSource: Send {
+/// 线程安全（`Send + Sync`）：书源只读，供 FFI 边界共享持有。
+pub trait BookSource: Send + Sync {
     fn meta(&self) -> &BookMeta;
 
     /// 目录树。

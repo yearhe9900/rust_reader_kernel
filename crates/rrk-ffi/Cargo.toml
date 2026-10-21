@@ -1,0 +1,14 @@
+[package]
+name = "rrk-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：C ABI（Dart/Flutter 跨语言边界）"
+
+[lib]
+name = "rrk_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rrk-model.workspace = true
+rrk-kernel.workspace = true

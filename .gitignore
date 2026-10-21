@@ -1,3 +1,5 @@
 target/
 Cargo.lock
 tmp_book/
+**/.dart_tool/
+**/pubspec.lock
