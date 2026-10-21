@@ -24,6 +24,7 @@ license = "MIT"
 repository = ""
 
 [workspace.dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 rrk-model = { path = "crates/rrk-model" }
 rrk-format = { path = "crates/rrk-format" }
 rrk-markup = { path = "crates/rrk-markup" }

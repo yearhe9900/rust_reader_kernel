@@ -312,6 +312,28 @@ impl BookSource for CbzBook {
     fn estimate_weights(&self) -> RrkResult<Vec<(ChapterId, u32)>> {
         Ok(self.page_names.iter().enumerate().map(|(i, _)| (i as ChapterId, 0)).collect())
     }
+
+    /// 页 = 图片：解码 + 缩放 → RGBA 位图（CBZ 的「原版页」即图片本体）。
+    fn render_page(&self, index: u32, target_width_px: u32) -> RrkResult<rrk_model::RenderResult> {
+        let res = self.load_page_resource(index)?;
+        let img = image::load_from_memory(&res.data)
+            .map_err(|e| RrkError::corrupt(format!("CBZ 图片解码失败: {e}")))?;
+        let w = img.width();
+        let h = img.height();
+        let target_w = target_width_px.max(1);
+        let target_h = ((h as u64 * target_w as u64) / w.max(1) as u64).max(1) as u32;
+        let resized = if target_w != w {
+            img.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
+        let rgba = resized.to_rgba8().into_raw();
+        Ok(rrk_model::RenderResult::Bitmap {
+            width: target_w,
+            height: target_h,
+            rgba,
+        })
+    }
 }
 
 #[cfg(test)]

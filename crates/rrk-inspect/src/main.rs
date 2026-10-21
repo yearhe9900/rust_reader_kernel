@@ -134,21 +134,18 @@ fn run() -> Result<(), String> {
     }
 
     if let Some((page, out)) = render {
-        // L2 光栅（仅 PDF）：直接走 rrk_pdf 渲染入口
+        // 统一渲染出口（PDF L2 / CBZ 图页都走 BookSource::render_page）
         let t = std::time::Instant::now();
-        match rrk_pdf::PdfBook::parse(&ContentSource::from_path(path)) {
-            Ok(pdf) => match pdf.render_page(page, 900) {
-                Ok(rrk_model::RenderResult::Bitmap { width, height, rgba }) => {
-                    save_png(&out, width, height, &rgba);
-                    println!(
-                        "\n== 渲染 == 第 {page} 页 → {out}（{width}x{height}，{:.1} ms）",
-                        t.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
-                Ok(_) => println!("\n== 渲染 == 非位图结果"),
-                Err(e) => println!("\n== 渲染 == 失败: {e}"),
-            },
-            Err(e) => println!("\n== 渲染 == 打开失败: {e}"),
+        match book.render_page(page, 900) {
+            Ok(rrk_model::RenderResult::Bitmap { width, height, rgba }) => {
+                save_png(&out, width, height, &rgba);
+                println!(
+                    "\n== 渲染 == 第 {page} 页 → {out}（{width}x{height}，{:.1} ms）",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            Ok(_) => println!("\n== 渲染 == 非位图结果"),
+            Err(e) => println!("\n== 渲染 == 失败: {e}"),
         }
     }
 

@@ -7,15 +7,21 @@
 //! - 文本：BT/ET、Tf、Tm/Td/TD/T\*、Tj/TJ/'/" —— 字形经 swash 光栅为 alpha 遮罩，
 //!   按填充色混合；字符→字形映射走 ToUnicode（与 L1 同源）。
 //!
-//! L3 长尾（不覆盖，样张驱动）：Type1/CFF 原生字形、透明组/混合模式、渐变/图案、
-//! JPX/JBIG2 图像、Type3 字体、标注/表单；失败页按 L1 文本模式降级（上层口径）。
+//! L3 部分覆盖（2026-10-21）：ExtGState 透明度（/ca /CA）、渐变填充（sh 轴向/径向）。
+//! L3 长尾（明确不覆盖及原因）：
+//! - Type1 字体轮廓（PFA/PFB charstring 解释器，样张驱动排期）；
+//! - JPX/JBIG2 图像：解码需 openjpeg/jbig2dec 等 C 绑定，违反自研红线 → 降级占位；
+//! - 透明组/混合模式（/BM、/Group）：tiny-skia fill_path 固定 SourceOver，需图层管线；
+//! - 采样函数（FunctionType 0/3）、图案/底纹、Type3 字体、标注/表单；
+//! - 双栏/复杂版面重排（L1 文本抽取保序，重排属 §3.6 L3 长尾）。
+//! 失败页按 L1 文本模式降级（上层口径）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use swash::scale::{Render, ScaleContext, Source};
 use swash::FontRef;
-use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
+use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Point, Transform};
 
 use crate::content::parse_tounicode;
 use crate::objects::{Dict, Object, Parser, PdfDocument};
@@ -172,6 +178,9 @@ struct GState {
     stroke: (f32, f32, f32, f32),
     line_width: f32,
     clip: Option<tiny_skia::Mask>,
+    /// ExtGState 透明度（/ca /CA）。
+    fill_alpha: f32,
+    stroke_alpha: f32,
 }
 
 impl Default for GState {
@@ -182,6 +191,8 @@ impl Default for GState {
             stroke: (0.0, 0.0, 0.0, 1.0),
             line_width: 1.0,
             clip: None,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
         }
     }
 }
@@ -556,6 +567,39 @@ impl<'a> Rasterizer<'a> {
                 }
             }
 
+            // ExtGState（L3 可行部分：/ca /CA 透明度；/BM 混合模式受 tiny-skia
+            // fill_path 固定 SourceOver 限制，归 L3 长尾）
+            b"gs" => {
+                if let Some(name) = ops.last().and_then(|o| o.as_name()) {
+                    let name = name.to_string();
+                    if let Some(res) = self.resources.clone() {
+                        let res = self.doc.resolve(&res);
+                        if let Some(eg) = res.get("ExtGState").map(|x| self.doc.resolve(x)) {
+                            if let Some(g) = eg.get(&name).map(|o| self.doc.resolve(o)) {
+                                if let Some(d) = g.as_dict() {
+                                    if let Some(ca) = d.get("ca").and_then(|v| v.as_int().map(|i| i as f32).or(Some(match v { Object::Real(f) => *f as f32, _ => 1.0 }))) {
+                                        self.gs.fill_alpha = ca.clamp(0.0, 1.0);
+                                    }
+                                    if let Some(Object::Real(ca)) = d.get("ca") {
+                                        self.gs.fill_alpha = (*ca as f32).clamp(0.0, 1.0);
+                                    }
+                                    if let Some(Object::Real(ca)) = d.get("CA") {
+                                        self.gs.stroke_alpha = (*ca as f32).clamp(0.0, 1.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // 渐变填充（L3 可行部分：ShadingType 2 轴向 / 3 径向，FunctionType 2）
+            b"sh" => {
+                if let Some(name) = ops.last().and_then(|o| o.as_name()) {
+                    let name = name.to_string();
+                    self.paint_shading(&name);
+                }
+            }
+
             // 图像
             b"Do" => {
                 if let Some(name) = ops.last().and_then(|o| o.as_name()) {
@@ -578,7 +622,7 @@ impl<'a> Rasterizer<'a> {
         if let Some(path) = path {
             let mut paint = Paint::default();
             let (r, g, b, a) = self.gs.fill;
-            paint.set_color_rgba8(fc(r), fc(g), fc(b), fc(a));
+            paint.set_color_rgba8(fc(r), fc(g), fc(b), fc(a * self.gs.fill_alpha));
             let clip = self.gs.clip.as_ref();
             self.pixmap.fill_path(&path, &paint, rule, Transform::identity(), clip);
             self.last_path = Some(path);
@@ -602,7 +646,7 @@ impl<'a> Rasterizer<'a> {
     fn stroke_path(&mut self, path: &tiny_skia::Path) {
         let mut paint = Paint::default();
         let (r, g, b, a) = self.gs.stroke;
-        paint.set_color_rgba8(fc(r), fc(g), fc(b), fc(a));
+        paint.set_color_rgba8(fc(r), fc(g), fc(b), fc(a * self.gs.stroke_alpha));
         let mut stroke = tiny_skia::Stroke::default();
         stroke.width = self.gs.line_width * self.scale;
         let clip = self.gs.clip.as_ref();
@@ -854,6 +898,117 @@ impl<'a> Rasterizer<'a> {
 
 fn fc(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+impl<'a> Rasterizer<'a> {
+    /// sh 算子：渐变铺满当前裁剪区（无裁剪 = 整页设备区）。
+    fn paint_shading(&mut self, name: &str) {
+        let Some(res) = self.resources.clone() else { return };
+        let res = self.doc.resolve(&res);
+        let Some(sh_dict) = res
+            .get("Shading")
+            .map(|x| self.doc.resolve(x))
+            .and_then(|d| d.get(name).map(|o| self.doc.resolve(o)))
+        else {
+            return;
+        };
+        let Some(d) = sh_dict.as_dict() else { return };
+        let ty = d.get("ShadingType").and_then(|v| v.as_int()).unwrap_or(0);
+        let coords: Vec<f32> = d
+            .get("Coords")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|o| match o {
+                        Object::Int(i) => *i as f32,
+                        Object::Real(f) => *f as f32,
+                        _ => 0.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (c0, c1) = shading_colors(self.doc, d);
+        let stops = vec![
+            tiny_skia::GradientStop::new(0.0, tiny_skia::Color::from_rgba8(c0.0, c0.1, c0.2, 255)),
+            tiny_skia::GradientStop::new(1.0, tiny_skia::Color::from_rgba8(c1.0, c1.1, c1.2, 255)),
+        ];
+        let t = self.gs.ctm;
+        let shader = match ty {
+            2 if coords.len() >= 4 => {
+                let p1 = map_xy(&t, coords[0], coords[1]);
+                let p2 = map_xy(&t, coords[2], coords[3]);
+                tiny_skia::LinearGradient::new(
+                    Point::from_xy(p1.0, p1.1),
+                    Point::from_xy(p2.0, p2.1),
+                    stops,
+                    tiny_skia::SpreadMode::Pad,
+                    Transform::identity(),
+                )
+            }
+            3 if coords.len() >= 6 => {
+                // 双点锥形近似：起点=内圆心、终点=外圆心、半径取大者
+                let c = map_xy(&t, coords[0], coords[1]);
+                let c2 = map_xy(&t, coords[3], coords[4]);
+                let r = (coords[2].max(coords[5])) * t.sy.abs();
+                tiny_skia::RadialGradient::new(
+                    Point::from_xy(c.0, c.1),
+                    Point::from_xy(c2.0, c2.1),
+                    r.max(0.0),
+                    stops,
+                    tiny_skia::SpreadMode::Pad,
+                    Transform::identity(),
+                )
+            }
+            _ => None,
+        };
+        let Some(shader) = shader else { return };
+        let mut paint = Paint::default();
+        paint.shader = shader;
+        paint.anti_alias = true;
+        // 铺满设备区（PDF 语义 = 当前裁剪区；L2 无裁剪时 = 整页）
+        let (pw, ph) = (self.pixmap.width() as f32, self.pixmap.height() as f32);
+        let mut pb = PathBuilder::new();
+        pb.move_to(0.0, 0.0);
+        pb.line_to(pw, 0.0);
+        pb.line_to(pw, ph);
+        pb.line_to(0.0, ph);
+        pb.close();
+        if let Some(path) = pb.finish() {
+            let clip = self.gs.clip.as_ref();
+            self.pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), clip);
+        }
+    }
+}
+
+/// Shading /Function（Type 2 指数）→ (C0, C1) RGB8。
+fn shading_colors(doc: &PdfDocument, d: &Dict) -> ((u8, u8, u8), (u8, u8, u8)) {
+    let f = d.get("Function").map(|o| doc.resolve(o));
+    let to_rgb = |arr: Option<&Object>, fallback: (u8, u8, u8)| -> (u8, u8, u8) {
+        match arr.and_then(|a| a.as_array()) {
+            Some(vals) if vals.len() >= 3 => (
+                fc(num_of(&vals[0])),
+                fc(num_of(&vals[1])),
+                fc(num_of(&vals[2])),
+            ),
+            Some(vals) if vals.len() == 1 => {
+                let v = fc(num_of(&vals[0]));
+                (v, v, v)
+            }
+            _ => fallback,
+        }
+    };
+    match f.as_ref().and_then(|o| o.as_dict()) {
+        Some(fd) => (to_rgb(fd.get("C0"), (255, 255, 255)), to_rgb(fd.get("C1"), (0, 0, 0))),
+        None => ((255, 255, 255), (0, 0, 0)),
+    }
+}
+
+fn num_of(o: &Object) -> f32 {
+    match o {
+        Object::Int(i) => *i as f32,
+        Object::Real(f) => *f as f32,
+        _ => 0.0,
+    }
 }
 
 fn cmyk(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32, f32) {

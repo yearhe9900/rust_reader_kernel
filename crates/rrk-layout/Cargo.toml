@@ -13,3 +13,4 @@ parley = "0.5"
 rrk-format.workspace = true
 rrk-txt.workspace = true
 rrk-cache.workspace = true
+cosmic-text = "0.12"
