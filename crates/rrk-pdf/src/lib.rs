@@ -11,6 +11,7 @@
 
 mod content;
 mod objects;
+mod raster;
 
 use std::sync::Mutex;
 use std::collections::HashMap;
@@ -22,7 +23,8 @@ use objects::{Object, PdfDocument};
 use rrk_format::{BookSource, ContentSource, FormatAdapter, PagedSource};
 use rrk_model::{
     fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
-    Inline, PageEntry, PageKind, PagedContent, Resource, RrkError, RrkResult, TextRange, TocNode,
+    Inline, PageEntry, PageKind, PagedContent, RenderResult, Resource, RrkError, RrkResult,
+    TextRange, TocNode,
 };
 
 /// 页面信息（结构层，O(结构) 可得）。
@@ -174,6 +176,26 @@ impl PdfBook {
         }
         let blocks = paragraphs_to_blocks(&text);
         Ok(ChapterContent { id, text: Arc::from(text), blocks })
+    }
+
+    /// L2 光栅：渲染原版页为 RGBA 位图（方案 §3.6 模式 B）。
+    ///
+    /// [target_width_px] 为输出像素宽；高按页比例推。失败返回错误（上层降级 L1）。
+    pub fn render_page(&self, index: u32, target_width_px: u32) -> RrkResult<RenderResult> {
+        let page = self
+            .pages
+            .get(index as usize)
+            .ok_or_else(|| RrkError::invalid(format!("页越界: {index}")))?;
+        let (w_pt, h_pt) = (page.media.0.max(1.0), page.media.1.max(1.0));
+        let (rgba, width, height) = raster::render_page(
+            &self.doc,
+            &page.content_refs,
+            page.resources.clone(),
+            w_pt,
+            h_pt,
+            target_width_px,
+        )?;
+        Ok(RenderResult::Bitmap { width, height, rgba })
     }
 }
 
@@ -472,5 +494,39 @@ mod tests {
         let text = "第一段第一行。\n\n第二段。\n\n\n第三段。";
         let blocks = paragraphs_to_blocks(text);
         assert_eq!(blocks.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    /// L2 冒烟：最小 PDF（白底 + 黑色矩形）→ 位图非空白。
+    #[test]
+    fn render_minimal_page() {
+        let src = b"%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 44 >>
+stream
+0 0 0 rg 20 20 100 50 re f 1 0 0 rg
+endstream
+endobj
+";
+        let doc = PdfDocument::open(std::sync::Arc::from(&src[..])).unwrap();
+        let content_refs = vec![Object::Ref(4, 0)];
+        let (rgba, w, h) = raster::render_page(&doc, &content_refs, None, 200.0, 200.0, 200).unwrap();
+        assert_eq!((w, h), (200, 200));
+        // 应有非白像素（黑矩形/红彩状态至少其一）
+        let non_white = rgba.chunks(4).filter(|p| p[0] < 250 || p[1] < 250 || p[2] < 250).count();
+        assert!(non_white > 500, "应画出矩形，非白像素={non_white}");
     }
 }

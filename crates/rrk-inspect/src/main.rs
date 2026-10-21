@@ -54,6 +54,10 @@ fn run() -> Result<(), String> {
         .find(|w| w[0] == "--blocks")
         .and_then(|w| w[1].parse().ok())
         .unwrap_or(20);
+    let render: Option<(u32, String)> = args
+        .windows(4)
+        .find(|w| w[0] == "--render" && w[2] == "--out")
+        .map(|w| (w[1].parse().unwrap_or(0), w[3].clone()));
 
     let reg = build_registry();
     let src = ContentSource::from_path(path);
@@ -129,7 +133,34 @@ fn run() -> Result<(), String> {
         }
     }
 
+    if let Some((page, out)) = render {
+        // L2 光栅（仅 PDF）：直接走 rrk_pdf 渲染入口
+        let t = std::time::Instant::now();
+        match rrk_pdf::PdfBook::parse(&ContentSource::from_path(path)) {
+            Ok(pdf) => match pdf.render_page(page, 900) {
+                Ok(rrk_model::RenderResult::Bitmap { width, height, rgba }) => {
+                    save_png(&out, width, height, &rgba);
+                    println!(
+                        "\n== 渲染 == 第 {page} 页 → {out}（{width}x{height}，{:.1} ms）",
+                        t.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                Ok(_) => println!("\n== 渲染 == 非位图结果"),
+                Err(e) => println!("\n== 渲染 == 失败: {e}"),
+            },
+            Err(e) => println!("\n== 渲染 == 打开失败: {e}"),
+        }
+    }
+
     Ok(())
+}
+
+/// 存 PNG（自研最小编码器走 image crate）。
+fn save_png(path: &str, w: u32, h: u32, rgba: &[u8]) {
+    let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).expect("RGBA 尺寸自洽");
+    image::DynamicImage::ImageRgba8(img)
+        .save(path)
+        .expect("写 PNG 失败");
 }
 
 fn main() -> ExitCode {
