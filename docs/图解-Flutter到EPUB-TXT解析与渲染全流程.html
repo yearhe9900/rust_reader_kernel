@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>图解：Flutter 到 EPUB/TXT 解析与渲染全流程</title>
+<style>
+  :root {
+    --bg: #FAF9F6; --card: #FFFFFF; --ink: #2C2C2A; --muted: #5F5E5A;
+    --line: #D3D1C7; --purple: #534AB7; --blue: #185FA5; --teal: #0F6E56;
+    --coral: #D85A30; --amber: #BA7517;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.75; padding: 48px 24px 80px;
+  }
+  main { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 28px; font-weight: 600; letter-spacing: .5px; margin-bottom: 8px; }
+  .lead { font-size: 15px; color: var(--muted); margin-bottom: 28px; }
+  h2 { font-size: 20px; font-weight: 600; margin: 48px 0 6px; }
+  h2 .no { color: var(--purple); margin-right: 8px; }
+  h3 { font-size: 15px; font-weight: 600; margin: 22px 0 6px; }
+  p { margin: 10px 0; font-size: 14.5px; }
+  .diag {
+    background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+    padding: 18px 10px; margin: 18px 0;
+  }
+  .cap { text-align: center; font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+  ul { margin: 8px 0 8px 22px; }
+  li { font-size: 14.5px; margin: 5px 0; }
+  code, pre {
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    background: #F1EFE8; border-radius: 6px;
+  }
+  code { padding: 1px 6px; font-size: 13px; }
+  pre { padding: 16px 18px; font-size: 13px; line-height: 1.7; overflow-x: auto; margin: 12px 0; border: 1px solid var(--line); }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; background: var(--card); }
+  th, td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; }
+  th { background: #F1EFE8; font-weight: 600; }
+  .tag {
+    display: inline-block; font-size: 12px; padding: 2px 10px; border-radius: 999px;
+    background: #EEEDFE; color: var(--purple); margin-right: 6px;
+  }
+  .toc { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 24px; margin: 20px 0; }
+  .toc a { color: var(--blue); text-decoration: none; font-size: 14px; line-height: 2; }
+  .toc a:hover { text-decoration: underline; }
+  .key { background: #EEEDFE; border-left: 3px solid var(--purple); padding: 10px 16px; border-radius: 0 10px 10px 0; margin: 14px 0; font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>图解：Flutter 到 EPUB / TXT 解析与渲染全流程</h1>
+<p class="lead">基于《设计-Rust阅读内核总体方案》的图文导读 —— 一本书从文件到屏幕，中间发生了什么。<span class="tag">解析</span><span class="tag">数据模型</span><span class="tag">排版</span><span class="tag">渲染</span></p>
+
+<div class="toc">
+  <a href="#s1">　一、全景：五个层各管什么</a><br>
+  <a href="#s2">　二、解析：EPUB 与 TXT 如何变成同一种数据</a><br>
+  <a href="#s3">　三、渲染：从 Block 流到屏幕像素</a><br>
+  <a href="#s4">　四、一次开书的调用链（Flutter API 视角）</a><br>
+  <a href="#s5">　五、缓存：为什么第二次打开是瞬时的</a>
+</div>
+
+<h2 id="s1"><span class="no">一</span>全景：五个层各管什么</h2>
+<p>整个系统的核心原则是<strong>计算面与呈现面分离</strong>：解析、解压、排版、缓存这些重活全在 Rust 内核（无 GC、可并行、产物可落盘）；Flutter 只做合成、手势与动画。两层之间靠 FFI 批量传递数据，一次调用 = 一个完整任务。</p>
+
+<div class="diag">
+<svg width="100%" viewBox="0 0 920 486" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <marker id="a1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <rect x="70" y="20" width="780" height="62" rx="12" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="0.5"/>
+  <text x="94" y="46" font-size="15" font-weight="500" fill="#3C3489">UI 壳层（Flutter）</text>
+  <text x="94" y="68" font-size="12.5" fill="#5F5E5A">书架 · 阅读页 · 手势 · 动画 —— 只做合成与呈现，不做解析与测量</text>
+
+  <line x1="460" y1="82" x2="460" y2="112" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a1)"/>
+  <text x="474" y="103" font-size="11.5" fill="#5F5E5A">Dart API：Future / Stream</text>
+
+  <rect x="70" y="116" width="780" height="62" rx="12" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+  <text x="94" y="142" font-size="15" font-weight="500" fill="#0C447C">rrk_reader（Dart facade 包）</text>
+  <text x="94" y="164" font-size="12.5" fill="#5F5E5A">openBook · meta / toc · loadChapter · pagesOf · renderPage · close</text>
+
+  <line x1="460" y1="178" x2="460" y2="208" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a1)"/>
+  <text x="474" y="199" font-size="11.5" fill="#5F5E5A">批量任务 + 零拷贝缓冲 (ptr, len)</text>
+
+  <rect x="70" y="212" width="780" height="62" rx="12" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+  <text x="94" y="238" font-size="15" font-weight="500" fill="#2C2C2A">FFI 边界（rrk-ffi）</text>
+  <text x="94" y="260" font-size="12.5" fill="#5F5E5A">u64 句柄 · 错误码 → RrkException · panic 不跨界 · 事件流 NativePort</text>
+
+  <line x1="460" y1="274" x2="460" y2="304" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a1)"/>
+  <text x="474" y="295" font-size="11.5" fill="#5F5E5A">结构 / 内容 / 版式对象（rkyv 友好）</text>
+
+  <rect x="70" y="308" width="780" height="62" rx="12" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+  <text x="94" y="334" font-size="15" font-weight="500" fill="#085041">Rust 内核（计算面）</text>
+  <text x="94" y="356" font-size="12.5" fill="#5F5E5A">rrk-format（EPUB / TXT / MOBI…）· rrk-layout（排版）· rrk-render · rrk-kernel 任务池</text>
+
+  <line x1="460" y1="370" x2="460" y2="400" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a1)"/>
+  <text x="474" y="391" font-size="11.5" fill="#5F5E5A">LayoutPage / 位图原路返回</text>
+
+  <rect x="70" y="404" width="780" height="62" rx="12" fill="#FAEEDA" stroke="#FAC775" stroke-width="0.5"/>
+  <text x="94" y="430" font-size="15" font-weight="500" fill="#854F0B">缓存与数据（rrk-cache）</text>
+  <text x="94" y="452" font-size="12.5" fill="#5F5E5A">C1 内存页 LRU + 保护窗口 · C2 rkyv 布局落盘（mmap）· C3 ContentChunk / 结构缓存</text>
+</svg>
+<p class="cap">图 1 · 五层架构：UI 只管呈现，FFI 之下全是计算面</p>
+</div>
+
+<h2 id="s2"><span class="no">二</span>解析：EPUB 与 TXT 如何变成同一种数据</h2>
+<p>两种格式走完全不同的解析路径，但出口是同一个 —— <strong>统一数据模型的 <code>Block</code> 流</strong>。这就是「解析与渲染职责分离」的落点：排版层只认 Block，完全不感知背后是 EPUB 还是 TXT。</p>
+
+<div class="diag">
+<svg width="100%" viewBox="0 0 920 430" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <marker id="a2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <text x="50" y="40" font-size="14" font-weight="500" fill="#185FA5">EPUB 路径</text>
+  <rect x="50" y="56" width="150" height="56" rx="10" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+  <text x="125" y="80" font-size="13" font-weight="500" fill="#0C447C" text-anchor="middle">book.epub</text>
+  <text x="125" y="99" font-size="11" fill="#5F5E5A" text-anchor="middle">zip 容器</text>
+  <line x1="200" y1="84" x2="238" y2="84" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a2)"/>
+  <rect x="244" y="56" width="150" height="56" rx="10" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+  <text x="319" y="80" font-size="13" font-weight="500" fill="#0C447C" text-anchor="middle">中央目录 + OPF</text>
+  <text x="319" y="99" font-size="11" fill="#5F5E5A" text-anchor="middle">一次 IO 得全书结构</text>
+  <line x1="394" y1="84" x2="432" y2="84" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a2)"/>
+  <rect x="438" y="56" width="150" height="56" rx="10" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+  <text x="513" y="80" font-size="13" font-weight="500" fill="#0C447C" text-anchor="middle">spine 条目 → XHTML</text>
+  <text x="513" y="99" font-size="11" fill="#5F5E5A" text-anchor="middle">按需 inflate 单章</text>
+
+  <text x="50" y="176" font-size="14" font-weight="500" fill="#0F6E56">TXT 路径</text>
+  <rect x="50" y="192" width="150" height="56" rx="10" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+  <text x="125" y="216" font-size="13" font-weight="500" fill="#085041" text-anchor="middle">book.txt</text>
+  <text x="125" y="235" font-size="11" fill="#5F5E5A" text-anchor="middle">mmap，不整载内存</text>
+  <line x1="200" y1="220" x2="238" y2="220" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a2)"/>
+  <rect x="244" y="192" width="150" height="56" rx="10" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+  <text x="319" y="216" font-size="13" font-weight="500" fill="#085041" text-anchor="middle">编码检测 + 流式分章</text>
+  <text x="319" y="235" font-size="11" fill="#5F5E5A" text-anchor="middle">只扫每行行首 N 字</text>
+  <line x1="394" y1="220" x2="432" y2="220" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a2)"/>
+  <rect x="438" y="192" width="150" height="56" rx="10" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+  <text x="513" y="216" font-size="13" font-weight="500" fill="#085041" text-anchor="middle">段落切分 / 逻辑块</text>
+  <text x="513" y="235" font-size="11" fill="#5F5E5A" text-anchor="middle">巨章切 256KB 一块</text>
+
+  <path d="M588 84 C 620 84 620 170 646 196" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a2)"/>
+  <text x="600" y="130" font-size="11.5" fill="#5F5E5A">清洗 → Block 流</text>
+  <path d="M588 220 C 618 220 618 214 646 210" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <rect x="652" y="120" width="228" height="196" rx="14" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="0.5"/>
+  <text x="766" y="150" font-size="14" font-weight="500" fill="#3C3489" text-anchor="middle">统一数据模型 rrk-model</text>
+  <rect x="672" y="168" width="188" height="58" rx="8" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="0.5"/>
+  <text x="766" y="191" font-size="12.5" font-weight="500" fill="#3C3489" text-anchor="middle">结构层</text>
+  <text x="766" y="211" font-size="11" fill="#5F5E5A" text-anchor="middle">BookMeta · TocNode · ChapterEntry</text>
+  <rect x="672" y="238" width="188" height="58" rx="8" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="0.5"/>
+  <text x="766" y="261" font-size="12.5" font-weight="500" fill="#3C3489" text-anchor="middle">内容层</text>
+  <text x="766" y="281" font-size="11" fill="#5F5E5A" text-anchor="middle">ChapterContent = Block 流 + 零拷贝切片</text>
+
+  <rect x="50" y="300" width="538" height="96" rx="12" fill="#FAECE7" stroke="#F5C4B3" stroke-width="0.5"/>
+  <text x="72" y="328" font-size="13" font-weight="500" fill="#712B13">解析期的两条硬纪律</text>
+  <text x="72" y="352" font-size="12" fill="#5F5E5A">· 建索引不搬内容：目录 / 章索引只读结构，正文按需加载（打开任一章 O(1) 定位）</text>
+  <text x="72" y="374" font-size="12" fill="#5F5E5A">· 零拷贝：正文一整块内存切片，文本只存「偏移 + 长度」引用，任何层不复制字符串</text>
+</svg>
+<p class="cap">图 2 · 双路径解析，单一出口：无论什么格式，排版层拿到的都是干净的 Block 流</p>
+</div>
+
+<h3>EPUB 解析细节</h3>
+<ul>
+  <li><strong>zip 随机读</strong>：只读一次中央目录拿到全部条目表，绝不整包解压；每章按需 inflate 单个条目。</li>
+  <li><strong>OPF 三件套</strong>：metadata（书名/作者/封面）→ manifest（条目 → 媒体类型）→ spine（阅读顺序）；目录优先 EPUB3 nav.xhtml，回退 NCX。</li>
+  <li><strong>XHTML → Block 清洗</strong>：标签白名单（p / h1–h6 / img / blockquote…），CSS 只取影响排版的最小集（字号/行距/缩进/对齐），图片转成资源引用。</li>
+  <li>DRM 加密的书明确报 <code>UnsupportedFormat</code>，不静默降级。</li>
+</ul>
+
+<h3>TXT 解析细节</h3>
+<ul>
+  <li><strong>编码三级判定</strong>：BOM → UTF-8 合法性校验 → chardetng 采样（GB18030/GBK/Big5…），结论全书复用。</li>
+  <li><strong>流式分章</strong>：只扫每行行首 N 个字符跑分章状态机（「第X章 / Chapter N / 卷…」），记字节偏移不复制文本；没有任何章节标记的巨书按固定字数切<strong>逻辑块</strong>。</li>
+  <li><strong>大文件友好</strong>：200MB 的 TXT 全程 mmap，内存占用与书的大小无关。</li>
+</ul>
+
+<h2 id="s3"><span class="no">三</span>渲染：从 Block 流到屏幕像素</h2>
+<p>排版被定义为一个<strong>纯函数</strong>：<code>layout(内容, 样式, 视口) → LayoutPage[]</code>。纯函数意味着可缓存、可后台并行、可流式替换。渲染出口有两种消费方式：</p>
+
+<div class="diag">
+<svg width="100%" viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <marker id="a3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <rect x="40" y="46" width="180" height="52" rx="10" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+  <text x="130" y="68" font-size="12.5" font-weight="500" fill="#085041" text-anchor="middle">ChapterContent</text>
+  <text x="130" y="87" font-size="11" fill="#5F5E5A" text-anchor="middle">Block 流（内容）</text>
+  <rect x="40" y="118" width="180" height="52" rx="10" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="0.5"/>
+  <text x="130" y="140" font-size="12.5" font-weight="500" fill="#3C3489" text-anchor="middle">StyleSpec</text>
+  <text x="130" y="159" font-size="11" fill="#5F5E5A" text-anchor="middle">字体 · 字号 · 行距（styleHash）</text>
+  <rect x="40" y="190" width="180" height="52" rx="10" fill="#FAEEDA" stroke="#FAC775" stroke-width="0.5"/>
+  <text x="130" y="212" font-size="12.5" font-weight="500" fill="#854F0B" text-anchor="middle">Viewport</text>
+  <text x="130" y="231" font-size="11" fill="#5F5E5A" text-anchor="middle">宽 · 高 · dpr（viewportHash）</text>
+
+  <line x1="220" y1="72" x2="266" y2="130" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a3)"/>
+  <line x1="220" y1="144" x2="266" y2="150" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a3)"/>
+  <line x1="220" y1="216" x2="266" y2="172" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a3)"/>
+
+  <rect x="272" y="86" width="210" height="130" rx="14" fill="#FFFFFF" stroke="#D3D1C7" stroke-width="1"/>
+  <text x="377" y="122" font-size="14" font-weight="500" fill="#2C2C2A" text-anchor="middle">layout() 纯函数</text>
+  <text x="377" y="146" font-size="11.5" fill="#5F5E5A" text-anchor="middle">rrk-layout：整形 · 断行 · 分页</text>
+  <text x="377" y="166" font-size="11.5" fill="#5F5E5A" text-anchor="middle">rayon 并行 · 可取消 · 可缓存</text>
+  <text x="377" y="192" font-size="11.5" fill="#185FA5" text-anchor="middle">只排落位页 ±2，不等整章</text>
+
+  <line x1="482" y1="151" x2="530" y2="151" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a3)"/>
+  <rect x="536" y="118" width="170" height="66" rx="10" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+  <text x="621" y="145" font-size="12.5" font-weight="500" fill="#0C447C" text-anchor="middle">LayoutPage（不可变）</text>
+  <text x="621" y="166" font-size="11" fill="#5F5E5A" text-anchor="middle">行表 + 字形 run + 图片矩形</text>
+
+  <path d="M706 138 C 736 138 736 92 760 88" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a3)"/>
+  <path d="M706 164 C 736 164 736 240 760 244" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a3)"/>
+
+  <rect x="766" y="52" width="140" height="88" rx="12" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="0.5"/>
+  <text x="836" y="82" font-size="12.5" font-weight="500" fill="#3C3489" text-anchor="middle">几何模式（默认）</text>
+  <text x="836" y="102" font-size="10.5" fill="#5F5E5A" text-anchor="middle">Flutter Canvas 自绘</text>
+  <text x="836" y="120" font-size="10.5" fill="#5F5E5A" text-anchor="middle">可选字 · 高亮 · 点选</text>
+
+  <rect x="766" y="200" width="140" height="88" rx="12" fill="#FAECE7" stroke="#F5C4B3" stroke-width="0.5"/>
+  <text x="836" y="230" font-size="12.5" font-weight="500" fill="#712B13" text-anchor="middle">栅格化模式</text>
+  <text x="836" y="250" font-size="10.5" fill="#5F5E5A" text-anchor="middle">内核算出 RGBA 位图</text>
+  <text x="836" y="268" font-size="10.5" fill="#5F5E5A" text-anchor="middle">贴图最快 · 选不了字</text>
+
+  <text x="460" y="316" font-size="11.5" fill="#5F5E5A" text-anchor="middle">文字书（EPUB / TXT）走几何模式；PDF 原版页走栅格化模式 —— 同一个 renderPage 出口</text>
+</svg>
+<p class="cap">图 3 · 渲染管线：三个输入、一个纯函数、两种输出</p>
+</div>
+
+<table>
+  <tr><th></th><th>几何模式（默认）</th><th>栅格化模式</th></tr>
+  <tr><td>跨 FFI 传什么</td><td>行 / 字形的位置数据</td><td>一张 RGBA 像素图</td></tr>
+  <tr><td>屏幕显示</td><td>Flutter Canvas 自绘</td><td>直接贴图</td></tr>
+  <tr><td>文字选中 / 高亮 / 链接点选</td><td>天然支持</td><td>不支持（只是图）</td></tr>
+  <tr><td>适用</td><td>EPUB / TXT / MOBI 等重排书</td><td>PDF 原版页、预览缩略、低端机降级</td></tr>
+</table>
+
+<h2 id="s4"><span class="no">四</span>一次开书的调用链（Flutter API 视角）</h2>
+<p>宿主只需要依赖 <code>rrk_reader</code> 包，调用一条线：<code>openBook → toc → loadChapter / pagesOf → renderPage</code>。所有重活在 Rust 线程池，Dart 侧只见 Future / Stream，UI 线程零等待。</p>
+
+<div class="diag">
+<svg width="100%" viewBox="0 0 920 250" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <marker id="a4" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <g>
+    <rect x="30" y="56" width="152" height="92" rx="12" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+    <text x="106" y="82" font-size="12.5" font-weight="500" fill="#0C447C" text-anchor="middle">① openBook(path)</text>
+    <text x="106" y="102" font-size="10.5" fill="#5F5E5A" text-anchor="middle">FFI 建会话</text>
+    <text x="106" y="119" font-size="10.5" fill="#5F5E5A" text-anchor="middle">返回书句柄</text>
+  </g>
+  <line x1="182" y1="102" x2="208" y2="102" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a4)"/>
+  <g>
+    <rect x="214" y="56" width="152" height="92" rx="12" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+    <text x="290" y="82" font-size="12.5" font-weight="500" fill="#0C447C" text-anchor="middle">② meta / toc</text>
+    <text x="290" y="102" font-size="10.5" fill="#5F5E5A" text-anchor="middle">结构缓存命中即返</text>
+    <text x="290" y="119" font-size="10.5" fill="#5F5E5A" text-anchor="middle">书名 · 目录树</text>
+  </g>
+  <line x1="366" y1="102" x2="392" y2="102" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a4)"/>
+  <g>
+    <rect x="398" y="56" width="152" height="92" rx="12" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+    <text x="474" y="82" font-size="12.5" font-weight="500" fill="#085041" text-anchor="middle">③ loadChapter</text>
+    <text x="474" y="102" font-size="10.5" fill="#5F5E5A" text-anchor="middle">解压 + 清洗（或 mmap）</text>
+    <text x="474" y="119" font-size="10.5" fill="#5F5E5A" text-anchor="middle">Block 流</text>
+  </g>
+  <line x1="550" y1="102" x2="576" y2="102" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a4)"/>
+  <g>
+    <rect x="582" y="56" width="152" height="92" rx="12" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="0.5"/>
+    <text x="658" y="82" font-size="12.5" font-weight="500" fill="#3C3489" text-anchor="middle">④ pagesOf</text>
+    <text x="658" y="102" font-size="10.5" fill="#5F5E5A" text-anchor="middle">只排落位页 ±2</text>
+    <text x="658" y="119" font-size="10.5" fill="#5F5E5A" text-anchor="middle">LayoutPage 列表</text>
+  </g>
+  <line x1="734" y1="102" x2="760" y2="102" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#a4)"/>
+  <g>
+    <rect x="766" y="56" width="130" height="92" rx="12" fill="#FAECE7" stroke="#F5C4B3" stroke-width="0.5"/>
+    <text x="831" y="82" font-size="12.5" font-weight="500" fill="#712B13" text-anchor="middle">⑤ renderPage</text>
+    <text x="831" y="102" font-size="10.5" fill="#5F5E5A" text-anchor="middle">几何 / 位图</text>
+    <text x="831" y="119" font-size="10.5" fill="#5F5E5A" text-anchor="middle">出字上屏</text>
+  </g>
+
+  <rect x="30" y="182" width="380" height="34" rx="8" fill="#E1F5EE" stroke="#9FE1CB" stroke-width="0.5"/>
+  <text x="220" y="204" font-size="12" fill="#085041" text-anchor="middle">热启动预算：点书卡 → 首次出字 ≤ 150ms（缓存命中 ≈ 0）</text>
+  <rect x="430" y="182" width="300" height="34" rx="8" fill="#FAEEDA" stroke="#FAC775" stroke-width="0.5"/>
+  <text x="580" y="204" font-size="12" fill="#854F0B" text-anchor="middle">冷启动预算：≤ 600ms（未预载的书）</text>
+</svg>
+<p class="cap">图 4 · 一次开书的调用链与性能预算</p>
+</div>
+
+<pre><span style="color:#5F5E5A">// 最小接入：三步开一本书</span>
+final engine = await RrkEngine.create();
+final book = await engine.openBook('/path/to/book.epub');
+
+final toc = await book.toc();                                  <span style="color:#5F5E5A">// 目录</span>
+final pages = await book.pagesOf(chapterId, style, viewport);   <span style="color:#5F5E5A">// 分页</span>
+final page = await book.renderPage(PageRef(pages.first));       <span style="color:#5F5E5A">// 渲染指定页面</span>
+<span style="color:#5F5E5A">// page.geometry → Flutter 自绘；page.rgba → 直接贴图</span></pre>
+
+<h2 id="s5"><span class="no">五</span>缓存：为什么第二次打开是瞬时的</h2>
+<p>排版结果是不可变对象，因此可缓存、可落盘 —— 这是 Rust 内核最持久的收益（Flutter 原生排版结果不可序列化，关掉就没了）。缓存 key 由三要素组成，改字号只失效布局、转屏只排可见页：</p>
+
+<div class="diag">
+<svg width="100%" viewBox="0 0 920 306" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
+  <rect x="180" y="24" width="560" height="42" rx="10" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="0.5"/>
+  <text x="460" y="51" font-size="13.5" font-weight="500" fill="#3C3489" text-anchor="middle">缓存 key = contentHash × styleHash × viewportHash</text>
+
+  <rect x="40" y="106" width="260" height="150" rx="14" fill="#FFFFFF" stroke="#D3D1C7" stroke-width="1"/>
+  <text x="170" y="138" font-size="13.5" font-weight="500" fill="#2C2C2A" text-anchor="middle">C1 内存页缓存</text>
+  <text x="170" y="164" font-size="11.5" fill="#5F5E5A" text-anchor="middle">当前章 ±1 的 LayoutPage</text>
+  <text x="170" y="186" font-size="11.5" fill="#5F5E5A" text-anchor="middle">LRU + 保护窗口</text>
+  <text x="170" y="206" font-size="11.5" fill="#5F5E5A" text-anchor="middle">窗口所在章永不淘汰</text>
+  <text x="170" y="232" font-size="11.5" fill="#185FA5" text-anchor="middle">翻页 = 切页对象，零排版</text>
+
+  <rect x="330" y="106" width="260" height="150" rx="14" fill="#FFFFFF" stroke="#D3D1C7" stroke-width="1"/>
+  <text x="460" y="138" font-size="13.5" font-weight="500" fill="#2C2C2A" text-anchor="middle">C2 磁盘布局缓存</text>
+  <text x="460" y="164" font-size="11.5" fill="#5F5E5A" text-anchor="middle">rkyv 归档 · mmap 直读</text>
+  <text x="460" y="186" font-size="11.5" fill="#5F5E5A" text-anchor="middle">加载成本 ≈ 0</text>
+  <text x="460" y="206" font-size="11.5" fill="#5F5E5A" text-anchor="middle">损坏自动隔离重算</text>
+  <text x="460" y="232" font-size="11.5" fill="#185FA5" text-anchor="middle">重开书免排版（命中 ≥ 90%）</text>
+
+  <rect x="620" y="106" width="260" height="150" rx="14" fill="#FFFFFF" stroke="#D3D1C7" stroke-width="1"/>
+  <text x="750" y="138" font-size="13.5" font-weight="500" fill="#2C2C2A" text-anchor="middle">C3 源数据缓存</text>
+  <text x="750" y="164" font-size="11.5" fill="#5F5E5A" text-anchor="middle">ContentChunk（分章压缩块）</text>
+  <text x="750" y="186" font-size="11.5" fill="#5F5E5A" text-anchor="middle">结构缓存（目录 / 章索引）</text>
+  <text x="750" y="206" font-size="11.5" fill="#5F5E5A" text-anchor="middle">常驻，体积小</text>
+  <text x="750" y="232" font-size="11.5" fill="#185FA5" text-anchor="middle">随书生命周期</text>
+
+  <text x="460" y="288" font-size="11.5" fill="#5F5E5A" text-anchor="middle">改字号 → 只失效布局　·　转屏 → 只重排可见页　·　旧缓存保留，回切即命中</text>
+</svg>
+<p class="cap">图 5 · 三级缓存：内存快、磁盘免重算、源数据常驻</p>
+</div>
+
+<h2>性能纪律速览</h2>
+<ul>
+  <li><strong>关键路径零全量</strong>：整本书的解压 / 分章 / 排版永远不出现在开书的关键路径上。</li>
+  <li><strong>一次 FFI = 一个任务</strong>：绝不逐行跨界；首帧路径 FFI 往返 ≤ 2 次，大块数据零拷贝。</li>
+  <li><strong>永远有可显示的东西</strong>：快照 → 估算页 → 精排页三级交付，替换时按语义坐标重锚、不跳动。</li>
+  <li><strong>全自研、代码可控</strong>：解析 / 解压 / 排版 / 渲染管线全部自研，无黑盒 SDK；第三方仅限纯 Rust 可审计白名单件。</li>
+</ul>
+
+<p class="cap" style="margin-top:36px">基于《设计-Rust阅读内核总体方案》 · 细节与 API 定义见 docs/ 内原文档</p>
+
+</main>
+</body>
+</html>

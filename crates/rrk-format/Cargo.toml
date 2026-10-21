@@ -1,0 +1,9 @@
+[package]
+name = "rrk-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：格式适配接口（FormatAdapter/BookSource）与嗅探注册表"
+
+[dependencies]
+rrk-model.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "rrk-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：统一书籍数据模型（结构层/内容层/版式层）"
+
+[dependencies]

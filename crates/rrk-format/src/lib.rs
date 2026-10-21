@@ -1,0 +1,196 @@
+//! rrk-format：格式适配接口与嗅探注册表（方案 §3.1）。
+//!
+//! 一个格式 = 一个 [`FormatAdapter`]；打开后统一为 [`BookSource`] 契约。
+//! 扩展方式是**静态注册**（[`FormatRegistry::register`]），不做 dylib 动态插件。
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rrk_model::{
+    BookMeta, ChapterContent, ChapterEntry, ChapterId, FormatId, Resource, ResourceKey,
+    RrkError, RrkResult, TocNode,
+};
+
+// ---------------------------------------------------------------------------
+// 内容源
+// ---------------------------------------------------------------------------
+
+/// 打开一本书的输入：路径（大文件友好）或内存字节。
+#[derive(Debug, Clone)]
+pub enum ContentSource {
+    Path(PathBuf),
+    Bytes { name: Option<String>, data: Arc<[u8]> },
+}
+
+impl ContentSource {
+    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+        ContentSource::Path(path.into())
+    }
+
+    pub fn from_bytes(name: Option<String>, data: impl Into<Arc<[u8]>>) -> Self {
+        ContentSource::Bytes { name, data: data.into() }
+    }
+
+    /// 取用于嗅探的文件名。
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            ContentSource::Path(p) => p.file_name().and_then(|s| s.to_str()),
+            ContentSource::Bytes { name, .. } => name.as_deref(),
+        }
+    }
+
+    /// 读入全部字节（P0 简化实现；mmap 化在 P2 落盘档接入）。
+    pub fn read_all(&self) -> RrkResult<Arc<[u8]>> {
+        match self {
+            ContentSource::Path(p) => {
+                let bytes = std::fs::read(p).map_err(|e| {
+                    RrkError::io(format!("读取文件失败: {}", p.display())).with_context(e.to_string())
+                })?;
+                Ok(bytes.into())
+            }
+            ContentSource::Bytes { data, .. } => Ok(Arc::clone(data)),
+        }
+    }
+
+    /// 读取前 `n` 字节做嗅探（不足则全读）。
+    pub fn read_head(&self, n: usize) -> RrkResult<Vec<u8>> {
+        match self {
+            ContentSource::Path(p) => {
+                use std::io::Read;
+                let mut f = std::fs::File::open(p)?;
+                let mut buf = vec![0u8; n];
+                let read = f.read(&mut buf)?;
+                buf.truncate(read);
+                Ok(buf)
+            }
+            ContentSource::Bytes { data, .. } => {
+                let take = n.min(data.len());
+                Ok(data[..take].to_vec())
+            }
+        }
+    }
+}
+
+impl From<&Path> for ContentSource {
+    fn from(p: &Path) -> Self {
+        ContentSource::Path(p.to_path_buf())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 适配器与书源契约
+// ---------------------------------------------------------------------------
+
+/// 一个格式 = 一个适配器。
+pub trait FormatAdapter: Send + Sync {
+    fn id(&self) -> FormatId;
+
+    /// 读头部字节 + 文件名返回置信度（0 = 不认）。
+    fn sniff(&self, head: &[u8], name: Option<&str>) -> u32;
+
+    /// 打开为统一书源。
+    fn open(&self, src: &ContentSource) -> RrkResult<Box<dyn BookSource>>;
+}
+
+/// 统一书源：所有格式的输出契约（吸收 foliate-js `sections.load/unload/size` 思想）。
+pub trait BookSource: Send {
+    fn meta(&self) -> &BookMeta;
+
+    /// 目录树。
+    fn toc(&self) -> RrkResult<Vec<TocNode>>;
+
+    /// 章索引：O(结构) 可得，不解压正文（「建索引不搬内容」）。
+    fn chapters(&self) -> RrkResult<Vec<ChapterEntry>>;
+
+    /// 加载一章（解析层出口：结构层 + 内容层）。
+    fn load_chapter(&self, id: ChapterId) -> RrkResult<ChapterContent>;
+
+    /// 释放章解压缓存（可选优化，允许空实现）。
+    fn unload_chapter(&self, _id: ChapterId) {}
+
+    /// 按 key 加载资源（图片/字体）。
+    fn load_resource(&self, key: &ResourceKey) -> RrkResult<Resource>;
+
+    /// 封面。
+    fn cover(&self) -> RrkResult<Option<Resource>>;
+
+    /// 零解压权重估算（章 id → 估算字数），供进度与预排预算。
+    fn estimate_weights(&self) -> RrkResult<Vec<(ChapterId, u32)>>;
+}
+
+// ---------------------------------------------------------------------------
+// 注册表
+// ---------------------------------------------------------------------------
+
+/// 静态注册的格式注册表：按嗅探置信度选适配器。
+#[derive(Default)]
+pub struct FormatRegistry {
+    adapters: Vec<Box<dyn FormatAdapter>>,
+}
+
+impl FormatRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 注册一个适配器（后注册优先于低置信度，不覆盖更高置信度）。
+    pub fn register(&mut self, adapter: Box<dyn FormatAdapter>) {
+        self.adapters.push(adapter);
+    }
+
+    /// 嗅探出置信度最高的适配器。
+    pub fn detect(&self, head: &[u8], name: Option<&str>) -> Option<&dyn FormatAdapter> {
+        let mut best: Option<(u32, &dyn FormatAdapter)> = None;
+        for a in &self.adapters {
+            let score = a.sniff(head, name);
+            if score > 0 && best.map(|(s, _)| score > s).unwrap_or(true) {
+                best = Some((score, a.as_ref()));
+            }
+        }
+        best.map(|(_, a)| a)
+    }
+
+    /// 打开一本书：嗅探 → 适配器 → 统一书源。
+    pub fn open(&self, src: &ContentSource) -> RrkResult<Box<dyn BookSource>> {
+        let head = src.read_head(4096)?;
+        let adapter = self.detect(&head, src.name()).ok_or_else(|| {
+            let name = src.name().unwrap_or("<memory>").to_string();
+            RrkError::unsupported(format!("无法识别的格式: {name}"))
+        })?;
+        adapter.open(src)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeAdapter;
+
+    impl FormatAdapter for FakeAdapter {
+        fn id(&self) -> FormatId {
+            FormatId::Txt
+        }
+        fn sniff(&self, head: &[u8], name: Option<&str>) -> u32 {
+            if head.starts_with(b"FAKE") {
+                100
+            } else if name.map(|n| n.ends_with(".txt")).unwrap_or(false) {
+                10
+            } else {
+                0
+            }
+        }
+        fn open(&self, _src: &ContentSource) -> RrkResult<Box<dyn BookSource>> {
+            Err(RrkError::unsupported("fake"))
+        }
+    }
+
+    #[test]
+    fn registry_picks_highest_confidence() {
+        let mut reg = FormatRegistry::new();
+        reg.register(Box::new(FakeAdapter));
+        assert!(reg.detect(b"FAKE123", Some("a.bin")).is_some());
+        assert!(reg.detect(b"XXXX", Some("a.txt")).is_some());
+        assert!(reg.detect(b"XXXX", Some("a.bin")).is_none());
+    }
+}

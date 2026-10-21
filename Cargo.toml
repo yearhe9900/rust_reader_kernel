@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rrk-model",
+    "crates/rrk-format",
+    "crates/rrk-txt",
+    "crates/rrk-epub",
+    "crates/rrk-inspect",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = ""
+
+[workspace.dependencies]
+rrk-model = { path = "crates/rrk-model" }
+rrk-format = { path = "crates/rrk-format" }
+rrk-txt = { path = "crates/rrk-txt" }
+rrk-epub = { path = "crates/rrk-epub" }
+
+# 依赖白名单（方案 §3.2）：纯 Rust、可审计、可 fork、许可宽松。
+# 禁止 pdfium / mupdf / unrar / 闭源 SDK / 预编译黑盒二进制。
+encoding_rs = "0.8"      # 编码转换（Firefox 同源，纯 Rust）
+chardetng = "0.1"        # 编码检测（纯 Rust）
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }  # inflate（miniz_oxide 纯 Rust）
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

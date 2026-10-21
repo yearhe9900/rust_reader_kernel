@@ -1,0 +1,12 @@
+[package]
+name = "rrk-inspect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：CLI 校验器（打开书 → meta/toc/章索引/Block）"
+
+[dependencies]
+rrk-model.workspace = true
+rrk-format.workspace = true
+rrk-txt.workspace = true
+rrk-epub.workspace = true

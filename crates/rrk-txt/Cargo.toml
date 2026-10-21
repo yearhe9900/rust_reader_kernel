@@ -1,0 +1,12 @@
+[package]
+name = "rrk-txt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：TXT 适配器（编码三级检测 + 流式分章 + 逻辑块）"
+
+[dependencies]
+rrk-model.workspace = true
+rrk-format.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true

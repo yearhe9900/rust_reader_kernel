@@ -1,0 +1,12 @@
+[package]
+name = "rrk-epub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：EPUB 适配器（zip 随机读 + OPF/NCX/nav + XHTML→Block 清洗）"
+
+[dependencies]
+rrk-model.workspace = true
+rrk-format.workspace = true
+flate2.workspace = true
+encoding_rs.workspace = true
