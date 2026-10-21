@@ -17,4 +17,5 @@
 - 渲染默认模式确认（建议几何模式）。
 
 ## 环境
-- 本目录暂非 git 仓库（2026-10-21 确认）；用户「任务批次即提交 git」惯例待仓库初始化后生效。
+- 已 git 仓库（2026-10-21 初始化）；remote `origin` = https://github.com/yearhe9900/rust_reader_kernel.git，分支 `master`，首批 M0+M1 提交已推送。`tmp_book/`（测试书）、`target/`、`Cargo.lock` 在 .gitignore。
+- 用户「任务批次即提交 git」惯例生效中；crates.io 走 USTC 镜像。
