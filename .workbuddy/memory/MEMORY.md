@@ -19,5 +19,6 @@
 - 渲染默认模式确认（建议几何模式）。
 
 ## 环境
-- 已 git 仓库（2026-10-21 初始化）；remote `origin` = https://github.com/yearhe9900/rust_reader_kernel.git，分支 `master`，首批 M0+M1 提交已推送。`tmp_book/`（测试书）、`target/`、`Cargo.lock` 在 .gitignore。
+- 已 git 仓库（2026-10-21 初始化）；remote `origin` = https://github.com/yearhe9900/rust_reader_kernel.git，分支 `master`。`tmp_book/`（测试书）、`target/`、`Cargo.lock`、`.dart_tool/`、`pubspec.lock` 在 .gitignore。
+- **GitHub CLI 已装**（gh 2.101.0，账号 yearhe9900，repo 权限；`gh auth setup-git` 已配凭证助手——推送零警告）；可 gh 管理 issue/PR/Actions。用户口径：任务批次提交后用命令行推送。
 - 用户「任务批次即提交 git」惯例生效中；crates.io 走 USTC 镜像。
