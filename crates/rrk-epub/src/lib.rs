@@ -5,8 +5,6 @@
 //! - **章内容**：XHTML → [`clean::clean_xhtml`] 清洗管线（标签白名单 + CSS 最小集）；
 //! - **DRM**：`encryption.xml` 加密正文 → 明确 `UnsupportedFormat`，不静默。
 
-mod zip;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -16,8 +14,7 @@ use rrk_model::{
     fnv1a64, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId, Resource,
     ResourceKey, RrkError, RrkResult, TocNode,
 };
-
-use zip::{ZipArchive, ZipEntry};
+use rrk_zip::{ZipArchive, ZipEntry};
 
 const XHTML_TYPES: &[&str] = &["application/xhtml+xml", "text/html", "text/xml", "application/x-dtbook+xml"];
 

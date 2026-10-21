@@ -1,0 +1,9 @@
+[package]
+name = "rrk-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：三级缓存（内存 LRU + 磁盘落盘，三要素 key）"
+
+[dependencies]
+rrk-model.workspace = true

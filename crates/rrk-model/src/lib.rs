@@ -212,6 +212,43 @@ pub struct SemanticPos {
 }
 
 // ---------------------------------------------------------------------------
+// 固定版式（PDF/CBZ，方案 §2.4 页级变体）
+// ---------------------------------------------------------------------------
+
+/// 页种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageKind {
+    /// 矢量页（PDF）。
+    Vector,
+    /// 图片页（CBZ）。
+    Image,
+}
+
+/// 页索引项：O(结构) 可得，不解压。
+#[derive(Debug, Clone)]
+pub struct PageEntry {
+    pub index: u32,
+    /// 页尺寸（pt）。
+    pub size: (f32, f32),
+    pub kind: PageKind,
+}
+
+/// 页内容（L1 口径：图片页给资源，矢量页给抽取文本）。
+#[derive(Debug, Clone)]
+pub enum PagedContent {
+    /// 图片页。
+    Image(Resource),
+    /// 文本页（L1 抽取结果；L2 光栅位图在渲染层落）。
+    Text(ChapterContent),
+}
+
+/// 固定版式进度真值（页码；页内锚点后置）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedPos {
+    pub page: u32,
+}
+
+// ---------------------------------------------------------------------------
 // 错误
 // ---------------------------------------------------------------------------
 

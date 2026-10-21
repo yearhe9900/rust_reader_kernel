@@ -1,0 +1,11 @@
+[package]
+name = "rrk-zip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：自研 zip 随机读（EPUB/CBZ 共用；仅 inflate 用白名单件）"
+
+[dependencies]
+rrk-model.workspace = true
+flate2.workspace = true
+encoding_rs.workspace = true

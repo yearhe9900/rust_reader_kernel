@@ -9,58 +9,17 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
-use rrk_format::{BookSource, ContentSource, FormatAdapter, FormatRegistry};
-use rrk_model::{Block, FormatId, Inline, RrkError, RrkResult};
+use rrk_format::{ContentSource, FormatAdapter, FormatRegistry};
+use rrk_model::{Block, Inline};
 use rrk_txt::TxtAdapter;
-
-/// 「已识别但解析内核未落地」的桩适配器：给出准确的排期信息，而不是「无法识别」。
-/// 排期口径见《设计-Rust阅读内核总体方案》§3.8 格式支持矩阵。
-struct StubAdapter {
-    id: FormatId,
-    detect: fn(&[u8], Option<&str>) -> bool,
-    plan: &'static str,
-}
-
-impl FormatAdapter for StubAdapter {
-    fn id(&self) -> FormatId {
-        self.id
-    }
-
-    fn sniff(&self, head: &[u8], name: Option<&str>) -> u32 {
-        if (self.detect)(head, name) {
-            100
-        } else {
-            0
-        }
-    }
-
-    fn open(&self, _src: &ContentSource) -> RrkResult<Box<dyn BookSource>> {
-        Err(RrkError::unsupported(format!(
-            "已识别为 {}，解析内核尚未落地（{}）",
-            self.id, self.plan
-        )))
-    }
-}
 
 fn build_registry() -> FormatRegistry {
     let mut reg = FormatRegistry::new();
     reg.register(Box::new(rrk_epub::EpubAdapter));
     reg.register(Box::new(TxtAdapter));
     reg.register(Box::new(rrk_mobi::MobiAdapter));
-    // 排期中的格式：识别 + 明确报错（错误码 1002）
-    reg.register(Box::new(StubAdapter {
-        id: FormatId::Pdf,
-        detect: |h, _| h.starts_with(b"%PDF"),
-        plan: "PDF 自研分级（L1 文本→L2 光栅）在 M3/M4 排期，见方案 §3.6",
-    }));
-    reg.register(Box::new(StubAdapter {
-        id: FormatId::Cbz,
-        detect: |h, n| {
-            h.starts_with(b"PK\x03\x04")
-                && n.map(|s| s.to_ascii_lowercase().ends_with(".cbz")).unwrap_or(false)
-        },
-        plan: "CBZ 页级图库在 M3 排期，见方案 §3.7",
-    }));
+    reg.register(Box::new(rrk_cbz::CbzAdapter));
+    reg.register(Box::new(rrk_pdf::PdfAdapter));
     reg
 }
 

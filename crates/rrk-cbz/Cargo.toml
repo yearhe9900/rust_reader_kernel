@@ -1,0 +1,11 @@
+[package]
+name = "rrk-cbz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：CBZ 页级图库（数字自然序页索引 + 图片管线）"
+
+[dependencies]
+rrk-model.workspace = true
+rrk-format.workspace = true
+rrk-zip.workspace = true

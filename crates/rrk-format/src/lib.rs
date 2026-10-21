@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rrk_model::{
-    BookMeta, ChapterContent, ChapterEntry, ChapterId, FormatId, Resource, ResourceKey,
-    RrkError, RrkResult, TocNode,
+    BookMeta, ChapterContent, ChapterEntry, ChapterId, FormatId, PageEntry, PagedContent, Resource,
+    ResourceKey, RrkError, RrkResult, TocNode,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,6 +117,22 @@ pub trait BookSource: Send + Sync {
 
     /// 零解压权重估算（章 id → 估算字数），供进度与预排预算。
     fn estimate_weights(&self) -> RrkResult<Vec<(ChapterId, u32)>>;
+}
+
+/// 固定版式书源（PDF/CBZ，方案 §2.4）：页级随机读，进度 = 页码。
+pub trait PagedSource: Send + Sync {
+    fn meta(&self) -> &BookMeta;
+
+    /// 目录树（PDF outline；CBZ 通常为空）。
+    fn toc(&self) -> RrkResult<Vec<TocNode>>;
+
+    /// 页索引：O(结构) 可得（页数 + 尺寸表），不解压。
+    fn pages(&self) -> RrkResult<Vec<PageEntry>>;
+
+    /// 读一页（L1：图片资源或抽取文本；L2 光栅在渲染层）。
+    fn load_page(&self, index: u32) -> RrkResult<PagedContent>;
+
+    fn cover(&self) -> RrkResult<Option<Resource>>;
 }
 
 // ---------------------------------------------------------------------------
