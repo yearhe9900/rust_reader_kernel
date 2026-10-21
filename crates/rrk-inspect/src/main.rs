@@ -46,20 +46,8 @@ fn build_registry() -> FormatRegistry {
     let mut reg = FormatRegistry::new();
     reg.register(Box::new(rrk_epub::EpubAdapter));
     reg.register(Box::new(TxtAdapter));
-    // 排期中的格式：识别 + 明确报错（错误码 1002）。注意 AZW3 先注册（更特化，置信度同为 100 时先注册者胜）
-    reg.register(Box::new(StubAdapter {
-        id: FormatId::Azw3,
-        detect: |h, n| {
-            (h.len() >= 68 && &h[60..68] == b"BOOKMOBI")
-                && n.map(|s| s.to_ascii_lowercase().ends_with(".azw3")).unwrap_or(false)
-        },
-        plan: "MOBI/AZW3 自研解压在 M1 排期，见方案 §3.5",
-    }));
-    reg.register(Box::new(StubAdapter {
-        id: FormatId::Mobi,
-        detect: |h, _| h.len() >= 68 && (&h[60..68] == b"BOOKMOBI" || &h[60..68] == b"TEXtREAd"),
-        plan: "MOBI/AZW3 自研解压在 M1 排期，见方案 §3.5",
-    }));
+    reg.register(Box::new(rrk_mobi::MobiAdapter));
+    // 排期中的格式：识别 + 明确报错（错误码 1002）
     reg.register(Box::new(StubAdapter {
         id: FormatId::Pdf,
         detect: |h, _| h.starts_with(b"%PDF"),

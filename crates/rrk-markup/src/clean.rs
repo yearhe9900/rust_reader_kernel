@@ -132,7 +132,16 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
                     }
                     "img" => {
                         c.flush();
-                        let key = attr(&attrs, "src").unwrap_or("").to_string();
+                        // MOBI 的图片引用是 recindex（记录号），EPUB 是 src 路径
+                        let key = attr(&attrs, "src")
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .or_else(|| {
+                                attr(&attrs, "recindex")
+                                    .and_then(|s| s.parse::<u32>().ok())
+                                    .map(|n| format!("rec:{}", n.saturating_sub(1)))
+                            })
+                            .unwrap_or_default();
                         if !key.is_empty() {
                             let size_hint = match (
                                 attr(&attrs, "width").and_then(|w| w.parse().ok()),

@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "crates/rrk-model",
     "crates/rrk-format",
+    "crates/rrk-markup",
     "crates/rrk-txt",
     "crates/rrk-epub",
+    "crates/rrk-mobi",
     "crates/rrk-inspect",
 ]
 
@@ -17,8 +19,10 @@ repository = ""
 [workspace.dependencies]
 rrk-model = { path = "crates/rrk-model" }
 rrk-format = { path = "crates/rrk-format" }
+rrk-markup = { path = "crates/rrk-markup" }
 rrk-txt = { path = "crates/rrk-txt" }
 rrk-epub = { path = "crates/rrk-epub" }
+rrk-mobi = { path = "crates/rrk-mobi" }
 
 # 依赖白名单（方案 §3.2）：纯 Rust、可审计、可 fork、许可宽松。
 # 禁止 pdfium / mupdf / unrar / 闭源 SDK / 预编译黑盒二进制。

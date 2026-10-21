@@ -8,5 +8,6 @@ description = "Rust 阅读内核：EPUB 适配器（zip 随机读 + OPF/NCX/nav 
 [dependencies]
 rrk-model.workspace = true
 rrk-format.workspace = true
+rrk-markup.workspace = true
 flate2.workspace = true
 encoding_rs.workspace = true

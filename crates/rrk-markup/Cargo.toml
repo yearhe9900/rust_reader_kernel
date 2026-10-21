@@ -1,0 +1,9 @@
+[package]
+name = "rrk-markup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：最小 XML/HTML 标签扫描 + XHTML→Block 清洗管线（EPUB/MOBI 共用）"
+
+[dependencies]
+rrk-model.workspace = true

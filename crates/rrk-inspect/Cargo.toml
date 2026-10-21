@@ -10,3 +10,4 @@ rrk-model.workspace = true
 rrk-format.workspace = true
 rrk-txt.workspace = true
 rrk-epub.workspace = true
+rrk-mobi.workspace = true
