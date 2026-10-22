@@ -15,7 +15,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use rrk_kernel::{BookHandle, Kernel};
-use rrk_model::{Block, BookMeta, ChapterContent, ChapterEntry, Inline, LinkRange, RrkError, RrkErrorKind, TocNode};
+use rrk_model::{Block, BookMeta, ChapterEntry, LinkRange, RrkError, RrkErrorKind, TocNode};
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
 pub const RRK_ABI_VERSION: u32 = 4;
@@ -230,63 +230,43 @@ fn chapters_json(entries: &[ChapterEntry]) -> Vec<u8> {
     s.into_bytes()
 }
 
-fn inline_text(text: &str, inlines: &[Inline]) -> String {
-    let mut out = String::new();
-    for i in inlines {
-        if let Inline::Text { range, .. } = i {
-            out.push_str(range.slice(text));
-        }
-    }
-    out
-}
-
+/// 块树 → JSON（**唯一降维口径**：`rrk_model::flatten_blocks`，引用块摊平、
+/// 分割线丢弃、行内图片以 `\u{FFFC}key\u{FFFC}` 内嵌）。
 fn blocks_json(text: &str, blocks: &[Block]) -> Vec<u8> {
-    let mut s = String::with_capacity(256 * blocks.len().max(1));
+    use rrk_model::PlainBlock;
+    let flat = rrk_model::flatten_blocks(text, blocks);
+    let mut s = String::with_capacity(256 * flat.len().max(1));
     s.push('[');
-    let mut first = true;
-    for b in blocks {
-        let (ty, extra): (&str, String) = match b {
-            Block::Heading { level, inlines } => {
-                ("h", format!(",\"level\":{level},\"text\":{}", {
-                    let mut t = String::new();
-                    json_str(&inline_text(text, inlines), &mut t);
-                    t
-                }))
-            }
-            Block::Paragraph { inlines, indent } => {
-                ("p", format!(",\"indent\":{},\"text\":{}", indent, {
-                    let mut t = String::new();
-                    json_str(&inline_text(text, inlines), &mut t);
-                    t
-                }))
-            }
-            Block::Image { key, alt, .. } => {
-                ("img", format!(",\"key\":{},\"alt\":{}", {
-                    let mut k = String::new();
-                    json_str(&key.0, &mut k);
-                    k
-                }, {
-                    match alt {
-                        Some(a) => {
-                            let mut x = String::new();
-                            json_str(a, &mut x);
-                            x
-                        }
-                        None => "null".to_string(),
-                    }
-                }))
-            }
-            Block::Quote { blocks } => ("quote", format!(",\"count\":{}", blocks.len())),
-            Block::Divider => ("hr", String::new()),
-        };
-        if !first {
+    for (i, b) in flat.iter().enumerate() {
+        if i > 0 {
             s.push(',');
         }
-        first = false;
-        s.push_str("{\"type\":");
-        json_str(ty, &mut s);
-        s.push_str(&extra);
-        s.push('}');
+        match b {
+            PlainBlock::Heading { level, text: t } => {
+                s.push_str("{\"type\":\"h\",\"level\":");
+                s.push_str(&level.to_string());
+                s.push_str(",\"text\":");
+                json_str(t, &mut s);
+                s.push('}');
+            }
+            PlainBlock::Paragraph { text: t, indent } => {
+                s.push_str("{\"type\":\"p\",\"indent\":");
+                s.push_str(if *indent { "true" } else { "false" });
+                s.push_str(",\"text\":");
+                json_str(t, &mut s);
+                s.push('}');
+            }
+            PlainBlock::Image { key, alt } => {
+                s.push_str("{\"type\":\"img\",\"key\":");
+                json_str(&key.0, &mut s);
+                s.push_str(",\"alt\":");
+                match alt {
+                    Some(a) => json_str(a, &mut s),
+                    None => s.push_str("null"),
+                }
+                s.push('}');
+            }
+        }
     }
     s.push(']');
     s.into_bytes()
@@ -459,6 +439,28 @@ pub unsafe extern "C" fn rrk_cover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4 对拍：blocks_json 与 flatten_blocks 同源——引用摊平、分割线不出现。
+    #[test]
+    fn blocks_json_uses_flatten_contract() {
+        use rrk_model::{Inline, StyleFlags, TextRange};
+        let text: std::sync::Arc<str> = std::sync::Arc::from("引用正文");
+        let blocks = vec![
+            Block::Quote {
+                blocks: vec![Block::Paragraph {
+                    inlines: vec![Inline::Text {
+                        range: TextRange::new(0, 12),
+                        style: StyleFlags(0),
+                    }],
+                    indent: false,
+                }],
+            },
+            Block::Divider,
+        ];
+        let json = String::from_utf8(blocks_json(&text, &blocks)).unwrap();
+        assert!(json.contains("\"type\":\"p\""), "引用应摊平成段落: {json}");
+        assert!(!json.contains("quote") && !json.contains("\"hr\""), "不应残留结构标记: {json}");
+    }
 
     #[test]
     fn abi_version_and_errors() {

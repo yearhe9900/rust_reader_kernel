@@ -228,6 +228,77 @@ impl ChapterContent {
     }
 }
 
+/// 行内图片内嵌标记（用 U+FFFC 包裹资源 key）：`<U+FFFC><key><U+FFFC>`。
+///
+/// 宿主按此标记把段落文本织回「文字 / 图片」片段；U+FFFC（OBJECT REPLACEMENT
+/// CHARACTER）不会出现在正常正文中，故无需转义。
+pub const INLINE_IMAGE_MARKER: char = '\u{FFFC}';
+
+/// 扁平块：块树降维后的宿主可直接消费形态（引用块摊平、分割线丢弃）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlainBlock {
+    Paragraph { text: String, indent: bool },
+    Heading { level: u8, text: String },
+    Image { key: ResourceKey, alt: Option<String> },
+}
+
+impl PlainBlock {
+    /// 类型标签（与 FFI `blocks_json` 的 `type` 一致：`p` / `h` / `img`）。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            PlainBlock::Paragraph { .. } => "p",
+            PlainBlock::Heading { .. } => "h",
+            PlainBlock::Image { .. } => "img",
+        }
+    }
+}
+
+/// 行内序列 → 纯文本；行内图片内嵌为 `\u{FFFC}<key>\u{FFFC}`。
+pub fn inline_plain(text: &str, inlines: &[Inline]) -> String {
+    let mut out = String::new();
+    for i in inlines {
+        match i {
+            Inline::Text { range, .. } => out.push_str(range.slice(text)),
+            Inline::Image { key } => {
+                out.push(INLINE_IMAGE_MARKER);
+                out.push_str(&key.0);
+                out.push(INLINE_IMAGE_MARKER);
+            }
+        }
+    }
+    out
+}
+
+/// 块树 → 扁平块流：**引用块递归摊平、分割线丢弃、块级图片单列**。
+///
+/// 这是「内容块如何降维成宿主段落」的唯一口径（方案 #4 轻方案）：
+/// FFI 出口与 FRB/其它绑定的宿主桥都应消费本函数，不再各写一份映射。
+pub fn flatten_blocks(text: &str, blocks: &[Block]) -> Vec<PlainBlock> {
+    fn walk(text: &str, blocks: &[Block], out: &mut Vec<PlainBlock>) {
+        for b in blocks {
+            match b {
+                Block::Paragraph { inlines, indent } => out.push(PlainBlock::Paragraph {
+                    text: inline_plain(text, inlines),
+                    indent: *indent,
+                }),
+                Block::Heading { level, inlines } => out.push(PlainBlock::Heading {
+                    level: *level,
+                    text: inline_plain(text, inlines),
+                }),
+                Block::Image { key, alt, .. } => out.push(PlainBlock::Image {
+                    key: key.clone(),
+                    alt: alt.clone(),
+                }),
+                Block::Quote { blocks } => walk(text, blocks, out),
+                Block::Divider => {}
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(blocks.len());
+    walk(text, blocks, &mut out);
+    out
+}
+
 // ---------------------------------------------------------------------------
 // 进度坐标
 // ---------------------------------------------------------------------------
@@ -405,5 +476,52 @@ mod tests {
     fn fnv1a_known_values() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_ne!(fnv1a64(b"a"), fnv1a64(b"b"));
+    }
+
+    /// #4：块树降维为唯一口径——引用摊平、分割线丢弃、行内图片加标记。
+    #[test]
+    fn flatten_blocks_contract() {
+        use std::sync::Arc;
+        let text: Arc<str> = Arc::from("标题正文尾巴");
+        let para_inlines = vec![
+            Inline::Text { range: TextRange::new(0, 12), style: StyleFlags(0) },
+            Inline::Image { key: ResourceKey("img1.png".into()) },
+            Inline::Text { range: TextRange::new(12, 18), style: StyleFlags(0) },
+        ];
+        let blocks = vec![
+            Block::Heading {
+                level: 2,
+                inlines: vec![Inline::Text { range: TextRange::new(0, 6), style: StyleFlags(0) }],
+            },
+            Block::Paragraph { inlines: para_inlines, indent: true },
+            Block::Quote {
+                blocks: vec![Block::Paragraph {
+                    inlines: vec![Inline::Text {
+                        range: TextRange::new(0, 6),
+                        style: StyleFlags(0),
+                    }],
+                    indent: false,
+                }],
+            },
+            Block::Divider,
+            Block::Image {
+                key: ResourceKey("cover.png".into()),
+                alt: Some("封面".into()),
+                size_hint: None,
+            },
+        ];
+        let flat = flatten_blocks(&text, &blocks);
+        // 引用摊平 + 分割线丢弃：h / p / p / img
+        assert_eq!(
+            flat.iter().map(|b| b.kind()).collect::<Vec<_>>(),
+            vec!["h", "p", "p", "img"]
+        );
+        match &flat[1] {
+            PlainBlock::Paragraph { text: t, indent } => {
+                assert!(*indent);
+                assert_eq!(t, "标题正文\u{FFFC}img1.png\u{FFFC}尾巴");
+            }
+            _ => panic!("第二块应为段落"),
+        }
     }
 }

@@ -87,6 +87,14 @@ dart run example/smoke.dart <ffi库路径> <书路径>
 API 概览：`RrkEngine.init/openBook` → `meta()/toc()/chapters()/loadChapter()`
 → `pagesOf()/pageAt()/hitTest()/prefetch()`（排版与进度）→ `renderPage()`（整页位图）。
 
+### 接入选型：C ABI（`rrk-ffi`）还是 FRB 直连
+
+- **推荐 C ABI**：跨语言稳定边界，预编译动态库直接加载，宿主无需 Rust 工具链；
+  数据出口为 JSON（`meta_json` / `blocks_json` / `link_ranges`）。
+- **FRB 直连 `rrk-*` crate**：仅在需要零 JSON 序列化时选用。注意「块 → 宿主段落」
+  唯一降维口径是 `rrk_model::flatten_blocks`（引用块摊平、分割线丢弃、行内图片以
+  `\u{FFFC}<key>\u{FFFC}` 标记内嵌），**不要在宿主侧重写映射**，否则模型演进两处漂移。
+
 ### Flutter demo（阅读页）
 
 ```sh
