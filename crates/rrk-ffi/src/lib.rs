@@ -18,7 +18,7 @@ use rrk_kernel::{BookHandle, Kernel};
 use rrk_model::{Block, BookMeta, ChapterContent, ChapterEntry, Inline, RrkError, RrkErrorKind, TocNode};
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
-pub const RRK_ABI_VERSION: u32 = 2;
+pub const RRK_ABI_VERSION: u32 = 3;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -528,14 +528,33 @@ pub unsafe extern "C" fn rrk_render_page(
 // A 批：缓存接线 + 进度/命中/预取
 // ---------------------------------------------------------------------------
 
-fn style_of(font_family: &str, font_size: f32, line_height: f32) -> rrk_model::StyleSpec {
+fn style_of(
+    font_family: &str,
+    font_size: f32,
+    line_height: f32,
+    para_indent_em: f32,
+    align: u32,
+) -> rrk_model::StyleSpec {
     let mut st = rrk_model::StyleSpec::default();
     if !font_family.is_empty() {
         st.font_family = font_family.to_string();
     }
     st.font_size = font_size;
     st.line_height = line_height;
+    st.para_indent_em = para_indent_em.max(0.0);
+    st.align = align_of(align);
     st
+}
+
+/// FFI `align` 整数 → 模型枚举（0=Start 1=Center 2=End 3=Justify，越界按 Start）。
+fn align_of(code: u32) -> rrk_model::Align {
+    use rrk_model::Align;
+    match code {
+        1 => Align::Center,
+        2 => Align::End,
+        3 => Align::Justify,
+        _ => Align::Start,
+    }
 }
 
 fn cache_key(
@@ -591,6 +610,8 @@ pub unsafe extern "C" fn rrk_pages_json(
     font_len: usize,
     font_size: f32,
     line_height: f32,
+    para_indent_em: f32,
+    align: u32,
     width: f32,
     height: f32,
     dpr: f32,
@@ -611,7 +632,7 @@ pub unsafe extern "C" fn rrk_pages_json(
         };
         with_kernel(|k| {
             let book = k.book(handle).map_err(set_kind)?;
-            let style = style_of(&font_family, font_size, line_height);
+            let style = style_of(&font_family, font_size, line_height, para_indent_em, align);
             let vp = rrk_model::Viewport { width, height, dpr };
             let key = cache_key(book.meta().content_hash, &style, &vp, chapter_id);
 
@@ -682,6 +703,8 @@ pub unsafe extern "C" fn rrk_page_at(
     font_len: usize,
     font_size: f32,
     line_height: f32,
+    para_indent_em: f32,
+    align: u32,
     width: f32,
     height: f32,
     dpr: f32,
@@ -695,7 +718,7 @@ pub unsafe extern "C" fn rrk_page_at(
         let mut p: *mut u8 = std::ptr::null_mut();
         let mut n = 0usize;
         let rc = rrk_pages_json(
-            handle, chapter_id, font_ptr, font_len, font_size, line_height, width, height, dpr,
+            handle, chapter_id, font_ptr, font_len, font_size, line_height, para_indent_em, align, width, height, dpr,
             &mut p, &mut n,
         );
         if rc != 0 {
@@ -750,6 +773,8 @@ pub unsafe extern "C" fn rrk_hit_test(
     font_len: usize,
     font_size: f32,
     line_height: f32,
+    para_indent_em: f32,
+    align: u32,
     width: f32,
     height: f32,
     dpr: f32,
@@ -763,7 +788,7 @@ pub unsafe extern "C" fn rrk_hit_test(
         let mut p: *mut u8 = std::ptr::null_mut();
         let mut n = 0usize;
         let rc = rrk_pages_json(
-            handle, chapter_id, font_ptr, font_len, font_size, line_height, width, height, dpr,
+            handle, chapter_id, font_ptr, font_len, font_size, line_height, para_indent_em, align, width, height, dpr,
             &mut p, &mut n,
         );
         if rc != 0 {
@@ -851,6 +876,8 @@ pub unsafe extern "C" fn rrk_prefetch(
     font_len: usize,
     font_size: f32,
     line_height: f32,
+    para_indent_em: f32,
+    align: u32,
     width: f32,
     height: f32,
     dpr: f32,
@@ -861,7 +888,7 @@ pub unsafe extern "C" fn rrk_prefetch(
             let mut p: *mut u8 = std::ptr::null_mut();
             let mut n = 0usize;
             let rc = rrk_pages_json(
-                handle, target, font_ptr, font_len, font_size, line_height, width, height, dpr,
+                handle, target, font_ptr, font_len, font_size, line_height, para_indent_em, align, width, height, dpr,
                 &mut p, &mut n,
             );
             if rc == 0 {

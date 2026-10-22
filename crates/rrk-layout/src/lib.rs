@@ -111,8 +111,13 @@ impl Layouter {
             return;
         }
 
-        // 首行缩进：前置全角空格（CJK 语义等价 text-indent: 2em）
-        let prefix = if indent { "　　" } else { "" };
+        // 首行缩进：em → 前缀空格（全角 1em / 半角 en space 0.5em），
+        // 让断行宽度真实扣除缩进；同时记下缩进像素宽，供 run.x 补偿（见下）。
+        let (prefix, indent_px) = if indent {
+            indent_metrics(style.para_indent_em, style.font_size)
+        } else {
+            (String::new(), 0.0)
+        };
         let full = format!("{prefix}{text}");
         let shift = prefix.len() as u32;
 
@@ -141,6 +146,7 @@ impl Layouter {
                 Align::Start => Alignment::Start,
                 Align::Center => Alignment::Middle,
                 Align::End => Alignment::End,
+                Align::Justify => Alignment::Justified,
             },
             AlignmentOptions::default(),
         );
@@ -154,8 +160,13 @@ impl Layouter {
                 if let PositionedLayoutItem::GlyphRun(gr) = item {
                     let run = gr.run();
                     let range = run.text_range();
+                    // 段落首行的首个 run 含缩进前缀，其 `offset()` 从 0 起算，
+                    // 而导出的文本范围已扣掉前缀字节量；这里把 x 补到前缀宽度，
+                    // 宿主「range → x」才能画在缩进后的位置（否则缩进在几何模式下丢失）。
+                    let at_para_head = indent_px > 0.0 && text_range.start == 0 && range.start == 0;
+                    let x = if at_para_head { gr.offset() + indent_px } else { gr.offset() };
                     runs.push(FlatRun {
-                        x: gr.offset(),
+                        x,
                         // parley 的 metrics.baseline 是布局坐标系（累计）——
                         // 换算成「行内基线」（baseline - 行顶），分页时再加页内行光标 y
                         baseline: metrics.baseline - metrics.min_coord,
@@ -178,6 +189,19 @@ impl Layouter {
             *g = gap_after;
         }
     }
+}
+
+/// em → 首行缩进前缀（全角 1em / en space 0.5em）与对应像素宽度。
+fn indent_metrics(em: f32, font_size: f32) -> (String, f32) {
+    let em = em.clamp(0.0, 8.0);
+    let whole = em.floor() as usize;
+    let half = (em - whole as f32) >= 0.5;
+    let mut prefix = "　".repeat(whole);
+    if half {
+        prefix.push('\u{2002}'); // EN SPACE ≈ 0.5em
+    }
+    let used_em = whole as f32 + if half { 0.5 } else { 0.0 };
+    (prefix, used_em * font_size)
 }
 
 fn heading_scale(level: u8) -> f32 {
@@ -376,6 +400,51 @@ mod tests {
         let bytes = rrk_model::encode_pages(&pages);
         let back = rrk_model::decode_pages(&bytes).unwrap();
         assert_eq!(pages, back);
+    }
+
+    /// #6：para_indent_em 必须真影响首行起点（默认 2em 与 0 可测差异）。
+    #[test]
+    fn para_indent_em_shifts_first_line() {
+        let mut l = Layouter::new();
+        let c = chapter();
+        let vp = Viewport { width: 390.0, height: 842.0, dpr: 3.0 };
+        let mut s0 = StyleSpec::default();
+        s0.para_indent_em = 0.0;
+        let s2 = StyleSpec::default(); // 2.0
+        let p0 = l.layout(&c, &s0, &vp);
+        let p2 = l.layout(&c, &s2, &vp);
+        let x0 = p0[0].runs.iter().find(|r| r.line == 0).map(|r| r.x).unwrap_or(-1.0);
+        let x2 = p2[0].runs.iter().find(|r| r.line == 0).map(|r| r.x).unwrap_or(-1.0);
+        assert!(x2 > x0 + 1.0, "2em 缩进应让首行起点右移：x0={x0}, x2={x2}");
+        // 2em × 18px = 36px（字宽近似，容差放宽）
+        assert!((x2 - x0 - 36.0).abs() < 6.0, "缩进宽度应≈2em：{x2} - {x0}");
+    }
+
+    /// #6：justify 只改行内间距，不应改变断行结构。
+    #[test]
+    fn align_justify_keeps_breaks() {
+        let mut l = Layouter::new();
+        let c = chapter();
+        let vp = Viewport { width: 390.0, height: 842.0, dpr: 3.0 };
+        let s = StyleSpec::default();
+        let mut j = StyleSpec::default();
+        j.align = Align::Justify;
+        let ps = l.layout(&c, &s, &vp);
+        let pj = l.layout(&c, &j, &vp);
+        assert_eq!(ps.len(), pj.len());
+        assert_eq!(ps[0].lines.len(), pj[0].lines.len());
+    }
+
+    #[test]
+    fn indent_metrics_maps_em() {
+        let (p2, w2) = indent_metrics(2.0, 18.0);
+        assert_eq!(p2, "　　");
+        assert!((w2 - 36.0).abs() < 0.01);
+        let (p0, w0) = indent_metrics(0.0, 18.0);
+        assert!(p0.is_empty());
+        assert_eq!(w0, 0.0);
+        let (p15, _) = indent_metrics(1.5, 18.0);
+        assert_eq!(p15, "　\u{2002}");
     }
 }
 

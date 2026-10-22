@@ -5,12 +5,17 @@
 
 use crate::{ChapterId, ResourceKey, SemanticPos};
 
-/// 对齐方式。
+/// 对齐方式（宿主可调；取值与 FFI `align` 参数一一对应：0=Start 1=Center 2=End 3=Justify）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Align {
+    /// 起始对齐（LTR = 左）。
     Start,
+    /// 居中。
     Center,
+    /// 末尾对齐（LTR = 右）。
     End,
+    /// 两端对齐（最后一行仍按起始）。
+    Justify,
 }
 
 /// 样式规格（styleHash 输入；任何字段变化 → 布局缓存失效）。
@@ -18,10 +23,16 @@ pub enum Align {
 pub struct StyleSpec {
     /// 字体族名（fallback 由引擎处理）。
     pub font_family: String,
+    /// 正文字号（px / 逻辑像素）。
     pub font_size: f32,
+    /// 行高（相对字号的倍数）。
     pub line_height: f32,
-    /// 首行缩进（em；CJK 习惯 2）。
+    /// 首行缩进，单位 em（基准 = `font_size`；CJK 习惯 2）。
+    ///
+    /// 仅对 `Block::Paragraph { indent: true }` 生效；0 = 不缩进。
+    /// 该值已进 `style_hash`，改动即精确失效布局缓存。
     pub para_indent_em: f32,
+    /// 对齐方式（见 [`Align`]）。
     pub align: Align,
 }
 
