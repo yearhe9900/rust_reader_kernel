@@ -20,7 +20,9 @@ jobs:
       - name: rrk-inspect 冒烟（样张）
         run: |
           cargo build --release -p rrk-inspect
-          ./target/release/rrk-inspect tmp_book/fmt_gen_cjk_nav.epub >/dev/null
+          ./target/release/rrk-inspect fixtures/sample.epub >/dev/null
+          ./target/release/rrk-inspect fixtures/sample.cbz >/dev/null
+          ./target/release/rrk-inspect fixtures/sample.pdf >/dev/null
 
   dart-test:
     runs-on: ubuntu-latest
@@ -36,7 +38,7 @@ jobs:
         run: |
           dart pub get
           dart analyze
-          dart run example/smoke.dart ../../target/release/librrk_ffi.so ../../tmp_book/fmt_gen_long_line.txt
+          dart run example/smoke.dart ../../target/release/librrk_ffi.so ../../fixtures/sample.txt
 
   flutter-test:
     runs-on: ubuntu-latest

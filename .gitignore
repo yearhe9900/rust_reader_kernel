@@ -1,5 +1,22 @@
-target/
-Cargo.lock
+# Rust
+/target/
+# Cargo.lock 入库（workspace 含二进制 rrk-inspect，保证可复现构建）
+
+# 私有测试书库（含版权书籍，绝不入库）；公开样例见 fixtures/
 tmp_book/
+
+# Dart / Flutter
 **/.dart_tool/
 **/pubspec.lock
+**/build/
+**/.flutter-plugins*
+*.iml
+.idea/
+
+# 内部工作区数据（不公开）
+.workbuddy/
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+*.log
