@@ -7,6 +7,7 @@
 
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -122,15 +123,36 @@ _Bindings get _bindings {
 class RrkEngine {
   /// 加载原生内核库并校验 ABI 版本。
   ///
-  /// [libPath]：rrk_ffi 动态库路径（如 `target/release/rrk_ffi.dll`）。
-  static void init(String libPath) {
-    final lib = DynamicLibrary.open(libPath);
+  /// [libPath] 省略时按下列顺序自动解析（便于宿主零配置接入）：
+  /// 1. 显式参数 [libPath]；
+  /// 2. 环境变量 `RRK_LIB`；
+  /// 3. 平台默认名：Android `librrk_ffi.so`（jniLibs/APK 提供，系统链接器定位）、
+  ///    Windows `rrk_ffi.dll`、macOS `librrk_ffi.dylib`、其它 `librrk_ffi.so`；
+  /// 4. iOS：静态链接进宿主，走 `DynamicLibrary.process()`。
+  static void init([String? libPath]) {
+    final DynamicLibrary lib;
+    final explicit = libPath ?? Platform.environment['RRK_LIB'];
+    if (explicit != null && explicit.isNotEmpty) {
+      lib = DynamicLibrary.open(explicit);
+    } else if (Platform.isIOS) {
+      lib = DynamicLibrary.process();
+    } else {
+      lib = DynamicLibrary.open(_defaultLibName());
+    }
     final b = _Bindings(lib);
     final abi = b.abiVersion();
     if (abi != kRrkAbiVersion) {
       throw RrkException(1999, 'ABI 版本不匹配：内核=$abi，封装=$kRrkAbiVersion');
     }
     _b = b;
+  }
+
+  /// 未显式指定库路径时的平台默认库名。
+  static String _defaultLibName() {
+    if (Platform.isAndroid) return 'librrk_ffi.so';
+    if (Platform.isMacOS) return 'librrk_ffi.dylib';
+    if (Platform.isWindows) return 'rrk_ffi.dll';
+    return 'librrk_ffi.so';
   }
 
   /// 配置三要素缓存（目录 + 内存上限 MB）。
@@ -226,21 +248,26 @@ class TocNode {
 }
 
 class ChapterEntry {
-  ChapterEntry._(this.id, this.title, this.charLen, this.byteStart, this.byteEnd, this.part);
+  ChapterEntry._(this.id, this.title, this.href, this.charLen, this.byteStart, this.byteEnd, this.part);
   final int id;
   final String? title;
+
+  /// 稳定定位串（进度/同步的章节身份键）：EPUB = 包内路径、TXT = `txt:<字符偏移>`、
+  /// MOBI = `mobi:<序号>`、CBZ = 页名、PDF = `pdf:<序号>`。
+  final String href;
   final int charLen;
   final int byteStart;
   final int byteEnd;
   final int part;
 
   static List<ChapterEntry> _listFromJson(List<dynamic> js) => js
-      .map((e) => ChapterEntry._(e['id'] as int, e['title'] as String?, e['charLen'] as int,
+      .map((e) => ChapterEntry._(e['id'] as int, e['title'] as String?,
+          e['href'] as String? ?? '', e['charLen'] as int,
           e['byteStart'] as int, e['byteEnd'] as int, e['part'] as int))
       .toList();
 
   @override
-  String toString() => 'ChapterEntry(#$id ${title ?? "（无标题）"} ≈$charLen 字)';
+  String toString() => 'ChapterEntry(#$id ${title ?? "（无标题）"} $href ≈$charLen 字)';
 }
 
 class ChapterBlock {
