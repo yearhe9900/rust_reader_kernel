@@ -48,10 +48,8 @@ pub fn detect_encoding(head: &[u8]) -> EncodingGuess {
     if std::str::from_utf8(head).is_ok() {
         return EncodingGuess { label: "UTF-8", utf16le: false, utf16be: false, utf8: true };
     }
-    // 3. chardetng 采样判定
-    let mut detector = chardetng::EncodingDetector::new();
-    detector.feed(head, true);
-    let enc = detector.guess(None, true);
+    // 3. chardetng 采样判定（含单字节西文误判纠正）
+    let enc = resolve_encoding(head);
     let label: &'static str = if enc == encoding_rs::UTF_8 {
         "UTF-8(chardetng)"
     } else if enc == encoding_rs::GBK {
@@ -94,12 +92,67 @@ fn decode_text(bytes: &[u8], guess: EncodingGuess) -> RrkResult<String> {
 fn decode_with_charset(bytes: &[u8], forced: Option<&'static encoding_rs::Encoding>) -> String {
     let enc = forced.unwrap_or_else(|| {
         // 只采样头部 64KB 判定（禁止整书喂检测器——8MB 级会到秒级）
-        let mut detector = chardetng::EncodingDetector::new();
-        detector.feed(&bytes[..bytes.len().min(64 * 1024)], true);
-        detector.guess(None, true)
+        resolve_encoding(&bytes[..bytes.len().min(64 * 1024)])
     });
     let (cow, _encoding_used, _had_errors) = enc.decode(bytes);
     cow.into_owned()
+}
+
+/// chardetng 猜测 + 「单字节西文编码」误判纠正。
+///
+/// chardetng 对 GBK 中文小说常在 `GBK` / `windows-1252` 间摇摆——同一文件换成 4KB
+/// 窗口能判对、64KB 窗口却判成 windows-1252（统计模型被局部字节分布带偏）。
+/// 中文正文若按 windows-1252 解码会变成 `ÕâÐ©³à¼¡¹í` 这类拉丁扩展乱码。
+///
+/// 纠正判据（三条同时满足才改判 GBK，避免误伤真正的西文文本）：
+/// 1. chardetng 猜的是 `windows-1252`（单字节西文的默认兜底）；
+/// 2. 按 GBK 解码几乎无替换符（`U+FFFD`）且 CJK 占比 > 50%；
+/// 3. 解码后 ASCII 占比 < 12.5%（中文正文 ASCII 极少；西文正文 ASCII 占绝对多数，
+///    按 GBK 解会把字母吞进 CJK 对，ASCII 占比仍居高不下，故不会被误纠）。
+fn resolve_encoding(sample: &[u8]) -> &'static encoding_rs::Encoding {
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(sample, true);
+    let guess = detector.guess(None, true);
+    if guess != encoding_rs::WINDOWS_1252 || sample.len() < 16 {
+        return guess;
+    }
+    // 采样尾部可能截断一个多字节字符，去掉最后 2 字节避免把 1 个截断算成替换符
+    let trimmed = &sample[..sample.len() - 2];
+    let (cow, _, _) = encoding_rs::GBK.decode(trimmed);
+    let total = cow.chars().count();
+    if total == 0 {
+        return guess;
+    }
+    let mut cjk = 0usize;
+    let mut ascii = 0usize;
+    let mut bad = 0usize;
+    for c in cow.chars() {
+        if c == '\u{FFFD}' {
+            bad += 1;
+        } else if c.is_ascii() {
+            ascii += 1;
+        } else if is_cjk_char(c) {
+            cjk += 1;
+        }
+    }
+    // bad 允许极小比例（边界截断兜底）；CJK 过半、ASCII 很少 → 判为 GBK 正文
+    if bad * 100 <= total && cjk * 2 > total && ascii * 8 < total {
+        encoding_rs::GBK
+    } else {
+        guess
+    }
+}
+
+/// 是否 CJK 汉字/常用中文标点（用于编码纠正的正文占比判据）。
+fn is_cjk_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF
+    ) || matches!(
+        c,
+        '，' | '。' | '、' | '；' | '：' | '？' | '！' | '“' | '”' | '‘' | '’' | '（' | '）'
+            | '《' | '》' | '【' | '】' | '…' | '—' | '·' | '　'
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +666,29 @@ mod tests {
         let text = decode_text(&gbk_bytes, guess).unwrap();
         assert!(text.contains("第一章"));
         assert!(text.contains("正文"));
+    }
+
+    /// 回归：GBK 中文正文被 chardetng 误判成 windows-1252 时必须纠正回 GBK。
+    /// （真实复现：《神之血裔》等更俗 TXT 在 64KB 窗口被判 windows-1252 → `ÕâÐ©` 乱码）
+    #[test]
+    fn gbk_misdetected_as_single_byte_is_corrected() {
+        let src = "　　“这些赤肌鬼好像不一样。”他握紧了拳头，却又慢慢松开。\r\n".repeat(600);
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode(&src);
+        let head = &gbk_bytes[..gbk_bytes.len().min(64 * 1024)];
+        let enc = resolve_encoding(head);
+        assert_eq!(enc, encoding_rs::GBK, "GBK 正文应判为 GBK，实际 {}", enc.name());
+        let (decoded, _, _) = enc.decode(&gbk_bytes);
+        assert!(decoded.contains("这些赤肌鬼"), "解出的应是中文而非拉丁乱码");
+    }
+
+    /// 反向保护：真正的西文（windows-1252）不能被误纠正成 GBK。
+    #[test]
+    fn latin1_text_is_not_forced_to_gbk() {
+        let src = "El rápido zorro marrón salta sobre el perro perezoso, señor.\r\n".repeat(600);
+        let (bytes, _, _) = encoding_rs::WINDOWS_1252.encode(&src);
+        let head = &bytes[..bytes.len().min(64 * 1024)];
+        let enc = resolve_encoding(head);
+        assert_ne!(enc, encoding_rs::GBK, "西文不应被判为 GBK");
     }
 
     #[test]
