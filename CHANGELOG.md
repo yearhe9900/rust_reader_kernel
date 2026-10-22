@@ -9,6 +9,30 @@
 
 （暂无）
 
+## [0.1.1] - 2026-10-22
+
+修复 GitHub issue #1–#7。**ABI 2 → 5**：Dart 封装（`kRrkAbiVersion = 5`）与预编译原生库必须同步升级。
+
+### Added
+
+- `BookMeta.description`：EPUB `dc:description` / MOBI EXTH 103·104（空白折叠、4000 字符截断）。
+- `ChapterContent.link_ranges`：正文内链「文本区间 → href」；EPUB href 归一化为包内绝对路径并保留 `#frag`。
+- `rrk_model::flatten_blocks`：块树 → 宿主段落的唯一降维口径（引用块摊平、分割线丢弃、行内图片以 `\u{FFFC}<key>\u{FFFC}` 内嵌）。
+- 目录树：`TocNode.children` 保留 nav `<ol>/<li>` 与 NCX `navPoint` 嵌套；`TocNode.anchor` 惰性解析为章内字节偏移。
+- 封面回退：EPUB 显式封面 → spine 首文档首图 → manifest 首个 `image/*`；MOBI EXTH 201 缺失时按图片魔数扫描资源记录。
+- `BookKind`（Text / ImageGallery / Paged）+ `BookSource::as_paged`：CBZ/PDF 经统一句柄接入；
+  FFI 新增 `rrk_book_kind` / `rrk_page_count` / `rrk_load_page_json` / `rrk_load_resource`。
+- Dart：`BookMeta.description`、`ChapterContent.links`、`TocNode.anchor`、
+  `RrkBook.kind/pageCount/loadPage/loadResource` 与 `PagedPage`。
+
+### Fixed
+
+- TXT：GBK 正文被 `chardetng` 在 64KB 采样窗口误判为 `windows-1252`，正文解成 `ÕâÐ©` 类拉丁乱码。
+- 排版：`para_indent_em` / `align` 未被引擎消费——首行缩进在几何模式下丢失、对齐设置不生效；`align` 新增两端对齐。
+- 封面：无显式封面的书 `cover()` 返回 `None`。
+- 目录：层级被压平、`anchor` 恒 `None`、`fragment` 被丢弃。
+- 内容出口：宿主桥与 `rrk-ffi` 重复实现「块 → 文本」映射，模型演进需多处同步。
+
 ## [0.1.0] - 2026-10-22
 
 首个公开版本：六格式解析 → 高性能排版 → 双模式渲染 → FFI/Dart/Flutter 全链路。
