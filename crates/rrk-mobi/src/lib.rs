@@ -384,6 +384,29 @@ impl MobiBook {
     fn resource_record(&self, index: u32) -> RrkResult<&[u8]> {
         self.container.record(index as usize)
     }
+
+    /// 回退：EXTH 201 缺失时，从资源记录里找首个图片签名匹配项。
+    fn first_image_record(&self) -> Option<u32> {
+        let start = self.container.resource_start as usize;
+        let total = self.container.record_offsets.len();
+        for i in start..total {
+            if let Ok(d) = self.container.record(i) {
+                if looks_like_image(d) {
+                    return Some(i as u32);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// 按魔数判断是否图片（MOBI 资源记录无扩展名/媒体类型）。
+fn looks_like_image(d: &[u8]) -> bool {
+    d.starts_with(&[0xFF, 0xD8, 0xFF])
+        || d.starts_with(b"\x89PNG\r\n\x1a\n")
+        || d.starts_with(b"GIF8")
+        || d.starts_with(b"BM")
+        || (d.len() > 12 && &d[0..4] == b"RIFF" && &d[8..12] == b"WEBP")
 }
 
 // ---------------------------------------------------------------------------
@@ -482,10 +505,18 @@ impl BookSource for MobiBook {
     }
 
     fn cover(&self) -> RrkResult<Option<Resource>> {
-        let Some(cover_key) = &self.meta.cover else {
-            return Ok(None);
-        };
-        Ok(Some(self.load_resource(cover_key)?))
+        // 1) EXTH 201 声明的封面
+        if let Some(cover_key) = &self.meta.cover {
+            return Ok(Some(self.load_resource(cover_key)?));
+        }
+        // 2) 回退：资源记录里首个图片签名匹配项（部分 MOBI 不写 EXTH 201）
+        if let Some(idx) = self.first_image_record() {
+            let key = ResourceKey(format!("rec:{idx}"));
+            if let Ok(r) = self.load_resource(&key) {
+                return Ok(Some(r));
+            }
+        }
+        Ok(None)
     }
 
     fn estimate_weights(&self) -> RrkResult<Vec<(ChapterId, u32)>> {

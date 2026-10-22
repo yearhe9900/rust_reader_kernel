@@ -221,6 +221,29 @@ impl EpubBook {
         })
     }
 
+    /// 回退 2：spine 首个可渲染文档里的首个 `<img src>` → 包内绝对路径。
+    fn first_spine_image(&self) -> Option<ResourceKey> {
+        let first_id = self.spine.first()?;
+        let item = self.manifest.get(first_id)?;
+        let doc_path = resolve_href(&self.opf_dir, &item.href);
+        let entry = self.zip.entry(&doc_path)?;
+        let html = self.zip.read_string(entry).ok()?;
+        let base = dir_of(&doc_path);
+        for t in tokenize(&html) {
+            if let Token::Open { name, attrs, .. } = &t {
+                if local_name(name) == "img" {
+                    if let Some(src) = attr(attrs, "src") {
+                        let src = src.trim();
+                        if !src.is_empty() {
+                            return Some(ResourceKey(resolve_href(&base, src)));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn entry_for_chapter(&self, id: ChapterId) -> RrkResult<&ZipEntry> {
         let href = self
             .href_to_chapter
@@ -600,11 +623,28 @@ impl BookSource for EpubBook {
     }
 
     fn cover(&self) -> RrkResult<Option<Resource>> {
-        let Some(cover_key) = &self.meta.cover else {
-            // 三级回退之「spine 首图」略：P0 只走显式封面
-            return Ok(None);
-        };
-        Ok(Some(self.load_resource(cover_key)?))
+        // 1) 显式封面（EPUB3 properties=cover-image / EPUB2 meta name=cover）
+        if let Some(cover_key) = &self.meta.cover {
+            return Ok(Some(self.load_resource(cover_key)?));
+        }
+        // 2) spine 首个文档里的首个图片资源
+        if let Some(key) = self.first_spine_image() {
+            if let Ok(r) = self.load_resource(&key) {
+                return Ok(Some(r));
+            }
+        }
+        // 3) manifest 里首个 image/* 资源
+        if let Some(item) = self
+            .manifest
+            .values()
+            .find(|i| i.media_type.to_ascii_lowercase().starts_with("image/"))
+        {
+            let key = ResourceKey(resolve_href(&self.opf_dir, &item.href));
+            if let Ok(r) = self.load_resource(&key) {
+                return Ok(Some(r));
+            }
+        }
+        Ok(None)
     }
 
     fn estimate_weights(&self) -> RrkResult<Vec<(ChapterId, u32)>> {
@@ -788,5 +828,73 @@ mod tests {
         assert_eq!(resolve_link_href("OEBPS/text", "ch2.xhtml#s1"), "OEBPS/text/ch2.xhtml#s1");
         assert_eq!(resolve_link_href("OEBPS/text", "../images/a.png"), "OEBPS/images/a.png");
         assert_eq!(resolve_link_href("OEBPS/text", "#note1"), "#note1");
+    }
+
+    // ---- #5 封面三级回退 ----
+
+    fn book_with(opf: &str, ch1: &str, extra: &[(&str, &[u8])]) -> EpubBook {
+        let mut files: Vec<(&str, &[u8])> = vec![
+            ("META-INF/container.xml", CONTAINER.as_bytes()),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/text/ch1.xhtml", ch1.as_bytes()),
+        ];
+        files.extend_from_slice(extra);
+        let zip = build_zip(&files);
+        let src = ContentSource::from_bytes(
+            Some("t.epub".to_string()),
+            Arc::<[u8]>::from(zip.into_boxed_slice()),
+        );
+        EpubBook::parse(&src).unwrap()
+    }
+
+    const OPF_NO_COVER_META: &str = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>无显式封面</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+
+    const OPF_MANIFEST_IMAGE: &str = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>manifest 首图</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="pic" href="images/pic.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+
+    const CH1_NO_IMG: &str = r#"<html><body><p>纯文字</p></body></html>"#;
+
+    #[test]
+    fn cover_falls_back_to_first_spine_image() {
+        // spine 首文档含首图（manifest 未登记该图）→ 回退 2 命中
+        let book = book_with(
+            OPF_NO_COVER_META,
+            CH1,
+            &[("OEBPS/images/pic.png", b"\x89PNG-fake")],
+        );
+        let cover = book.cover().unwrap().expect("应回退到 spine 首图");
+        assert_eq!(cover.key.0, "OEBPS/images/pic.png");
+    }
+
+    #[test]
+    fn cover_falls_back_to_manifest_image() {
+        // spine 首文档无图 → 回退 3：manifest 首个 image/*
+        let book = book_with(
+            OPF_MANIFEST_IMAGE,
+            CH1_NO_IMG,
+            &[("OEBPS/images/pic.png", b"\x89PNG-fake")],
+        );
+        let cover = book.cover().unwrap().expect("应回退到 manifest 首图");
+        assert_eq!(cover.key.0, "OEBPS/images/pic.png");
+    }
+
+    #[test]
+    fn cover_none_when_no_image_anywhere() {
+        let book = book_with(OPF_NO_COVER_META, CH1_NO_IMG, &[]);
+        assert!(book.cover().unwrap().is_none());
     }
 }
