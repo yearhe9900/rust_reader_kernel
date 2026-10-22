@@ -100,6 +100,7 @@ impl PdfBook {
             chapters.push(ChapterEntry {
                 id: i as ChapterId,
                 title,
+                href: format!("pdf:{i}"),
                 byte_range: (start as u64, end as u64),
                 char_len: weight,
                 kind: ChapterKind::Text,

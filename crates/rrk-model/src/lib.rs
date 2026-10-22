@@ -98,11 +98,17 @@ pub enum ChapterKind {
     ImageGallery,
 }
 
-/// 章索引项：标题 + 字节范围 + 字数权重 + 锚点。
+/// 章索引项：标题 + 稳定定位串 + 字节范围 + 字数权重 + 锚点。
 #[derive(Debug, Clone)]
 pub struct ChapterEntry {
     pub id: ChapterId,
     pub title: Option<String>,
+    /// 稳定定位串（宿主进度/同步的章节身份键，同一本书内恒定、重开不变）。
+    ///
+    /// 口径按格式：EPUB = 包内路径（如 `OEBPS/text/ch1.xhtml`）；TXT =
+    /// `txt:<起始字符偏移>`（与宿主历史约定一致，**字符**偏移而非字节）；
+    /// MOBI/AZW3 = `mobi:<章序号>`；CBZ = 页（图片条目）名；PDF = `pdf:<章序号>`。
+    pub href: String,
     /// 源内字节范围（TXT = 文件内偏移；EPUB = 条目内范围 `(0, len)`）。
     pub byte_range: (u64, u64),
     /// 权重：估算字数（进度与预排预算用）。

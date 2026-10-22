@@ -191,6 +191,8 @@ fn chapters_json(entries: &[ChapterEntry]) -> Vec<u8> {
             Some(t) => json_str(t, &mut s),
             None => s.push_str("null"),
         }
+        s.push_str(",\"href\":");
+        json_str(&e.href, &mut s);
         s.push_str(&format!(
             ",\"charLen\":{},\"byteStart\":{},\"byteEnd\":{},\"part\":{},\"kind\":\"{}\"}}",
             e.char_len,

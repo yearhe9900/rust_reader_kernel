@@ -105,10 +105,11 @@ impl EpubBook {
             let href = resolve_href(&opf_dir, &item.href);
             let uncomp = zip.entry(&href).map(|e| e.uncomp_size).unwrap_or(0);
             let id = entries.len() as ChapterId;
-            href_to_chapter.insert(href, id);
+            href_to_chapter.insert(href.clone(), id);
             entries.push(ChapterEntry {
                 id,
                 title: None,
+                href,
                 byte_range: (0, uncomp),
                 char_len: (uncomp / 2) as u32, // CJK 估算
                 kind: ChapterKind::Text,

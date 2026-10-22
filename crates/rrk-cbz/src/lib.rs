@@ -274,6 +274,7 @@ impl BookSource for CbzBook {
             .map(|(i, name)| ChapterEntry {
                 id: i as ChapterId,
                 title: Some(format!("第 {} 页", i + 1)),
+                href: name.clone(),
                 byte_range: (i as u64, (i + 1) as u64),
                 char_len: 0,
                 kind: ChapterKind::ImageGallery,

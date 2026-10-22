@@ -310,9 +310,11 @@ impl MobiBook {
             }
             kept_spans.push((start, end));
             titles.push(derive_title(&cleaned));
+            let id = entries.len() as ChapterId;
             entries.push(ChapterEntry {
-                id: entries.len() as ChapterId,
+                id,
                 title: None, // 稍后回填
+                href: format!("mobi:{id}"),
                 byte_range: (start as u64, end as u64),
                 char_len: seg_str.chars().count() as u32,
                 kind: ChapterKind::Text,

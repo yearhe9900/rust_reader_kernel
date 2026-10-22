@@ -330,11 +330,17 @@ fn build_entries(text: &str) -> Vec<ChapterEntry> {
     }
 
     // 逻辑块切分 + 索引构建
+    // href = `txt:<起始字符偏移>`（字符偏移，与宿主历史约定一致）：
+    // spans/part_spans 均按起点升序，游标增量计数即可，全书 O(n) 一次。
     let mut entries = Vec::new();
+    let mut cursor = 0usize;
+    let mut chars_before = 0u64;
     for (start, end, title) in spans {
         let part_spans = split_logical_blocks(text, start, end);
         let total_parts = part_spans.len() as u32;
         for (part, (s, e)) in part_spans.into_iter().enumerate() {
+            chars_before += count_chars(&text[cursor..s]) as u64;
+            cursor = s;
             let part = part as u32;
             let display_title = match (&title, total_parts) {
                 (Some(t), 1) => Some(t.clone()),
@@ -345,6 +351,7 @@ fn build_entries(text: &str) -> Vec<ChapterEntry> {
             entries.push(ChapterEntry {
                 id: entries.len() as ChapterId,
                 title: display_title,
+                href: format!("txt:{chars_before}"),
                 byte_range: (s as u64, e as u64),
                 char_len: count_chars(&text[s..e]),
                 kind: ChapterKind::Text,
@@ -644,6 +651,34 @@ mod tests {
         assert_eq!(chapters[0].title.as_deref(), Some("第1卷 风起"));
         assert_eq!(chapters[0].char_len, 0);
         assert_eq!(chapters[1].title.as_deref(), Some("第1章 甲"));
+    }
+
+    #[test]
+    fn chapter_href_is_txt_char_offset_of_body_start() {
+        let src = ContentSource::from_bytes(
+            Some("t.txt".into()),
+            Arc::<[u8]>::from("第1章 甲\n\n正文。\n第2章 乙\n\n更多正文。\n".as_bytes()),
+        );
+        let book = TxtBook::parse(&src).unwrap();
+        let chapters = book.chapters().unwrap();
+        assert_eq!(chapters.len(), 2);
+        let mut prev = None;
+        for e in &chapters {
+            let off: usize = e
+                .href
+                .strip_prefix("txt:")
+                .expect("TXT href 前缀固定 txt:")
+                .parse()
+                .expect("txt: 后必须是数字");
+            // 契约：数字 = 该章 body 起点（byte_range.0）在全文中的**字符**偏移。
+            let expect = book.text[..e.byte_range.0 as usize].chars().count();
+            assert_eq!(off, expect);
+            // 且随章序严格递增（进度身份唯一）。
+            if let Some(p) = prev {
+                assert!(off > p, "href 字符偏移必须严格递增");
+            }
+            prev = Some(off);
+        }
     }
 
     #[test]
