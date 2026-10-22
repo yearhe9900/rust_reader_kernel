@@ -1,17 +1,21 @@
 //! XHTML → Block 清洗管线（方案 §3.3-4）：标签白名单 + CSS 最小集，
 //! 产出干净 `Block` 流 + UTF-8 正文（`Inline` 偏移基于清洗后文本）。
 
+use std::collections::BTreeMap;
+
 use rrk_model::{Block, Inline, LinkRange, ResourceKey, StyleFlags, TextRange};
 
 use crate::markup::{attr, local_name, tokenize, Token};
 
-/// 清洗结果：规整后的正文 + 块列表 + 正文内链区间。
+/// 清洗结果：规整后的正文 + 块列表 + 正文内链区间 + 元素 id 锚点。
 #[derive(Debug, Default)]
 pub struct CleanResult {
     pub text: String,
     pub blocks: Vec<Block>,
     /// 正文内链区间（`<a href>` → 清洗后文本字节区间）。
     pub links: Vec<LinkRange>,
+    /// 元素 id → 清洗后文本字节偏移（章内锚点，供 TOC `anchor` 兑现）。
+    pub anchors: BTreeMap<String, u32>,
 }
 
 /// 空白折叠（XHTML 缩进空白不进正文；CJK 无空格语义不受影响）。
@@ -123,6 +127,22 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
         match token {
             Token::Text(t) => c.push_text(&t),
             Token::Open { name, attrs, self_closing } => {
+                // 章内锚点：记录元素 id（或 `<a name>`）→ 当前文本偏移
+                if c.skip_depth == 0 {
+                    let anchor_id = attr(&attrs, "id")
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            (local_name(&name) == "a")
+                                .then(|| attr(&attrs, "name").map(|s| s.trim()))
+                                .flatten()
+                                .filter(|s| !s.is_empty())
+                        });
+                    if let Some(id) = anchor_id {
+                        let off = c.out.text.len() as u32;
+                        c.out.anchors.entry(id.to_string()).or_insert(off);
+                    }
+                }
                 let n = local_name(&name).to_string();
                 match n.as_str() {
                     "head" | "script" | "style" | "title" | "meta" | "link" => {

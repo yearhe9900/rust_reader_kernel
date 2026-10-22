@@ -102,7 +102,8 @@ fn run() -> Result<(), String> {
     if show_toc {
         println!("\n== 目录 ==（{} 项）", toc.len());
         for n in toc.iter().take(40) {
-            println!("  → [{:>3}] {}", n.chapter, n.title);
+            let anchor = n.anchor.map(|a| a.to_string()).unwrap_or_else(|| "-".into());
+            println!("  → [{:>3}] {} @{}", n.chapter, n.title, anchor);
         }
     }
 

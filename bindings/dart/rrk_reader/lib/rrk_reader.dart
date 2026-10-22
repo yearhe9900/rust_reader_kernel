@@ -243,14 +243,17 @@ class BookMeta {
 }
 
 class TocNode {
-  TocNode._(this.title, this.chapter, this.children);
+  TocNode._(this.title, this.chapter, this.anchor, this.children);
   final String title;
   final int chapter;
+
+  /// 章内字节偏移锚点（目标元素起点）；无 fragment/无法解析时为 null。
+  final int? anchor;
   final List<TocNode> children;
 
   static List<TocNode> _listFromJson(List<dynamic> js) => js
       .map((e) => TocNode._(e['title'] as String, e['chapter'] as int,
-          _listFromJson((e['children'] as List?) ?? const [])))
+          e['anchor'] as int?, _listFromJson((e['children'] as List?) ?? const [])))
       .toList();
 }
 

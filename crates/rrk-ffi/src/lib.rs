@@ -189,7 +189,12 @@ fn toc_json(nodes: &[TocNode]) -> Vec<u8> {
         }
         s.push_str("{\"title\":");
         json_str(&n.title, &mut s);
-        s.push_str(&format!(",\"chapter\":{},\"children\":", n.chapter));
+        s.push_str(&format!(",\"chapter\":{},\"anchor\":", n.chapter));
+        match n.anchor {
+            Some(a) => s.push_str(&a.to_string()),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"children\":");
         s.push_str(&String::from_utf8_lossy(&toc_json(&n.children)));
         s.push('}');
     }

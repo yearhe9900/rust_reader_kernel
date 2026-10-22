@@ -5,7 +5,7 @@
 //! - **章内容**：XHTML → [`clean::clean_xhtml`] 清洗管线（标签白名单 + CSS 最小集）；
 //! - **DRM**：`encryption.xml` 加密正文 → 明确 `UnsupportedFormat`，不静默。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use rrk_format::{BookSource, ContentSource, FormatAdapter};
@@ -38,7 +38,8 @@ pub struct EpubBook {
     /// href（相对 OPF 目录、无锚点）→ 章 id。
     href_to_chapter: HashMap<String, ChapterId>,
     entries: Vec<ChapterEntry>,
-    toc: Vec<TocNode>,
+    /// 目录原始树（含 href+fragment；`toc()` 时惰性解析锚点）。
+    toc_raw: Vec<TocRaw>,
 }
 
 fn resolve_href(base_dir: &str, href: &str) -> String {
@@ -171,19 +172,9 @@ impl EpubBook {
             return Err(RrkError::corrupt("EPUB: spine 无可渲染文档"));
         }
 
-        // 目录：nav 优先，NCX 回退；并用目录标题回填章标题
+        // 目录：nav 优先，NCX 回退；用目录标题回填章标题（锚点惰性解析，见 toc()）
         let toc_raw = build_toc_raw(&zip, &opf, &opf_dir);
-        let mut toc: Vec<TocNode> = Vec::new();
-        for (title, href) in toc_raw {
-            let path = normalize_path(href.split('#').next().unwrap_or(""));
-            let Some(&chapter) = href_to_chapter.get(&path) else { continue };
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == chapter) {
-                if entry.title.is_none() {
-                    entry.title = Some(title.clone());
-                }
-            }
-            toc.push(TocNode { title, chapter, anchor: None, children: Vec::new() });
-        }
+        backfill_titles(&toc_raw, &href_to_chapter, &mut entries);
 
         let title = opf
             .title
@@ -217,8 +208,45 @@ impl EpubBook {
             spine: opf.spine,
             href_to_chapter,
             entries,
-            toc,
+            toc_raw,
         })
+    }
+
+    /// 目录原始树 → `TocNode` 树（按需解析锚点；只清洗被 fragment 引用的文档）。
+    fn build_toc_nodes(
+        &self,
+        raws: &[TocRaw],
+        cache: &mut HashMap<ChapterId, BTreeMap<String, u32>>,
+    ) -> Vec<TocNode> {
+        let mut out = Vec::new();
+        for r in raws {
+            let path = normalize_path(r.href.split('#').next().unwrap_or(""));
+            let Some(&chapter) = self.href_to_chapter.get(&path) else { continue };
+            let anchor = match r.href.split_once('#') {
+                Some((_, frag)) if !frag.is_empty() => {
+                    if !cache.contains_key(&chapter) {
+                        let m = self.chapter_anchors(chapter).unwrap_or_default();
+                        cache.insert(chapter, m);
+                    }
+                    cache.get(&chapter).and_then(|m| m.get(frag)).copied()
+                }
+                _ => None,
+            };
+            out.push(TocNode {
+                title: r.title.clone(),
+                chapter,
+                anchor,
+                children: self.build_toc_nodes(&r.children, cache),
+            });
+        }
+        out
+    }
+
+    /// 章内锚点表：清洗该章后 `id → 文本字节偏移`。
+    fn chapter_anchors(&self, chapter: ChapterId) -> RrkResult<BTreeMap<String, u32>> {
+        let entry = self.entry_for_chapter(chapter)?;
+        let html = self.zip.read_string(entry)?;
+        Ok(clean_xhtml(&html).anchors)
     }
 
     /// 回退 2：spine 首个可渲染文档里的首个 `<img src>` → 包内绝对路径。
@@ -400,7 +428,46 @@ fn parse_opf(opf_xml: &str) -> OpfData {
 }
 
 /// 目录原始项（title, **zip 根相对路径**）；nav 优先，NCX 回退。
-fn build_toc_raw(zip: &Arc<ZipArchive>, opf: &OpfData, opf_dir: &str) -> Vec<(String, String)> {
+/// 目录原始树（解析期；href 已归一化为包内绝对路径、保留 fragment）。
+#[derive(Debug, Clone)]
+struct TocRaw {
+    title: String,
+    href: String,
+    children: Vec<TocRaw>,
+}
+
+/// 递归归一化目录树 href（路径按 base 解析，fragment 保留）。
+fn resolve_toc_tree(items: Vec<TocRaw>, base: &str) -> Vec<TocRaw> {
+    items
+        .into_iter()
+        .map(|mut r| {
+            r.href = resolve_link_href(base, &r.href);
+            r.children = resolve_toc_tree(r.children, base);
+            r
+        })
+        .collect()
+}
+
+/// 用目录标题回填章标题（仅填空缺，不覆盖已解析出的标题）。
+fn backfill_titles(
+    raws: &[TocRaw],
+    href_to_chapter: &HashMap<String, ChapterId>,
+    entries: &mut [ChapterEntry],
+) {
+    for r in raws {
+        let path = normalize_path(r.href.split('#').next().unwrap_or(""));
+        if let Some(&ch) = href_to_chapter.get(&path) {
+            if let Some(e) = entries.iter_mut().find(|e| e.id == ch) {
+                if e.title.is_none() {
+                    e.title = Some(r.title.clone());
+                }
+            }
+        }
+        backfill_titles(&r.children, href_to_chapter, entries);
+    }
+}
+
+fn build_toc_raw(zip: &Arc<ZipArchive>, opf: &OpfData, opf_dir: &str) -> Vec<TocRaw> {
     // EPUB3 nav：manifest 中 properties 含 nav
     if let Some(item) = opf.manifest.values().find(|i| i.properties.contains("nav")) {
         let href = resolve_href(opf_dir, &item.href);
@@ -409,10 +476,7 @@ fn build_toc_raw(zip: &Arc<ZipArchive>, opf: &OpfData, opf_dir: &str) -> Vec<(St
                 let items = parse_nav_toc(&xml);
                 if !items.is_empty() {
                     let base = dir_of(&href);
-                    return items
-                        .into_iter()
-                        .map(|(t, h)| (t, resolve_href(&base, &h)))
-                        .collect();
+                    return resolve_toc_tree(items, &base);
                 }
             }
         }
@@ -425,10 +489,7 @@ fn build_toc_raw(zip: &Arc<ZipArchive>, opf: &OpfData, opf_dir: &str) -> Vec<(St
                 let items = parse_ncx_toc(&xml);
                 if !items.is_empty() {
                     let base = dir_of(&href);
-                    return items
-                        .into_iter()
-                        .map(|(t, h)| (t, resolve_href(&base, &h)))
-                        .collect();
+                    return resolve_toc_tree(items, &base);
                 }
             }
         }
@@ -439,96 +500,132 @@ fn build_toc_raw(zip: &Arc<ZipArchive>, opf: &OpfData, opf_dir: &str) -> Vec<(St
             let items = parse_ncx_toc(&xml);
             if !items.is_empty() {
                 let base = dir_of(&entry.name);
-                return items
-                    .into_iter()
-                    .map(|(t, h)| (t, resolve_href(&base, &h)))
-                    .collect();
+                return resolve_toc_tree(items, &base);
             }
         }
     }
     Vec::new()
 }
 
-/// nav.xhtml：收集 `<a href="...">标题</a>`（文档序即阅读序）。
-fn parse_nav_toc(xml: &str) -> Vec<(String, String)> {
-    let mut items = Vec::new();
+/// nav.xhtml：按 `<ol>/<li>` 嵌套构建目录树（文档序即阅读序）。
+fn parse_nav_toc(xml: &str) -> Vec<TocRaw> {
+    let mut root: Vec<TocRaw> = Vec::new();
+    let mut levels: Vec<Vec<TocRaw>> = Vec::new(); // 嵌套 ol 层级
     let mut in_nav = 0u32;
-    let mut current: Option<(String, String)> = None; // (href, accumulating title)
+    let mut pending: Option<String> = None; // 当前 <a> 的 href
+    let mut title = String::new();
     for t in tokenize(xml) {
         match t {
-            Token::Open { name, attrs, self_closing } => match local_name(&name) {
+            Token::Open { name, attrs, .. } => match local_name(&name) {
                 "nav" => in_nav += 1,
+                "ol" if in_nav > 0 => levels.push(Vec::new()),
                 "a" if in_nav > 0 => {
                     if let Some(href) = attr(&attrs, "href") {
-                        current = Some((href.to_string(), String::new()));
-                    }
-                    if self_closing {
-                        if let Some((h, title)) = current.take() {
-                            items.push((title, h));
-                        }
+                        pending = Some(href.to_string());
+                        title.clear();
                     }
                 }
                 _ => {}
             },
             Token::Text(text) => {
-                if let Some((_, title)) = &mut current {
+                if pending.is_some() {
                     title.push_str(&text);
                 }
             }
             Token::Close(name) => match local_name(&name) {
                 "nav" => in_nav = in_nav.saturating_sub(1),
                 "a" => {
-                    if let Some((h, title)) = current.take() {
+                    if let Some(href) = pending.take() {
                         let title = title.trim().to_string();
                         if !title.is_empty() {
-                            items.push((title, h));
+                            let item = TocRaw { title, href, children: Vec::new() };
+                            match levels.last_mut() {
+                                Some(level) => level.push(item),
+                                None => root.push(item),
+                            }
+                        }
+                    }
+                }
+                "ol" => {
+                    if let Some(mut kids) = levels.pop() {
+                        match levels.last_mut().and_then(|p| p.last_mut()) {
+                            Some(parent) => parent.children.append(&mut kids),
+                            None => root.append(&mut kids),
                         }
                     }
                 }
                 _ => {}
             },
+            _ => {}
         }
     }
-    items
+    root
 }
 
-/// NCX：`<navPoint><navLabel><text>..</text></navLabel><content src=".."/>`。
-fn parse_ncx_toc(xml: &str) -> Vec<(String, String)> {
-    let mut items = Vec::new();
-    let mut in_text = false;
-    let mut title = String::new();
+/// NCX：`<navPoint>` 递归构建目录树。
+fn parse_ncx_toc(xml: &str) -> Vec<TocRaw> {
+    let mut root: Vec<TocRaw> = Vec::new();
+    let mut stack: Vec<TocRaw> = Vec::new();
+    let mut in_text = 0u32;
+    let mut text_buf = String::new();
     for t in tokenize(xml) {
         match t {
-            Token::Open { name, attrs, self_closing } => match local_name(&name) {
+            Token::Open { name, attrs, .. } => match local_name(&name) {
+                "navpoint" => stack.push(TocRaw {
+                    title: String::new(),
+                    href: String::new(),
+                    children: Vec::new(),
+                }),
                 "text" => {
-                    in_text = true;
-                    title.clear(); // 嵌套 navPoint 各有各的标题，不串接
+                    in_text += 1;
+                    text_buf.clear();
                 }
                 "content" => {
-                    if let Some(src) = attr(&attrs, "src") {
-                        let title_taken = std::mem::take(&mut title);
-                        items.push((title_taken, src.to_string()));
-                    }
-                    if self_closing {
-                        in_text = false;
+                    if let (Some(src), Some(top)) = (attr(&attrs, "src"), stack.last_mut()) {
+                        top.href = src.to_string();
                     }
                 }
                 _ => {}
             },
             Token::Text(text) => {
-                if in_text {
-                    title.push_str(&text);
+                if in_text > 0 {
+                    text_buf.push_str(&text);
                 }
             }
-            Token::Close(name) => {
-                if local_name(&name) == "text" {
-                    in_text = false;
+            Token::Close(name) => match local_name(&name) {
+                "text" => {
+                    in_text = in_text.saturating_sub(1);
+                    if let Some(top) = stack.last_mut() {
+                        if top.title.is_empty() {
+                            top.title = text_buf.trim().to_string();
+                        }
+                    }
                 }
-            }
+                "navpoint" => {
+                    if let Some(np) = stack.pop() {
+                        let attach = if !np.title.is_empty() && !np.href.is_empty() {
+                            Some(np)
+                        } else {
+                            // 无标题/无 src 的容器：子项上提
+                            if let Some(parent) = stack.last_mut() {
+                                parent.children.extend(np.children);
+                            }
+                            None
+                        };
+                        if let Some(np) = attach {
+                            match stack.last_mut() {
+                                Some(parent) => parent.children.push(np),
+                                None => root.push(np),
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
         }
     }
-    items.retain(|(t, _)| !t.trim().is_empty());
-    items
+    root
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +665,9 @@ impl BookSource for EpubBook {
     }
 
     fn toc(&self) -> RrkResult<Vec<TocNode>> {
-        Ok(self.toc.clone())
+        // 锚点惰性解析：只在 toc() 时按需清洗目标文档取 `id → 偏移`，打开书不做全量预扫。
+        let mut cache: HashMap<ChapterId, BTreeMap<String, u32>> = HashMap::new();
+        Ok(self.build_toc_nodes(&self.toc_raw, &mut cache))
     }
 
     fn chapters(&self) -> RrkResult<Vec<ChapterEntry>> {
@@ -896,5 +995,58 @@ mod tests {
     fn cover_none_when_no_image_anywhere() {
         let book = book_with(OPF_NO_COVER_META, CH1_NO_IMG, &[]);
         assert!(book.cover().unwrap().is_none());
+    }
+
+    // ---- #3 目录层级 + 章内锚点 ----
+
+    const OPF_NAV: &str = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>目录书</dc:title></metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="ch1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+
+    const NAV_NESTED: &str = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<nav epub:type="toc"><ol>
+  <li><a href="text/ch1.xhtml#sec1">第一节</a>
+    <ol><li><a href="text/ch1.xhtml#sec2">小节</a></li></ol>
+  </li>
+</ol></nav></body></html>"#;
+
+    const CH1_WITH_IDS: &str = r#"<html><body>
+<p id="sec1">第一节内容</p><p id="sec2">小节内容</p>
+</body></html>"#;
+
+    #[test]
+    fn toc_nesting_and_anchor_resolved() {
+        let book = book_with(
+            OPF_NAV,
+            CH1_WITH_IDS,
+            &[("OEBPS/nav.xhtml", NAV_NESTED.as_bytes())],
+        );
+        let toc = book.toc().unwrap();
+        assert_eq!(toc.len(), 1);
+        assert_eq!(toc[0].title, "第一节");
+        assert_eq!(toc[0].children.len(), 1, "nav 嵌套应保留层级");
+        assert_eq!(toc[0].children[0].title, "小节");
+        // 锚点 = 目标元素在清洗后章文本中的字节偏移
+        assert_eq!(toc[0].anchor, Some(0));
+        assert_eq!(toc[0].children[0].anchor, Some("第一节内容".len() as u32));
+    }
+
+    #[test]
+    fn toc_without_fragment_has_no_anchor() {
+        let nav = r#"<html><body><nav><ol><li><a href="text/ch1.xhtml">整章</a></li></ol></nav></body></html>"#;
+        let book = book_with(
+            OPF_NAV,
+            CH1_WITH_IDS,
+            &[("OEBPS/nav.xhtml", nav.as_bytes())],
+        );
+        let toc = book.toc().unwrap();
+        assert_eq!(toc.len(), 1);
+        assert!(toc[0].anchor.is_none());
     }
 }
