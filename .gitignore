@@ -5,6 +5,9 @@
 # 私有测试书库（含版权书籍，绝不入库）；公开样例见 fixtures/
 tmp_book/
 
+# 打包产物（预编译 release 包，由 scripts/package-release.sh 生成）
+dist/
+
 # Dart / Flutter
 **/.dart_tool/
 **/pubspec.lock

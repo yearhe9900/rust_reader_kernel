@@ -53,6 +53,20 @@ cargo test                       # 28 套单测
 cargo run --release -p rrk-inspect -- fixtures/sample.epub
 ```
 
+### 预编译 Release 包（供其它项目快速接入）
+
+```sh
+bash scripts/package-release.sh            # Windows + Android 四 ABI
+SKIP_ANDROID=1 bash scripts/package-release.sh   # 只打 Windows
+```
+
+产物在 `dist/rrk_reader-<version>/`（含各平台 `rrk_ffi` 动态库、`dart/rrk_reader`
+封装包、`MANIFEST.json` 校验和、接入说明 `README.md`）及同名 `.zip`。发布到 GitHub：
+
+```sh
+gh release create v0.1.0 dist/rrk_reader-0.1.0.zip --generate-notes
+```
+
 ### 命令行工具（rrk-inspect）
 
 解析诊断工具：书目 / 章索引 / 目录 / 章内容 / 页渲染。
