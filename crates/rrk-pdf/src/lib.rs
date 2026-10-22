@@ -177,7 +177,7 @@ impl PdfBook {
             text.push_str(t);
         }
         let blocks = paragraphs_to_blocks(&text);
-        Ok(ChapterContent { id, text: Arc::from(text), blocks })
+        Ok(ChapterContent { id, text: Arc::from(text), blocks, link_ranges: Vec::new() })
     }
 
     /// L2 光栅：渲染原版页为 RGBA 位图（方案 §3.6 模式 B）。
@@ -483,6 +483,7 @@ impl PagedSource for PdfBook {
             id: index,
             text: Arc::from(text),
             blocks,
+            link_ranges: Vec::new(),
         }))
     }
 

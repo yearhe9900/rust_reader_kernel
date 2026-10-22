@@ -15,10 +15,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use rrk_kernel::{BookHandle, Kernel};
-use rrk_model::{Block, BookMeta, ChapterContent, ChapterEntry, Inline, RrkError, RrkErrorKind, TocNode};
+use rrk_model::{Block, BookMeta, ChapterContent, ChapterEntry, Inline, LinkRange, RrkError, RrkErrorKind, TocNode};
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
-pub const RRK_ABI_VERSION: u32 = 3;
+pub const RRK_ABI_VERSION: u32 = 4;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -161,6 +161,22 @@ fn meta_json(meta: &BookMeta) -> Vec<u8> {
     s.push_str(",\"format\":");
     json_str(&meta.format.to_string(), &mut s);
     s.push_str(&format!(",\"contentHash\":\"{:016x}\"}}", meta.content_hash));
+    s.into_bytes()
+}
+
+/// 内链区间 → JSON（`[{"start","end","href"}]`）。
+fn links_json(links: &[LinkRange]) -> Vec<u8> {
+    let mut s = String::with_capacity(32 * links.len().max(1));
+    s.push('[');
+    for (i, l) in links.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{{\"start\":{},\"end\":{},\"href\":", l.range.start, l.range.end));
+        json_str(&l.href, &mut s);
+        s.push('}');
+    }
+    s.push(']');
     s.into_bytes()
 }
 
@@ -386,17 +402,27 @@ pub unsafe extern "C" fn rrk_load_chapter(
     text_len: *mut usize,
     blocks_ptr: *mut *mut u8,
     blocks_len: *mut usize,
+    links_ptr: *mut *mut u8,
+    links_len: *mut usize,
 ) -> u32 {
     guard(|| {
-        if text_ptr.is_null() || text_len.is_null() || blocks_ptr.is_null() || blocks_len.is_null() {
+        if text_ptr.is_null()
+            || text_len.is_null()
+            || blocks_ptr.is_null()
+            || blocks_len.is_null()
+            || links_ptr.is_null()
+            || links_len.is_null()
+        {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
         with_kernel(|k| {
             let book = k.book(handle).map_err(set_kind)?;
             let content = book.load_chapter(chapter_id).map_err(set_kind)?;
             let blocks = blocks_json(&content.text, &content.blocks);
+            let links = links_json(&content.link_ranges);
             write_buf(content.text.as_bytes().to_vec(), text_ptr, text_len);
             write_buf(blocks, blocks_ptr, blocks_len);
+            write_buf(links, links_ptr, links_len);
             Ok(0)
         })
     })

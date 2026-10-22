@@ -463,6 +463,7 @@ impl BookSource for MobiBook {
             id,
             text: Arc::from(cleaned.text),
             blocks: cleaned.blocks,
+            link_ranges: cleaned.links,
         })
     }
 

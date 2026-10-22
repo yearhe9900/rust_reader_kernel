@@ -27,7 +27,7 @@ fn layout_payload_survives_disk_cache() {
         height: 842.0,
     }];
     let _ = (
-        ChapterContent { id: 0, text: "".into(), blocks: vec![] },
+        ChapterContent { id: 0, text: "".into(), blocks: vec![], link_ranges: vec![] },
         Block::Divider,
         Inline::Text { range: TextRange::new(0, 0), style: StyleFlags::default() },
     );

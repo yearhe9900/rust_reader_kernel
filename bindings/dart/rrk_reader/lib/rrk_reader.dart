@@ -13,7 +13,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 /// ABI 版本（与 rrk-ffi 的 RRK_ABI_VERSION 对齐，启动校验）。
-const int kRrkAbiVersion = 3;
+const int kRrkAbiVersion = 4;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -59,9 +59,11 @@ typedef _RenderNative = Uint32 Function(
 typedef _RenderDart = int Function(
     int, int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint32>, Pointer<Uint32>);
 typedef _LoadChapterNative = Uint32 Function(
-    Uint64, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+    Uint64, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _LoadChapterDart = int Function(
-    int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+    int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Pointer<Uint8>>, Pointer<IntPtr>,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _BufFreeNative = Void Function(Pointer<Uint8>, IntPtr);
 typedef _BufFreeDart = void Function(Pointer<Uint8>, int);
 typedef _AbiNative = Uint32 Function();
@@ -342,11 +344,22 @@ class ReaderPage {
           .toList());
 }
 
+/// 正文内链区间：清洗后章文本字节区间 → 目标 href（EPUB 为包内路径或 `#frag`）。
+class ChapterLink {
+  ChapterLink._(this.start, this.end, this.href);
+  final int start;
+  final int end;
+  final String href;
+}
+
 class ChapterContent {
-  ChapterContent._(this.id, this.text, this.blocks);
+  ChapterContent._(this.id, this.text, this.blocks, this.links);
   final int id;
   final String text;
   final List<ChapterBlock> blocks;
+
+  /// 正文内链区间（无链接的书为空）。
+  final List<ChapterLink> links;
 }
 
 // ---------------------------------------------------------------------------
@@ -440,21 +453,30 @@ class RrkBook {
     final textLen = malloc<IntPtr>();
     final blocksPtr = malloc<Pointer<Uint8>>();
     final blocksLen = malloc<IntPtr>();
+    final linksPtr = malloc<Pointer<Uint8>>();
+    final linksLen = malloc<IntPtr>();
     try {
-      final code =
-          b.loadChapter(_handle, chapterId, textPtr, textLen, blocksPtr, blocksLen);
+      final code = b.loadChapter(
+          _handle, chapterId, textPtr, textLen, blocksPtr, blocksLen, linksPtr, linksLen);
       if (code != 0) _throwCode(code);
       final text = RrkEngine._takeBuffer(b, textPtr.value, textLen.value) ?? '';
       final blocksJson = RrkEngine._takeBuffer(b, blocksPtr.value, blocksLen.value) ?? '[]';
+      final linksJson = RrkEngine._takeBuffer(b, linksPtr.value, linksLen.value) ?? '[]';
       return ChapterContent._(
           chapterId,
           text,
-          ChapterBlock._listFromJson(jsonDecode(blocksJson) as List<dynamic>));
+          ChapterBlock._listFromJson(jsonDecode(blocksJson) as List<dynamic>),
+          (jsonDecode(linksJson) as List<dynamic>)
+              .map((e) => ChapterLink._(
+                  e['start'] as int, e['end'] as int, e['href'] as String))
+              .toList());
     } finally {
       malloc.free(textPtr);
       malloc.free(textLen);
       malloc.free(blocksPtr);
       malloc.free(blocksLen);
+      malloc.free(linksPtr);
+      malloc.free(linksLen);
     }
   }
 

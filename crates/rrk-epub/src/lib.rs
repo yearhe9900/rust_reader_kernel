@@ -71,6 +71,17 @@ fn dir_of(href: &str) -> String {
     }
 }
 
+/// 内链 href 归一化：非 `#frag` 的路径按文档目录解析为包内绝对路径，fragment 原样保留。
+fn resolve_link_href(base_dir: &str, href: &str) -> String {
+    if href.starts_with('#') {
+        return href.to_string();
+    }
+    match href.split_once('#') {
+        Some((path, frag)) => format!("{}#{frag}", resolve_href(base_dir, path)),
+        None => resolve_href(base_dir, href),
+    }
+}
+
 /// 书内资源 key 归一化为**包内绝对路径**（`load_resource` 的 key 契约）。
 ///
 /// XHTML 里的 `src` 是相对**文档**目录的；`/…` 开头按包根解释。
@@ -549,7 +560,17 @@ impl BookSource for EpubBook {
         // （相对**文档**目录），在出口统一归一化，宿主可直接拿去 `load_resource`。
         let base = dir_of(&entry.name);
         resolve_image_keys(&mut cleaned.blocks, &base);
-        Ok(ChapterContent { id, text: Arc::from(cleaned.text), blocks: cleaned.blocks })
+        // 内链出口契约：路径部分按文档目录归一化为包内绝对路径，`#frag` 原样保留。
+        for l in &mut cleaned.links {
+            l.href = resolve_link_href(&base, &l.href);
+        }
+        let link_ranges = std::mem::take(&mut cleaned.links);
+        Ok(ChapterContent {
+            id,
+            text: Arc::from(cleaned.text),
+            blocks: cleaned.blocks,
+            link_ranges,
+        })
     }
 
     fn load_resource(&self, key: &ResourceKey) -> RrkResult<Resource> {
@@ -759,5 +780,13 @@ mod tests {
     fn opf_without_description_is_none() {
         let opf = r#"<package><metadata><dc:title>无简介</dc:title></metadata></package>"#;
         assert!(parse_opf(opf).description.is_none());
+    }
+
+    /// #1：内链 href 归一化——路径按文档目录解析为包内绝对路径，fragment 原样保留。
+    #[test]
+    fn link_href_normalized_fragment_preserved() {
+        assert_eq!(resolve_link_href("OEBPS/text", "ch2.xhtml#s1"), "OEBPS/text/ch2.xhtml#s1");
+        assert_eq!(resolve_link_href("OEBPS/text", "../images/a.png"), "OEBPS/images/a.png");
+        assert_eq!(resolve_link_href("OEBPS/text", "#note1"), "#note1");
     }
 }

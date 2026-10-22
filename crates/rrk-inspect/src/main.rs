@@ -121,6 +121,16 @@ fn run() -> Result<(), String> {
             content.blocks.len(),
             t2.elapsed().as_secs_f64() * 1000.0
         );
+        if !content.link_ranges.is_empty() {
+            let l = &content.link_ranges[0];
+            println!(
+                "  内链: {} 条（首条 {}..{} → {}）",
+                content.link_ranges.len(),
+                l.range.start,
+                l.range.end,
+                l.href
+            );
+        }
         for (i, b) in content.blocks.iter().take(blocks).enumerate() {
             match b {
                 Block::Heading { level, inlines } => {

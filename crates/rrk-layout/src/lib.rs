@@ -370,7 +370,7 @@ mod tests {
                 indent: true,
             },
         ];
-        ChapterContent { id: 0, text, blocks }
+        ChapterContent { id: 0, text, blocks, link_ranges: Vec::new() }
     }
 
     #[test]

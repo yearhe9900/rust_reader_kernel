@@ -1,15 +1,17 @@
 //! XHTML → Block 清洗管线（方案 §3.3-4）：标签白名单 + CSS 最小集，
 //! 产出干净 `Block` 流 + UTF-8 正文（`Inline` 偏移基于清洗后文本）。
 
-use rrk_model::{Block, Inline, ResourceKey, StyleFlags, TextRange};
+use rrk_model::{Block, Inline, LinkRange, ResourceKey, StyleFlags, TextRange};
 
 use crate::markup::{attr, local_name, tokenize, Token};
 
-/// 清洗结果：规整后的正文 + 块列表。
+/// 清洗结果：规整后的正文 + 块列表 + 正文内链区间。
 #[derive(Debug, Default)]
 pub struct CleanResult {
     pub text: String,
     pub blocks: Vec<Block>,
+    /// 正文内链区间（`<a href>` → 清洗后文本字节区间）。
+    pub links: Vec<LinkRange>,
 }
 
 /// 空白折叠（XHTML 缩进空白不进正文；CJK 无空格语义不受影响）。
@@ -41,6 +43,8 @@ struct Cleaner {
     skip_depth: u32,
     /// 段内是否已有非空白内容。
     has_content: bool,
+    /// 未闭合 `<a href>` 栈：(href, 起始字节偏移)。
+    link_stack: Vec<(String, u32)>,
 }
 
 impl Cleaner {
@@ -112,6 +116,7 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
         italic_depth: 0,
         skip_depth: 0,
         has_content: false,
+        link_stack: Vec::new(),
     };
 
     for token in tokenize(html) {
@@ -167,6 +172,17 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
                     }
                     "strong" | "b" => c.bold_depth += 1,
                     "em" | "i" => c.italic_depth += 1,
+                    "a" => {
+                        // 内链旁路：记录 href 与区间起点（跳过 head/script 等忽略区）
+                        if c.skip_depth == 0 {
+                            if let Some(href) = attr(&attrs, "href") {
+                                if !href.trim().is_empty() {
+                                    c.link_stack
+                                        .push((href.trim().to_string(), c.out.text.len() as u32));
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 if self_closing {
@@ -199,12 +215,31 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
                             c.italic_depth -= 1;
                         }
                     }
+                    "a" => {
+                        if let Some((href, start)) = c.link_stack.pop() {
+                            let end = c.out.text.len() as u32;
+                            if end > start {
+                                c.out.links.push(LinkRange {
+                                    range: TextRange::new(start, end),
+                                    href,
+                                });
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
     c.flush();
+    // 段尾空白裁剪可能让已记录的内链区间越界：夹到文本长度并丢弃空区间。
+    let len = c.out.text.len() as u32;
+    for l in &mut c.out.links {
+        if l.range.end > len {
+            l.range = TextRange::new(l.range.start.min(len), len);
+        }
+    }
+    c.out.links.retain(|l| l.range.end > l.range.start);
     c.out
 }
 
@@ -264,5 +299,25 @@ mod tests {
         } else {
             panic!()
         }
+    }
+
+    /// #1：`<a href>` 必须产出「文本区间 → href」映射，区间正好覆盖链接文字。
+    #[test]
+    fn captures_link_ranges() {
+        let html = r#"<p>前文<a href="ch2.xhtml#s1">链接文字</a>后文</p>"#;
+        let r = clean_xhtml(html);
+        assert_eq!(r.links.len(), 1, "应捕获一条内链");
+        let l = &r.links[0];
+        assert_eq!(l.href, "ch2.xhtml#s1");
+        let slice = &r.text[l.range.start as usize..l.range.end as usize];
+        assert_eq!(slice, "链接文字");
+    }
+
+    /// 无 href 的锚点（`<a name="x">`）不产生内链；`head`/`script` 内的 `<a>` 也不产生。
+    #[test]
+    fn link_ranges_ignore_anchor_and_skipped_blocks() {
+        let html = r#"<a name="top"></a><script><a href="x">坏</a></script><p><a>纯锚</a></p>"#;
+        let r = clean_xhtml(html);
+        assert!(r.links.is_empty(), "不应捕获：{:?}", r.links);
     }
 }

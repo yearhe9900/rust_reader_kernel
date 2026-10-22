@@ -198,13 +198,27 @@ pub enum Block {
     Divider,
 }
 
-/// 章内容：整章 UTF-8 正文（零拷贝持源）+ 块列表。
+/// 正文内链区间：清洗后章文本的字节区间 → 目标 href。
+///
+/// 出口口径（方案 #1 轻方案 A「链接区间旁路」）：不改 `Inline` 枚举、排版内核零改动，
+/// 宿主按区间把可点标记织回段落文本。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkRange {
+    /// 清洗后章文本中的字节区间（与 `Inline::Text` 同坐标系）。
+    pub range: TextRange,
+    /// 目标 href（EPUB 为包内绝对路径或 `#frag`；非 EPUB 为原文 href）。
+    pub href: String,
+}
+
+/// 章内容：整章 UTF-8 正文（零拷贝持源）+ 块列表 + 内链区间。
 #[derive(Debug, Clone)]
 pub struct ChapterContent {
     pub id: ChapterId,
     /// 章正文（清洗后的 UTF-8 文本），`Inline::Text` 的偏移以此为坐标系。
     pub text: Arc<str>,
     pub blocks: Vec<Block>,
+    /// 正文内链区间（无链接的书为空）。
+    pub link_ranges: Vec<LinkRange>,
 }
 
 impl ChapterContent {

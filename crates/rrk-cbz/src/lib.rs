@@ -295,6 +295,7 @@ impl BookSource for CbzBook {
                 alt: None,
                 size_hint: self.sizes.get(id as usize).copied().flatten(),
             }],
+            link_ranges: Vec::new(),
         })
     }
 

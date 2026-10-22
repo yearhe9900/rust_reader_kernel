@@ -623,7 +623,7 @@ impl BookSource for TxtBook {
         // ChapterContent.text 的偏移独立于全书文本：重建局部文本
         let text: Arc<str> = Arc::from(body);
         let blocks = build_blocks(&text);
-        Ok(ChapterContent { id, text, blocks })
+        Ok(ChapterContent { id, text, blocks, link_ranges: Vec::new() })
     }
 
     fn load_resource(&self, key: &ResourceKey) -> RrkResult<Resource> {
