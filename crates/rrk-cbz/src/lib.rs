@@ -262,6 +262,10 @@ impl BookSource for CbzBook {
         &self.meta
     }
 
+    fn as_paged(&self) -> Option<&dyn PagedSource> {
+        Some(self)
+    }
+
     fn toc(&self) -> RrkResult<Vec<TocNode>> {
         Ok(Vec::new())
     }

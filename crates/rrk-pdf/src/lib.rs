@@ -425,6 +425,10 @@ impl BookSource for PdfBook {
         &self.meta
     }
 
+    fn as_paged(&self) -> Option<&dyn PagedSource> {
+        Some(self)
+    }
+
     fn toc(&self) -> RrkResult<Vec<TocNode>> {
         Ok(self.toc.clone())
     }

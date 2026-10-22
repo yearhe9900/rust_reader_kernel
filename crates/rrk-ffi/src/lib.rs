@@ -15,10 +15,13 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use rrk_kernel::{BookHandle, Kernel};
-use rrk_model::{Block, BookMeta, ChapterEntry, LinkRange, RrkError, RrkErrorKind, TocNode};
+use rrk_model::{
+    Block, BookMeta, ChapterEntry, LinkRange, PagedContent, ResourceKey, RrkError, RrkErrorKind,
+    TocNode,
+};
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
-pub const RRK_ABI_VERSION: u32 = 4;
+pub const RRK_ABI_VERSION: u32 = 5;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -178,6 +181,31 @@ fn links_json(links: &[LinkRange]) -> Vec<u8> {
     }
     s.push(']');
     s.into_bytes()
+}
+
+/// 页内容 → JSON（图片页给 key/mime，文本页给 text/blocks）。
+fn paged_json(content: &PagedContent) -> Vec<u8> {
+    match content {
+        PagedContent::Image(res) => {
+            let mut s = String::with_capacity(128);
+            s.push_str("{\"kind\":\"image\",\"key\":");
+            json_str(&res.key.0, &mut s);
+            s.push_str(",\"mime\":");
+            json_str(&res.mime, &mut s);
+            s.push('}');
+            s.into_bytes()
+        }
+        PagedContent::Text(c) => {
+            let blocks = blocks_json(&c.text, &c.blocks);
+            let mut s = String::with_capacity(256 + c.text.len());
+            s.push_str("{\"kind\":\"text\",\"text\":");
+            json_str(&c.text, &mut s);
+            s.push_str(",\"blocks\":");
+            s.push_str(&String::from_utf8_lossy(&blocks));
+            s.push('}');
+            s.into_bytes()
+        }
+    }
 }
 
 fn toc_json(nodes: &[TocNode]) -> Vec<u8> {
@@ -561,6 +589,83 @@ pub unsafe extern "C" fn rrk_render_page(
     })
 }
 
+
+/// 书类型：0=Text 1=ImageGallery 2=Paged；非法句柄返回 u32::MAX。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_book_kind(handle: BookHandle) -> u32 {
+    match with_kernel(|k| k.kind(handle).map_err(set_kind).map(|b| b.code())) {
+        Ok(c) => c,
+        Err(_) => u32::MAX,
+    }
+}
+
+/// 页数（仅页级格式；重排格式返回 Unsupported）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_page_count(handle: BookHandle, out: *mut u32) -> u32 {
+    guard(|| {
+        if out.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        with_kernel(|k| {
+            let pages = k.paged(handle).map_err(set_kind)?.pages().map_err(set_kind)?;
+            *out = pages.len() as u32;
+            Ok(0)
+        })
+    })
+}
+
+/// 读一页（页级）：图片页 → {kind:"image",key,mime}；文本页 → {kind:"text",text,blocks}。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_load_page_json(
+    handle: BookHandle,
+    index: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        with_kernel(|k| {
+            let content = k.paged(handle).map_err(set_kind)?.load_page(index).map_err(set_kind)?;
+            write_buf(paged_json(&content), out_ptr, out_len);
+            Ok(0)
+        })
+    })
+}
+
+/// 按 key 取资源原始字节（CBZ 页图 / EPUB 图片等；mime 由宿主嗅探）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_load_resource(
+    handle: BookHandle,
+    key_ptr: *const u8,
+    key_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        let key = if key_ptr.is_null() || key_len == 0 {
+            String::new()
+        } else {
+            match std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)) {
+                Ok(s) => s.to_string(),
+                Err(e) => return Err(set_kind(RrkError::invalid(format!("资源 key 非 UTF-8: {e}")))),
+            }
+        };
+        with_kernel(|k| {
+            let r = k
+                .book(handle)
+                .map_err(set_kind)?
+                .load_resource(&ResourceKey(key))
+                .map_err(set_kind)?;
+            write_buf(r.data.to_vec(), out_ptr, out_len);
+            Ok(0)
+        })
+    })
+}
 
 // ---------------------------------------------------------------------------
 // A 批：缓存接线 + 进度/命中/预取

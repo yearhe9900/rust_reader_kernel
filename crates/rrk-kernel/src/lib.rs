@@ -5,10 +5,12 @@
 
 use std::sync::Arc;
 
+use rrk_cbz::CbzAdapter;
 use rrk_epub::EpubAdapter;
-use rrk_format::{BookSource, ContentSource, FormatRegistry};
+use rrk_format::{BookSource, ContentSource, FormatRegistry, PagedSource};
 use rrk_mobi::MobiAdapter;
-use rrk_model::{RrkError, RrkResult};
+use rrk_model::{BookKind, RrkError, RrkResult};
+use rrk_pdf::PdfAdapter;
 use rrk_txt::TxtAdapter;
 
 /// 书句柄（0 = 非法）。FFI 边界只传句柄，不传引用。
@@ -33,6 +35,9 @@ impl Kernel {
         registry.register(Box::new(EpubAdapter));
         registry.register(Box::new(TxtAdapter));
         registry.register(Box::new(MobiAdapter));
+        // 页级格式也进统一句柄：重排视图（页=章）+ 固定版式视图（as_paged）
+        registry.register(Box::new(CbzAdapter));
+        registry.register(Box::new(PdfAdapter));
         Self { registry, books: Vec::new() }
     }
 
@@ -80,6 +85,18 @@ impl Kernel {
     /// 当前打开的书数。
     pub fn open_count(&self) -> usize {
         self.books.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// 书类型（统一句柄分流：Text / ImageGallery / Paged）。
+    pub fn kind(&self, handle: BookHandle) -> RrkResult<BookKind> {
+        Ok(self.book(handle)?.kind())
+    }
+
+    /// 固定版式视图（CBZ/PDF）；重排格式返回错误。
+    pub fn paged(&self, handle: BookHandle) -> RrkResult<&dyn PagedSource> {
+        self.book(handle)?
+            .as_paged()
+            .ok_or_else(|| RrkError::unsupported("该书不是页级格式（无 PagedSource 视图）"))
     }
 }
 

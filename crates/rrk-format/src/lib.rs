@@ -103,6 +103,16 @@ pub trait BookSource: Send + Sync {
     /// 章索引：O(结构) 可得，不解压正文（「建索引不搬内容」）。
     fn chapters(&self) -> RrkResult<Vec<ChapterEntry>>;
 
+    /// 书类型（统一句柄分流依据）。
+    fn kind(&self) -> rrk_model::BookKind {
+        rrk_model::BookKind::of(self.meta().format)
+    }
+
+    /// 固定版式视图（CBZ/PDF 返回 `Some(self)`）；重排格式默认 `None`。
+    fn as_paged(&self) -> Option<&dyn PagedSource> {
+        None
+    }
+
     /// 加载一章（解析层出口：结构层 + 内容层）。
     fn load_chapter(&self, id: ChapterId) -> RrkResult<ChapterContent>;
 

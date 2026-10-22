@@ -13,7 +13,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 /// ABI 版本（与 rrk-ffi 的 RRK_ABI_VERSION 对齐，启动校验）。
-const int kRrkAbiVersion = 4;
+const int kRrkAbiVersion = 5;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -68,6 +68,18 @@ typedef _BufFreeNative = Void Function(Pointer<Uint8>, IntPtr);
 typedef _BufFreeDart = void Function(Pointer<Uint8>, int);
 typedef _AbiNative = Uint32 Function();
 typedef _AbiDart = int Function();
+typedef _BookKindNative = Uint32 Function(Uint64);
+typedef _BookKindDart = int Function(int);
+typedef _PageCountNative = Uint32 Function(Uint64, Pointer<Uint32>);
+typedef _PageCountDart = int Function(int, Pointer<Uint32>);
+typedef _LoadPageNative = Uint32 Function(
+    Uint64, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _LoadPageDart = int Function(
+    int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _LoadResourceNative = Uint32 Function(
+    Uint64, Pointer<Utf8>, IntPtr, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _LoadResourceDart = int Function(
+    int, Pointer<Utf8>, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 
 class _Bindings {
   _Bindings(DynamicLibrary lib)
@@ -88,7 +100,12 @@ class _Bindings {
             lib.lookupFunction<_CacheCfgNative, _CacheCfgDart>('rrk_cache_configure'),
         renderPage = lib.lookupFunction<_RenderNative, _RenderDart>('rrk_render_page'),
         bufFree = lib.lookupFunction<_BufFreeNative, _BufFreeDart>('rrk_buf_free'),
-        abiVersion = lib.lookupFunction<_AbiNative, _AbiDart>('rrk_abi_version');
+        abiVersion = lib.lookupFunction<_AbiNative, _AbiDart>('rrk_abi_version'),
+        bookKind = lib.lookupFunction<_BookKindNative, _BookKindDart>('rrk_book_kind'),
+        pageCount = lib.lookupFunction<_PageCountNative, _PageCountDart>('rrk_page_count'),
+        loadPage = lib.lookupFunction<_LoadPageNative, _LoadPageDart>('rrk_load_page_json'),
+        loadResource =
+            lib.lookupFunction<_LoadResourceNative, _LoadResourceDart>('rrk_load_resource');
 
   final _OpenDart open;
   final _CloseDart close;
@@ -106,6 +123,10 @@ class _Bindings {
   final _RenderDart renderPage;
   final _BufFreeDart bufFree;
   final _AbiDart abiVersion;
+  final _BookKindDart bookKind;
+  final _PageCountDart pageCount;
+  final _LoadPageDart loadPage;
+  final _LoadResourceDart loadResource;
 }
 
 _Bindings? _b;
@@ -365,6 +386,28 @@ class ChapterContent {
   final List<ChapterLink> links;
 }
 
+/// 页级格式（CBZ / PDF）的一页。
+class PagedPage {
+  PagedPage._(this.kind, this.text, this.blocks, this.imageKey, this.mime);
+
+  /// `image`（页图）或 `text`（L1 抽取文本）。
+  final String kind;
+  final String? text;
+  final List<ChapterBlock> blocks;
+
+  /// 图片页的资源 key（配合 `loadResource` 取字节）。
+  final String? imageKey;
+  final String? mime;
+
+  static PagedPage _fromJson(Map<String, dynamic> j) => PagedPage._(
+        j['kind'] as String,
+        j['text'] as String?,
+        ChapterBlock._listFromJson((j['blocks'] as List?) ?? const []),
+        j['key'] as String?,
+        j['mime'] as String?,
+      );
+}
+
 // ---------------------------------------------------------------------------
 // 书
 // ---------------------------------------------------------------------------
@@ -443,6 +486,58 @@ class RrkBook {
       final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value);
       return ChapterEntry._listFromJson(jsonDecode(json!) as List<dynamic>);
     } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 书类型：0=Text 1=ImageGallery 2=Paged（-1 = 非法句柄）。
+  int get kind => _bindings.bookKind(_handle);
+
+  /// 页数（仅 CBZ/PDF；重排格式抛错）。
+  int pageCount() {
+    _check();
+    final out = malloc<Uint32>();
+    try {
+      final code = _bindings.pageCount(_handle, out);
+      if (code != 0) _throwCode(code);
+      return out.value;
+    } finally {
+      malloc.free(out);
+    }
+  }
+
+  /// 读一页（CBZ 图片页 / PDF 文本页）。
+  PagedPage loadPage(int index) {
+    _check();
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.loadPage(_handle, index, outPtr, outLen);
+      if (code != 0) _throwCode(code);
+      final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '{}';
+      return PagedPage._fromJson(jsonDecode(json) as Map<String, dynamic>);
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 按 key 取资源原始字节（图片页等）。
+  Uint8List loadResource(String key) {
+    _check();
+    final b = _bindings;
+    final keyPtr = key.toNativeUtf8();
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code =
+          b.loadResource(_handle, keyPtr, utf8.encode(key).length, outPtr, outLen);
+      if (code != 0) _throwCode(code);
+      return RrkEngine._takeBytes(b, outPtr.value, outLen.value) ?? Uint8List(0);
+    } finally {
+      malloc.free(keyPtr);
       malloc.free(outPtr);
       malloc.free(outLen);
     }

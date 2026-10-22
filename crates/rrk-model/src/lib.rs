@@ -35,6 +35,36 @@ pub enum FormatId {
     Cbz,
 }
 
+/// 书类型：统一句柄的分流依据（宿主据此选重排阅读 / 页级浏览）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookKind {
+    /// 重排文本（TXT / EPUB / MOBI / AZW3）。
+    Text,
+    /// 页级图片图库（CBZ）。
+    ImageGallery,
+    /// 固定版式页（PDF）。
+    Paged,
+}
+
+impl BookKind {
+    pub fn of(format: FormatId) -> Self {
+        match format {
+            FormatId::Cbz => BookKind::ImageGallery,
+            FormatId::Pdf => BookKind::Paged,
+            _ => BookKind::Text,
+        }
+    }
+
+    /// FFI 整数编码：0=Text 1=ImageGallery 2=Paged。
+    pub fn code(self) -> u32 {
+        match self {
+            BookKind::Text => 0,
+            BookKind::ImageGallery => 1,
+            BookKind::Paged => 2,
+        }
+    }
+}
+
 impl fmt::Display for FormatId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {

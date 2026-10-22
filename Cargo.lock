@@ -735,10 +735,12 @@ dependencies = [
 name = "rrk-kernel"
 version = "0.1.0"
 dependencies = [
+ "rrk-cbz",
  "rrk-epub",
  "rrk-format",
  "rrk-mobi",
  "rrk-model",
+ "rrk-pdf",
  "rrk-txt",
 ]
 
