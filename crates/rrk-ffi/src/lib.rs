@@ -153,6 +153,11 @@ fn meta_json(meta: &BookMeta) -> Vec<u8> {
         Some(l) => json_str(l, &mut s),
         None => s.push_str("null"),
     }
+    s.push_str(",\"description\":");
+    match &meta.description {
+        Some(d) => json_str(d, &mut s),
+        None => s.push_str("null"),
+    }
     s.push_str(",\"format\":");
     json_str(&meta.format.to_string(), &mut s);
     s.push_str(&format!(",\"contentHash\":\"{:016x}\"}}", meta.content_hash));

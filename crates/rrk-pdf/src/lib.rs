@@ -121,6 +121,7 @@ impl PdfBook {
             title,
             authors: Vec::new(),
             language: None,
+            description: None,
             format: FormatId::Pdf,
             content_hash,
             cover: None,

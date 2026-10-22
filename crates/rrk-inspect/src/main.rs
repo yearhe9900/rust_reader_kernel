@@ -71,6 +71,12 @@ fn run() -> Result<(), String> {
     println!("标题      : {}", meta.title);
     println!("作者      : {}", if meta.authors.is_empty() { "-".into() } else { meta.authors.join(" / ") });
     println!("语言      : {}", meta.language.as_deref().unwrap_or("-"));
+    let desc = meta
+        .description
+        .as_deref()
+        .map(|d| d.chars().take(60).collect::<String>())
+        .unwrap_or_else(|| "-".to_string());
+    println!("简介      : {desc}");
     println!("格式      : {}", meta.format);
     println!("内容哈希  : {:016x}", meta.content_hash);
     println!("打开耗时  : {open_ms:.1} ms");

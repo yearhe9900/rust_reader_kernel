@@ -217,10 +217,14 @@ class RrkEngine {
 // ---------------------------------------------------------------------------
 
 class BookMeta {
-  BookMeta._(this.title, this.authors, this.language, this.format, this.contentHash);
+  BookMeta._(this.title, this.authors, this.language, this.description,
+      this.format, this.contentHash);
   final String title;
   final List<String> authors;
   final String? language;
+
+  /// 简介（EPUB `dc:description` / MOBI EXTH 103·104）；缺失为 null。
+  final String? description;
   final String format;
   final String contentHash;
 
@@ -228,6 +232,7 @@ class BookMeta {
       j['title'] as String,
       (j['authors'] as List).cast<String>(),
       j['language'] as String?,
+      j['description'] as String?,
       j['format'] as String,
       j['contentHash'] as String);
 

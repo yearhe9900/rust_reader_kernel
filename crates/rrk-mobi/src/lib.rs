@@ -366,6 +366,12 @@ impl MobiBook {
             title,
             authors,
             language: container.exth_text(524),
+            // EXTH 103（description）/ 104（ISBN 附近的描述位）——清洗空白后取首个非空
+            description: container
+                .exth_text(103)
+                .or_else(|| container.exth_text(104))
+                .map(|s| clean_multiline(&s))
+                .filter(|s| !s.is_empty()),
             format,
             content_hash: fnv1a64(&raw_arc[..raw_arc.len().min(1024 * 1024)]),
             cover: container.cover_record.map(|r| ResourceKey(format!("rec:{}", r))),
@@ -383,6 +389,15 @@ impl MobiBook {
 // ---------------------------------------------------------------------------
 // FormatAdapter / BookSource
 // ---------------------------------------------------------------------------
+
+/// 简介清洗：折叠连续空白（含 EXTH 里的 `\r\n`）为单空格，并截断到 4000 字符。
+fn clean_multiline(s: &str) -> String {
+    let mut out = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if out.chars().count() > 4000 {
+        out = out.chars().take(4000).collect();
+    }
+    out
+}
 
 /// MOBI/AZW3 适配器（同一实现，按扩展名区分元数据格式标识）。
 pub struct MobiAdapter;

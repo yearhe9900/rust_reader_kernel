@@ -166,6 +166,7 @@ impl CbzBook {
             title: stem,
             authors: Vec::new(),
             language: None,
+            description: None,
             format: FormatId::Cbz,
             content_hash,
             cover: Some(ResourceKey("page:0".to_string())),

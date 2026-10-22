@@ -75,6 +75,8 @@ pub struct BookMeta {
     pub title: String,
     pub authors: Vec<String>,
     pub language: Option<String>,
+    /// 简介（EPUB `dc:description` / MOBI EXTH 103·104）；取不到为 `None`（兜底文案属宿主职责）。
+    pub description: Option<String>,
     pub format: FormatId,
     pub content_hash: ContentHash,
     pub cover: Option<ResourceKey>,

@@ -331,6 +331,7 @@ impl TxtBook {
             title,
             authors: Vec::new(),
             language: None,
+            description: None,
             format: FormatId::Txt,
             content_hash: fnv1a64(&bytes[..bytes.len().min(1024 * 1024)]),
             cover: None,

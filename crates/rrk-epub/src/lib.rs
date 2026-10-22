@@ -186,6 +186,7 @@ impl EpubBook {
             title,
             authors: opf.authors.clone(),
             language: opf.language.clone(),
+            description: opf.description.clone(),
             format: FormatId::Epub,
             content_hash: fnv1a64(&opf_xml.as_bytes()[..opf_xml.len().min(64 * 1024)]),
             // cover 字段存的是 manifest **href**（包内绝对路径），不是 manifest id：
@@ -230,6 +231,7 @@ struct OpfData {
     title: Option<String>,
     authors: Vec<String>,
     language: Option<String>,
+    description: Option<String>,
     manifest: HashMap<String, ManifestItem>,
     spine: Vec<String>,
     cover_id: Option<String>,
@@ -253,6 +255,7 @@ fn parse_opf(opf_xml: &str) -> OpfData {
         title: None,
         authors: Vec::new(),
         language: None,
+        description: None,
         manifest: HashMap::new(),
         spine: Vec::new(),
         cover_id: None,
@@ -264,7 +267,7 @@ fn parse_opf(opf_xml: &str) -> OpfData {
         match t {
             Token::Open { name, attrs, self_closing } => {
                 match local_name(&name) {
-                    "title" | "creator" | "language" => {
+                    "title" | "creator" | "language" | "description" => {
                         ctx = Some(local_name(&name).to_string());
                     }
                     "meta" => {
@@ -324,10 +327,20 @@ fn parse_opf(opf_xml: &str) -> OpfData {
                         data.language = Some(t.to_string());
                     }
                 }
+                Some("description") if data.description.is_none() => {
+                    // 折叠空白（OPF 里常见多行/缩进），截断上限 4000 字符
+                    let mut t = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if t.chars().count() > 4000 {
+                        t = t.chars().take(4000).collect();
+                    }
+                    if !t.is_empty() {
+                        data.description = Some(t);
+                    }
+                }
                 _ => {}
             },
             Token::Close(name) => {
-                if matches!(local_name(&name), "title" | "creator" | "language") {
+                if matches!(local_name(&name), "title" | "creator" | "language" | "description") {
                     ctx = None;
                 }
             }
@@ -724,5 +737,27 @@ mod tests {
             .load_resource(&ResourceKey("images/cover.jpg".into()))
             .unwrap();
         assert_eq!(res.data.as_ref(), b"\xff\xd8\xff-fake");
+    }
+
+    #[test]
+    fn opf_description_parsed_and_whitespace_collapsed() {
+        let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <metadata>
+    <dc:title>书名</dc:title>
+    <dc:description>
+        第一段  简介
+        第二段  简介
+    </dc:description>
+  </metadata>
+</package>"#;
+        let d = parse_opf(opf);
+        assert_eq!(d.description.as_deref(), Some("第一段 简介 第二段 简介"));
+    }
+
+    #[test]
+    fn opf_without_description_is_none() {
+        let opf = r#"<package><metadata><dc:title>无简介</dc:title></metadata></package>"#;
+        assert!(parse_opf(opf).description.is_none());
     }
 }
