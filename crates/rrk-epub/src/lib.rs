@@ -11,8 +11,8 @@ use std::sync::Arc;
 use rrk_format::{BookSource, ContentSource, FormatAdapter};
 use rrk_markup::{attr, clean_xhtml, local_name, tokenize, Token};
 use rrk_model::{
-    fnv1a64, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId, Resource,
-    ResourceKey, RrkError, RrkResult, TocNode,
+    fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
+    Inline, Resource, ResourceKey, RrkError, RrkResult, TocNode,
 };
 use rrk_zip::{ZipArchive, ZipEntry};
 
@@ -61,6 +61,46 @@ fn normalize_path(p: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// 取 href 的目录部分（无目录返回空串）。
+fn dir_of(href: &str) -> String {
+    match href.rsplit_once('/') {
+        Some((d, _)) => d.to_string(),
+        None => String::new(),
+    }
+}
+
+/// 书内资源 key 归一化为**包内绝对路径**（`load_resource` 的 key 契约）。
+///
+/// XHTML 里的 `src` 是相对**文档**目录的；`/…` 开头按包根解释。
+/// 带 scheme（`http(s):` / `data:` …）的书外资源原样保留。
+fn resolve_key(base_dir: &str, raw: &str) -> String {
+    if raw.contains("://") || raw.starts_with("data:") {
+        return raw.to_string();
+    }
+    if let Some(abs) = raw.strip_prefix('/') {
+        return normalize_path(abs);
+    }
+    resolve_href(base_dir, raw)
+}
+
+/// 递归归一化块树里的图片 key（块级图片、行内图片、引用块内层）。
+fn resolve_image_keys(blocks: &mut [Block], base_dir: &str) {
+    for b in blocks {
+        match b {
+            Block::Image { key, .. } => key.0 = resolve_key(base_dir, &key.0),
+            Block::Quote { blocks } => resolve_image_keys(blocks, base_dir),
+            Block::Heading { inlines, .. } | Block::Paragraph { inlines, .. } => {
+                for i in inlines {
+                    if let Inline::Image { key } = i {
+                        key.0 = resolve_key(base_dir, &key.0);
+                    }
+                }
+            }
+            Block::Divider => {}
+        }
+    }
 }
 
 impl EpubBook {
@@ -148,7 +188,13 @@ impl EpubBook {
             language: opf.language.clone(),
             format: FormatId::Epub,
             content_hash: fnv1a64(&opf_xml.as_bytes()[..opf_xml.len().min(64 * 1024)]),
-            cover: opf.cover_id.clone().map(ResourceKey),
+            // cover 字段存的是 manifest **href**（包内绝对路径），不是 manifest id：
+            // `cover()` 直接走 `load_resource`，id 是查表键不是资源键。
+            cover: opf
+                .cover_id
+                .as_ref()
+                .and_then(|id| opf.manifest.get(id))
+                .map(|item| ResourceKey(resolve_href(&opf_dir, &item.href))),
         };
 
         Ok(Self {
@@ -308,10 +354,6 @@ fn parse_opf(opf_xml: &str) -> OpfData {
 
 /// 目录原始项（title, **zip 根相对路径**）；nav 优先，NCX 回退。
 fn build_toc_raw(zip: &Arc<ZipArchive>, opf: &OpfData, opf_dir: &str) -> Vec<(String, String)> {
-    let dir_of = |href: &str| match href.rsplit_once('/') {
-        Some((d, _)) => d.to_string(),
-        None => String::new(),
-    };
     // EPUB3 nav：manifest 中 properties 含 nav
     if let Some(item) = opf.manifest.values().find(|i| i.properties.contains("nav")) {
         let href = resolve_href(opf_dir, &item.href);
@@ -489,12 +531,23 @@ impl BookSource for EpubBook {
     fn load_chapter(&self, id: ChapterId) -> RrkResult<ChapterContent> {
         let entry = self.entry_for_chapter(id)?;
         let html = self.zip.read_string(entry)?;
-        let cleaned = clean_xhtml(&html);
+        let mut cleaned = clean_xhtml(&html);
+        // 图片 key 出口契约 = 包内绝对路径：清洗层保留的是文档里的原始 `src`
+        // （相对**文档**目录），在出口统一归一化，宿主可直接拿去 `load_resource`。
+        let base = dir_of(&entry.name);
+        resolve_image_keys(&mut cleaned.blocks, &base);
         Ok(ChapterContent { id, text: Arc::from(cleaned.text), blocks: cleaned.blocks })
     }
 
     fn load_resource(&self, key: &ResourceKey) -> RrkResult<Resource> {
-        let href = resolve_href(&self.opf_dir, &key.0);
+        // key 契约 = 包内绝对路径（load_chapter 归一化的图片 key / 封面 href）；
+        // 兼容 OPF 相对键（旧口径）：绝对路径 miss 时再按 OPF 目录解析一次。
+        let direct = normalize_path(&key.0);
+        let href = if self.zip.entry(&direct).is_some() {
+            direct
+        } else {
+            resolve_href(&self.opf_dir, &key.0)
+        };
         let entry = self
             .zip
             .entry(&href)
@@ -522,5 +575,154 @@ impl BookSource for EpubBook {
 
     fn estimate_weights(&self) -> RrkResult<Vec<(ChapterId, u32)>> {
         Ok(self.entries.iter().map(|e| (e.id, e.char_len)).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 内存构造最小 EPUB（STORED 条目，零依赖）做资源 key 归一化契约测试。
+
+    use super::*;
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in data {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+            }
+        }
+        !c
+    }
+
+    /// 最小 zip 写入器（STORED；布局照 rrk-zip 回环测试的构造器）。
+    fn build_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, content) in files {
+            let offset = out.len() as u32;
+            let crc = crc32(content);
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes()); // local header
+            out.extend_from_slice(&20u16.to_le_bytes()); // version
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method = stored
+            out.extend_from_slice(&0u16.to_le_bytes()); // time
+            out.extend_from_slice(&0u16.to_le_bytes()); // date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(content);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes()); // central header
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes()); // method = stored
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes()); // extra
+            central.extend_from_slice(&0u16.to_le_bytes()); // comment
+            central.extend_from_slice(&0u16.to_le_bytes()); // disk
+            central.extend_from_slice(&0u16.to_le_bytes()); // internal attr
+            central.extend_from_slice(&0u32.to_le_bytes()); // external attr
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(&central);
+        let cd_size = out.len() as u32 - cd_offset;
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes()); // EOCD
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    const CONTAINER: &str = r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#;
+
+    const OPF: &str = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>测试书</dc:title>
+    <dc:creator>测试作者</dc:creator>
+    <meta name="cover" content="cover-img"/>
+  </metadata>
+  <manifest>
+    <item id="cover-img" href="images/cover.jpg" media-type="image/jpeg"/>
+    <item id="ch1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+
+    const CH1: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p>你好<img src="../images/pic.png" alt="图"/></p>
+</body></html>"#;
+
+    fn test_book() -> EpubBook {
+        let zip = build_zip(&[
+            ("META-INF/container.xml", CONTAINER.as_bytes()),
+            ("OEBPS/content.opf", OPF.as_bytes()),
+            ("OEBPS/text/ch1.xhtml", CH1.as_bytes()),
+            ("OEBPS/images/pic.png", b"\x89PNG-fake"),
+            ("OEBPS/images/cover.jpg", b"\xff\xd8\xff-fake"),
+        ]);
+        let src = ContentSource::from_bytes(
+            Some("t.epub".to_string()),
+            Arc::<[u8]>::from(zip.into_boxed_slice()),
+        );
+        EpubBook::parse(&src).unwrap()
+    }
+
+    #[test]
+    fn cover_key_is_manifest_href_not_id() {
+        let book = test_book();
+        let cover = book.cover().unwrap().expect("封面应可取");
+        assert_eq!(cover.key.0, "OEBPS/images/cover.jpg");
+    }
+
+    #[test]
+    fn image_key_normalized_to_package_path() {
+        let book = test_book();
+        // 文档在 text/ 子目录，src="../images/pic.png" → 出口必须是包内绝对路径。
+        let content = book.load_chapter(0).unwrap();
+        let img = content
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Image { key, .. } => Some(key.0.clone()),
+                _ => None,
+            })
+            .expect("应有图片块");
+        assert_eq!(img, "OEBPS/images/pic.png");
+    }
+
+    #[test]
+    fn load_resource_accepts_absolute_and_opf_relative_keys() {
+        let book = test_book();
+        // 归一化后的绝对路径直查命中
+        let res = book
+            .load_resource(&ResourceKey("OEBPS/images/pic.png".into()))
+            .unwrap();
+        assert_eq!(res.data.as_ref(), b"\x89PNG-fake");
+        // OPF 相对键（旧口径）兜底也命中
+        let res = book
+            .load_resource(&ResourceKey("images/cover.jpg".into()))
+            .unwrap();
+        assert_eq!(res.data.as_ref(), b"\xff\xd8\xff-fake");
     }
 }
