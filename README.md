@@ -64,7 +64,7 @@ SKIP_ANDROID=1 bash scripts/package-release.sh   # 只打 Windows
 封装包、`MANIFEST.json` 校验和、接入说明 `README.md`）及同名 `.zip`。发布到 GitHub：
 
 ```sh
-gh release create v0.1.0 dist/rrk_reader-0.1.0.zip --generate-notes
+gh release create v0.1.2 dist/rrk_reader-0.1.2.zip --generate-notes
 ```
 
 ### 命令行工具（rrk-inspect）
@@ -73,6 +73,8 @@ gh release create v0.1.0 dist/rrk_reader-0.1.0.zip --generate-notes
 
 ```sh
 rrk-inspect <书路径> [--toc] [--chapter N] [--blocks M] [--render N --out page.png]
+rrk-inspect <书路径> --search 词      # 全书搜索（拉模式分块）
+rrk-inspect <书路径> --bm25 词        # BM25 建索引 + 排序
 ```
 
 ### Dart / FFI
@@ -85,7 +87,8 @@ dart run example/smoke.dart <ffi库路径> <书路径>
 ```
 
 API 概览：`RrkEngine.init/openBook` → `meta()/toc()/chapters()/loadChapter()`
-→ `pagesOf()/pageAt()/hitTest()/prefetch()`（排版与进度）→ `renderPage()`（整页位图）。
+→ `pagesOf()/pageAt()/hitTest()/prefetch()`（排版与进度）→ `renderPage()`（整页位图）
+→ `search()/buildIndex()`（全书检索与 BM25 索引）→ `RrkImage.*`（尺寸头解析 / BGRA→PNG）。
 
 ### 接入选型：C ABI（`rrk-ffi`）还是 FRB 直连
 
@@ -119,6 +122,8 @@ release 构建、Windows x64 实测（完整数据见
 | 排版 87KB 长章（67 页） | 23.9 ms（parley） |
 | 布局缓存命中 | 1.6 ms（提速 ~93%） |
 | PDF 原版页渲染 @900px | 15–23 ms/页 |
+| 全书搜索（7.1MB EPUB / 1152 章，命中 23750） | 204 ms（1188 批跨 FFI） |
+| BM25 建索引（同上，380544 词项） | 915 ms，序列化 9.5MB |
 
 ## 目录结构
 
@@ -131,6 +136,8 @@ rust_reader_kernel/
 │   ├── rrk-zip/             # zip 随机读（EPUB/CBZ 共用）
 │   ├── rrk-txt/ rrk-epub/ rrk-mobi/ rrk-cbz/ rrk-pdf/   # 各格式适配器
 │   ├── rrk-layout/          # 排版内核（parley）+ 引擎对照基准
+│   ├── rrk-search/          # 全书检索（拉模式分块）+ BM25 索引
+│   ├── rrk-image/           # 图片尺寸头解析 + BGRA→PNG 编码
 │   ├── rrk-cache/           # 三要素缓存（内存 LRU + 磁盘落盘）
 │   ├── rrk-kernel/          # 书架/句柄/生命周期
 │   ├── rrk-ffi/             # C ABI（Dart/Flutter/任意宿主）
@@ -150,6 +157,7 @@ rust_reader_kernel/
 | [设计-极速开书全链路](docs/设计-极速开书全链路.md) | 首屏性能与开书链路 |
 | [设计-极速开书与渲染统一方案](docs/设计-极速开书与渲染统一方案.md) | 解析/渲染统一数据面 |
 | [分析-渲染层性能与按需渲染改造方案](docs/分析-渲染层性能与按需渲染改造方案.md) | 按需渲染分析 |
+| [设计-检索与BM25索引](docs/设计-检索与BM25索引.md) | 全书搜索会话、偏移映射、BM25 索引格式 |
 | [性能-排版与解析基准](docs/性能-排版与解析基准.md) | 实测数据与验收判据 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
 

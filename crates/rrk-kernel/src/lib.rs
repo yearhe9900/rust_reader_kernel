@@ -250,13 +250,13 @@ pub struct Bm25Job {
 
 impl Bm25Job {
     fn new(book: Arc<dyn BookSource>, chapters: Vec<ChapterEntry>) -> Self {
-        let total = chapters.len();
         Self {
             book: Some(book),
             chapters,
             next: 0,
             builder: Bm25Builder::new(),
-            index: if total == 0 { Some(Bm25Builder::new().build()) } else { None },
+            // 空书也在首次 `step` 里走 finalize（保证 bytes 是合法的空索引字节）
+            index: None,
             bytes: Vec::new(),
         }
     }
@@ -366,6 +366,40 @@ mod tests {
         let err = k.open(&bad).unwrap_err();
         assert_eq!(err.kind, rrk_model::RrkErrorKind::UnsupportedFormat);
         assert_eq!(k.open_count(), 0);
+    }
+
+    /// 端到端：建索引 → 拉字节 → 从字节重载 → 查询结果一致。
+    #[test]
+    fn bm25_build_pull_reload() {
+        let mut k = Kernel::new();
+        let handle = k.open(&ContentSource::from_path("../../fixtures/sample.txt")).unwrap();
+
+        let iid = k.bm25_open(handle).unwrap();
+        let job = k.bm25_job(iid).unwrap();
+        let progress = job.lock().unwrap().step(10_000).unwrap();
+        assert!(progress.done, "应一次建完: {progress:?}");
+        assert!(progress.terms > 0, "样例书应有词项");
+        let bytes = job.lock().unwrap().bytes().to_vec();
+        assert!(!bytes.is_empty() && bytes.starts_with(b"RRKI"));
+        let before = job.lock().unwrap().index().unwrap().query("编码", 5);
+
+        // 宿主落盘后交回内核
+        let iid2 = k.bm25_load(&bytes).unwrap();
+        let after = k
+            .bm25_job(iid2)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .index()
+            .unwrap()
+            .query("编码", 5);
+        assert_eq!(before, after, "重载后查询结果应逐条一致");
+        assert!(!before.is_empty(), "样例书应命中「编码」");
+
+        k.bm25_close(iid).unwrap();
+        k.bm25_close(iid2).unwrap();
+        assert_eq!(k.index_count(), 0);
+        k.close(handle).unwrap();
     }
 
     #[test]
