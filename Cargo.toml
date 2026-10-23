@@ -12,6 +12,7 @@ members = [
     "crates/rrk-cbz",
     "crates/rrk-pdf",
     "crates/rrk-cache",
+    "crates/rrk-search",
     "crates/rrk-layout",
     "crates/rrk-kernel",
     "crates/rrk-ffi",
@@ -37,6 +38,7 @@ rrk-mobi = { path = "crates/rrk-mobi" }
 rrk-cbz = { path = "crates/rrk-cbz" }
 rrk-pdf = { path = "crates/rrk-pdf" }
 rrk-cache = { path = "crates/rrk-cache" }
+rrk-search = { path = "crates/rrk-search" }
 rrk-layout = { path = "crates/rrk-layout" }
 rrk-kernel = { path = "crates/rrk-kernel" }
 

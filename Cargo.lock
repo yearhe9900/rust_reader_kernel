@@ -710,6 +710,7 @@ dependencies = [
  "rrk-kernel",
  "rrk-layout",
  "rrk-model",
+ "rrk-search",
 ]
 
 [[package]]
@@ -739,6 +740,7 @@ dependencies = [
  "rrk-mobi",
  "rrk-model",
  "rrk-pdf",
+ "rrk-search",
  "rrk-txt",
 ]
 
@@ -752,6 +754,7 @@ dependencies = [
  "rrk-mobi",
  "rrk-model",
  "rrk-pdf",
+ "rrk-search",
  "rrk-txt",
 ]
 
@@ -799,6 +802,14 @@ dependencies = [
  "rrk-model",
  "swash 0.2.10",
  "tiny-skia",
+]
+
+[[package]]
+name = "rrk-search"
+version = "0.1.1"
+dependencies = [
+ "rrk-format",
+ "rrk-model",
 ]
 
 [[package]]

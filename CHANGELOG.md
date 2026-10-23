@@ -7,9 +7,29 @@
 
 ## [Unreleased]
 
-**ABI 6**：Dart 封装（`kRrkAbiVersion = 6`）与预编译原生库必须同步升级（新增图像出口）。
+**ABI 6 → 7**：Dart 封装（`kRrkAbiVersion = 7`）与预编译原生库必须同步升级
+（6 = 图像出口，7 = 检索/索引出口）。
 
 ### Added
+
+- **检索与索引（issue #9）**：新增 `rrk-search` crate + 内核会话表 + FFI/Dart 出口。
+  - **全书搜索**（`SearchSession`）：句柄级会话、**拉模式分块**（宿主按批取命中，
+    进度随批返回 `scanned/total`）、`cancel` 置原子标志即真停（无后台线程、内存随
+    引用释放）；每次只持有一章的扁平块，跨 FFI 只传批次小结构。
+  - **BM25 索引**（`Bm25Builder`/`Bm25`）：以句柄为输入逐章投喂（`step` 分批、可随时
+    放弃），产出**自描述序列化字节**（magic `RRKI` + LEB128 varint postings），
+    内核不写盘；`Bm25::decode`/`rrk_bm25_load` 支持宿主落盘后跨启动复用。
+  - **文本真值**：两者统一消费 `flatten_blocks_spans`（与 FFI `blocks_json` 同源），
+    保证「搜到的 = 读到的」；`rrk-search::search_text` 去掉行内图片标记后喂索引。
+  - **偏移坐标系**：命中偏移 = `ChapterContent.text` 的 UTF-8 字节偏移，与目录锚点
+    (`TocNode.anchor`)、内链 (`link_ranges`)、进度 (`SemanticPos`) 同一坐标系；
+    `rrk_model::PlainTextBlock::to_source` 负责「段落文本偏移 → 章正文偏移」回映。
+  - **分词**：CJK 连续段取 bigram（单字退化为 unigram）、西文/数字按词块，
+    仅做 ASCII 大小写折叠（不改变字节长度，故偏移映射不受影响）。
+  - FFI：`rrk_search_open/next/cancel`、`rrk_bm25_open/load/step/pull/query/close`；
+    Dart：`RrkBook.search()`/`buildIndex()`、`RrkSearchSession`、`RrkBm25Index`
+    （含 `pullAll` 分块拉取与 `load` 往返）。
+  - CLI：`rrk-inspect --search <词>` / `--bm25 <词>`。
 
 - **图像工具（issue #8）**：新增 `rrk-image` crate，把宿主侧的纯字节图像算法下沉内核。
   - `rrk_image::dimensions`：**只读文件头**取尺寸 + 格式（PNG IHDR / JPEG SOFn 段链 /

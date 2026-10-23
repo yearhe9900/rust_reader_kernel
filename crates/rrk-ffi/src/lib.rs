@@ -21,7 +21,7 @@ use rrk_model::{
 };
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
-pub const RRK_ABI_VERSION: u32 = 6;
+pub const RRK_ABI_VERSION: u32 = 7;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -1112,4 +1112,262 @@ pub unsafe extern "C" fn rrk_encode_png_bgra(
         write_buf(png, out_ptr, out_len);
         Ok(0)
     })
+}
+
+// ---------------------------------------------------------------------------
+// 检索（issue #9）：全书搜索（拉模式分块 + 可取消）与 BM25 索引
+// ---------------------------------------------------------------------------
+
+/// 读调用方传入的 UTF-8 串（空指针/零长 → 空串）。
+unsafe fn read_utf8(ptr: *const u8, len: usize, what: &str) -> Result<String, u32> {
+    if ptr.is_null() || len == 0 {
+        return Ok(String::new());
+    }
+    match std::str::from_utf8(std::slice::from_raw_parts(ptr, len)) {
+        Ok(s) => Ok(s.to_string()),
+        Err(e) => Err(set_kind(RrkError::invalid(format!("{what}非 UTF-8: {e}")))),
+    }
+}
+
+/// 检索批次 → JSON：
+/// `{"hits":[{"chapter","offset","len","snippet","snippetOffset"}],"scanned","total","done"}`
+fn search_page_json(page: &rrk_search::SearchPage) -> Vec<u8> {
+    let mut s = String::with_capacity(96 * page.hits.len().max(1) + 64);
+    s.push_str("{\"hits\":[");
+    for (i, h) in page.hits.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"chapter\":{},\"offset\":{},\"len\":{},\"snippet\":",
+            h.chapter, h.offset, h.len
+        ));
+        json_str(&h.snippet, &mut s);
+        s.push_str(&format!(",\"snippetOffset\":{}}}", h.snippet_offset));
+    }
+    s.push_str(&format!(
+        "],\"scanned\":{},\"total\":{},\"done\":{}}}",
+        page.scanned,
+        page.total,
+        if page.done { "true" } else { "false" }
+    ));
+    s.into_bytes()
+}
+
+/// 索引进度 → JSON：`{"built","total","done","terms","bytes"}`
+fn bm25_progress_json(p: &rrk_kernel::Bm25Progress) -> Vec<u8> {
+    format!(
+        "{{\"built\":{},\"total\":{},\"done\":{},\"terms\":{},\"bytes\":{}}}",
+        p.built,
+        p.total,
+        if p.done { "true" } else { "false" },
+        p.terms,
+        p.bytes
+    )
+    .into_bytes()
+}
+
+/// BM25 命中 → JSON：`[{"chapter","score"}]`
+fn scored_json(hits: &[rrk_search::ScoredHit]) -> Vec<u8> {
+    let mut s = String::with_capacity(32 * hits.len().max(1) + 2);
+    s.push('[');
+    for (i, h) in hits.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{{\"chapter\":{},\"score\":{:.4}}}", h.chapter, h.score));
+    }
+    s.push(']');
+    s.into_bytes()
+}
+
+/// 建立检索会话；成功返回 `search_id`（≥1），失败返回 0。
+///
+/// `case_sensitive` 非 0 = 区分大小写（仅 ASCII 折叠）；`context_chars` = 命中片段左右
+/// 各取多少字节上下文（0 用默认 30）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_search_open(
+    handle: BookHandle,
+    query_ptr: *const u8,
+    query_len: usize,
+    case_sensitive: u32,
+    context_chars: u32,
+) -> u64 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let query = match read_utf8(query_ptr, query_len, "检索词") {
+            Ok(q) => q,
+            Err(_) => return 0,
+        };
+        let opts = rrk_search::SearchOptions {
+            case_sensitive: case_sensitive != 0,
+            context_chars: if context_chars == 0 { 30 } else { context_chars },
+        };
+        with_kernel(|k| k.search_open(handle, &query, opts).map_err(set_kind)).unwrap_or(0)
+    })) {
+        Ok(id) => id,
+        Err(_) => {
+            set_last_error("内部 panic（已拦截）");
+            0
+        }
+    }
+}
+
+/// 拉取一批命中（**拉模式分块**）；批次 JSON 见 `search_page_json`。
+///
+/// 扫描在**会话锁**内进行、内核锁已提前释放，故另一线程的 `rrk_search_cancel`
+/// 能立刻置位并让本调用在下一个检查点返回 `Cancelled`（1005）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_search_next(
+    search_id: rrk_kernel::SearchId,
+    max_hits: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+        let (session, _cancel) =
+            with_kernel(|k| k.search_session(search_id).map_err(set_kind))?;
+        let mut s = session.lock().map_err(|_| {
+            set_err(RrkError::io("检索会话锁中毒"), RrkErrorKind::Internal.code())
+        })?;
+        let page = s.next(max_hits).map_err(set_kind)?;
+        write_buf(search_page_json(&page), out_ptr, out_len);
+        Ok(0)
+    })
+}
+
+/// 取消检索（置标志 + 摘除会话；内存随最后一个引用释放，**不留后台线程**）。
+#[no_mangle]
+pub extern "C" fn rrk_search_cancel(search_id: rrk_kernel::SearchId) -> u32 {
+    guard(|| with_kernel(|k| k.search_cancel(search_id).map_err(set_kind)).map(|_| 0))
+}
+
+/// 开一个 BM25 索引会话；成功返回 `index_id`（≥1），失败返回 0。
+#[no_mangle]
+pub extern "C" fn rrk_bm25_open(handle: BookHandle) -> u64 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        with_kernel(|k| k.bm25_open(handle).map_err(set_kind)).unwrap_or(0)
+    })) {
+        Ok(id) => id,
+        Err(_) => {
+            set_last_error("内部 panic（已拦截）");
+            0
+        }
+    }
+}
+
+/// 从宿主落盘的索引字节载入（跨启动复用）；成功返回 `index_id`，失败返回 0。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_bm25_load(data_ptr: *const u8, data_len: usize) -> u64 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if data_ptr.is_null() || data_len == 0 {
+            set_last_error("索引字节为空");
+            return 0;
+        }
+        let bytes = std::slice::from_raw_parts(data_ptr, data_len);
+        with_kernel(|k| k.bm25_load(bytes).map_err(set_kind)).unwrap_or(0)
+    })) {
+        Ok(id) => id,
+        Err(_) => {
+            set_last_error("内部 panic（已拦截）");
+            0
+        }
+    }
+}
+
+/// 分组推进索引构建（每次最多 `max_chapters` 章）；返回进度 JSON。
+///
+/// 宿主反复调用直到 `done=true`，期间可随时停手/放弃（`rrk_bm25_close`）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_bm25_step(
+    index_id: rrk_kernel::IndexId,
+    max_chapters: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+        let job = with_kernel(|k| k.bm25_job(index_id).map_err(set_kind))?;
+        let mut j = job
+            .lock()
+            .map_err(|_| set_err(RrkError::io("索引会话锁中毒"), RrkErrorKind::Internal.code()))?;
+        let progress = j.step(max_chapters).map_err(set_kind)?;
+        write_buf(bm25_progress_json(&progress), out_ptr, out_len);
+        Ok(0)
+    })
+}
+
+/// 拉取序列化索引字节的分块：从 `offset` 起取至多 `max_bytes` 字节，
+/// `out_next` 回填下一个 offset（== 总长即取完）。**内核不写盘，落盘归宿主。**
+#[no_mangle]
+pub unsafe extern "C" fn rrk_bm25_pull(
+    index_id: rrk_kernel::IndexId,
+    offset: u64,
+    max_bytes: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    out_next: *mut u64,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() || out_next.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+        let job = with_kernel(|k| k.bm25_job(index_id).map_err(set_kind))?;
+        let j = job
+            .lock()
+            .map_err(|_| set_err(RrkError::io("索引会话锁中毒"), RrkErrorKind::Internal.code()))?;
+        j.index().map_err(set_kind)?; // 未建完则报错（中文原因带进度）
+        let bytes = j.bytes();
+        let start = (offset as usize).min(bytes.len());
+        let end = start.saturating_add(max_bytes.max(1)).min(bytes.len());
+        *out_next = end as u64;
+        write_buf(bytes[start..end].to_vec(), out_ptr, out_len);
+        Ok(0)
+    })
+}
+
+/// BM25 查询：返回按得分降序的前 `top_k` 章 `[{"chapter","score"}]`。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_bm25_query(
+    index_id: rrk_kernel::IndexId,
+    query_ptr: *const u8,
+    query_len: usize,
+    top_k: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+        let query = read_utf8(query_ptr, query_len, "查询词")?;
+        if query.trim().is_empty() {
+            return Err(set_kind(RrkError::invalid("查询词为空")));
+        }
+        let job = with_kernel(|k| k.bm25_job(index_id).map_err(set_kind))?;
+        let j = job
+            .lock()
+            .map_err(|_| set_err(RrkError::io("索引会话锁中毒"), RrkErrorKind::Internal.code()))?;
+        let hits = j.index().map_err(set_kind)?.query(&query, top_k.max(1) as usize);
+        write_buf(scored_json(&hits), out_ptr, out_len);
+        Ok(0)
+    })
+}
+
+/// 关闭索引会话（释放索引内存）。
+#[no_mangle]
+pub extern "C" fn rrk_bm25_close(index_id: rrk_kernel::IndexId) -> u32 {
+    guard(|| with_kernel(|k| k.bm25_close(index_id).map_err(set_kind)).map(|_| 0))
 }

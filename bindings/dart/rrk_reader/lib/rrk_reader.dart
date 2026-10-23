@@ -13,7 +13,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 /// ABI 版本（与 rrk-ffi 的 RRK_ABI_VERSION 对齐，启动校验）。
-const int kRrkAbiVersion = 6;
+const int kRrkAbiVersion = 7;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -88,6 +88,26 @@ typedef _PngBgraNative = Uint32 Function(Uint32, Uint32, IntPtr, Pointer<Uint8>,
     Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _PngBgraDart = int Function(int, int, int, Pointer<Uint8>, int, Pointer<Pointer<Uint8>>,
     Pointer<IntPtr>);
+typedef _SearchOpenNative = Uint64 Function(Uint64, Pointer<Utf8>, IntPtr, Uint32, Uint32);
+typedef _SearchOpenDart = int Function(int, Pointer<Utf8>, int, int, int);
+typedef _SearchNextNative = Uint32 Function(Uint64, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _SearchNextDart = int Function(int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _IdNative = Uint32 Function(Uint64);
+typedef _IdDart = int Function(int);
+typedef _HandleToIdNative = Uint64 Function(Uint64);
+typedef _HandleToIdDart = int Function(int);
+typedef _Bm25LoadNative = Uint64 Function(Pointer<Uint8>, IntPtr);
+typedef _Bm25LoadDart = int Function(Pointer<Uint8>, int);
+typedef _StepNative = Uint32 Function(Uint64, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _StepDart = int Function(int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PullNative = Uint32 Function(
+    Uint64, Uint64, IntPtr, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint64>);
+typedef _PullDart = int Function(
+    int, int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint64>);
+typedef _Bm25QueryNative = Uint32 Function(
+    Uint64, Pointer<Utf8>, IntPtr, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _Bm25QueryDart = int Function(
+    int, Pointer<Utf8>, int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 
 class _Bindings {
   _Bindings(DynamicLibrary lib)
@@ -117,7 +137,16 @@ class _Bindings {
         imageDimensions =
             lib.lookupFunction<_ImageDimNative, _ImageDimDart>('rrk_image_dimensions'),
         encodePngBgra =
-            lib.lookupFunction<_PngBgraNative, _PngBgraDart>('rrk_encode_png_bgra');
+            lib.lookupFunction<_PngBgraNative, _PngBgraDart>('rrk_encode_png_bgra'),
+        searchOpen = lib.lookupFunction<_SearchOpenNative, _SearchOpenDart>('rrk_search_open'),
+        searchNext = lib.lookupFunction<_SearchNextNative, _SearchNextDart>('rrk_search_next'),
+        searchCancel = lib.lookupFunction<_IdNative, _IdDart>('rrk_search_cancel'),
+        bm25Open = lib.lookupFunction<_HandleToIdNative, _HandleToIdDart>('rrk_bm25_open'),
+        bm25Load = lib.lookupFunction<_Bm25LoadNative, _Bm25LoadDart>('rrk_bm25_load'),
+        bm25Step = lib.lookupFunction<_StepNative, _StepDart>('rrk_bm25_step'),
+        bm25Pull = lib.lookupFunction<_PullNative, _PullDart>('rrk_bm25_pull'),
+        bm25Query = lib.lookupFunction<_Bm25QueryNative, _Bm25QueryDart>('rrk_bm25_query'),
+        bm25Close = lib.lookupFunction<_IdNative, _IdDart>('rrk_bm25_close');
 
   final _OpenDart open;
   final _CloseDart close;
@@ -141,6 +170,15 @@ class _Bindings {
   final _LoadResourceDart loadResource;
   final _ImageDimDart imageDimensions;
   final _PngBgraDart encodePngBgra;
+  final _SearchOpenDart searchOpen;
+  final _SearchNextDart searchNext;
+  final _IdDart searchCancel;
+  final _HandleToIdDart bm25Open;
+  final _Bm25LoadDart bm25Load;
+  final _StepDart bm25Step;
+  final _PullDart bm25Pull;
+  final _Bm25QueryDart bm25Query;
+  final _IdDart bm25Close;
 }
 
 _Bindings? _b;
@@ -526,6 +564,86 @@ class PagedPage {
       );
 }
 
+/// 检索命中：定位信息（章 + 章内偏移）与上下文片段。
+class SearchHit {
+  SearchHit._(this.chapter, this.offset, this.len, this.snippet, this.snippetOffset);
+
+  /// 所在章。
+  final int chapter;
+
+  /// 章正文（`loadChapter().text`）中的 **UTF-8 字节偏移**，与目录锚点/内链同坐标系。
+  final int offset;
+
+  /// 命中长度（字节）。
+  final int len;
+
+  /// 上下文片段（超长时两端带 `…`）。
+  final String snippet;
+
+  /// 片段在所属段落文本中的起点（字节），供局部高亮。
+  final int snippetOffset;
+
+  @override
+  String toString() => 'SearchHit(#$chapter @$offset "$snippet")';
+}
+
+/// 一批检索结果（拉模式分块）。
+class SearchBatch {
+  SearchBatch._(this.hits, this.scanned, this.total, this.done);
+
+  final List<SearchHit> hits;
+
+  /// 已扫完的章数（含跳过的图片章）。
+  final int scanned;
+
+  /// 全书章数。
+  final int total;
+
+  /// 是否已扫完全书（此批之后没有更多命中）。
+  final bool done;
+
+  /// 进度 0..1。
+  double get progress => total == 0 ? 1.0 : (scanned / total).clamp(0.0, 1.0);
+
+  @override
+  String toString() => 'SearchBatch(${hits.length} 条, $scanned/$total, done=$done)';
+}
+
+/// BM25 索引构建进度。
+class Bm25Progress {
+  Bm25Progress._(this.built, this.total, this.done, this.terms, this.bytes);
+
+  /// 已投喂章数。
+  final int built;
+
+  /// 全书章数。
+  final int total;
+
+  /// 是否建完（建完后才能 `pull` / `query`）。
+  final bool done;
+
+  /// 唯一词项数。
+  final int terms;
+
+  /// 序列化索引字节数（未建完为 0）。
+  final int bytes;
+
+  double get ratio => total == 0 ? 1.0 : (built / total).clamp(0.0, 1.0);
+
+  @override
+  String toString() => 'Bm25Progress($built/$total, done=$done, $terms 词项, $bytes 字节)';
+}
+
+/// BM25 排序命中（章级）。
+class Bm25Hit {
+  Bm25Hit._(this.chapter, this.score);
+  final int chapter;
+  final double score;
+
+  @override
+  String toString() => 'Bm25Hit(#$chapter ${score.toStringAsFixed(4)})';
+}
+
 // ---------------------------------------------------------------------------
 // 书
 // ---------------------------------------------------------------------------
@@ -841,6 +959,33 @@ class RrkBook {
     }
   }
 
+  /// 建立全书检索会话（拉模式分块、可取消）。
+  ///
+  /// 检索基于「宿主读到的段落文本」同源数据，命中偏移是章正文 UTF-8 字节偏移。
+  RrkSearchSession search(String query,
+      {bool caseSensitive = false, int contextChars = 30}) {
+    _check();
+    final b = _bindings;
+    final q = query.toNativeUtf8();
+    try {
+      final id = b.searchOpen(
+          _handle, q, utf8.encode(query).length, caseSensitive ? 1 : 0, contextChars);
+      if (id == 0) throw RrkException(1001, RrkEngine._lastError(b).message);
+      return RrkSearchSession._(id);
+    } finally {
+      malloc.free(q);
+    }
+  }
+
+  /// 开一个 BM25 索引构建会话（分步推进，可随时 `close` 放弃）。
+  RrkBm25Index buildIndex() {
+    _check();
+    final b = _bindings;
+    final id = b.bm25Open(_handle);
+    if (id == 0) throw RrkException(1001, RrkEngine._lastError(b).message);
+    return RrkBm25Index._(id);
+  }
+
   /// 关闭（幂等；Finalizer 兜底但请显式调用）。
   void close() {
     if (_closed) return;
@@ -851,6 +996,217 @@ class RrkBook {
     final b = _b;
     if (b != null && handle != 0) {
       final code = b.close(handle);
+      if (code != 0) {
+        throw RrkException(code, RrkEngine._lastError(b).message);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 检索会话
+// ---------------------------------------------------------------------------
+
+/// 全书检索会话（句柄级）。
+///
+/// 拉模式：反复 [next] 取批，[SearchBatch.done] 为 true 即扫完；
+/// 中途放弃请 [cancel]（真停，不留后台线程）。
+class RrkSearchSession {
+  RrkSearchSession._(this._id) {
+    _finalizer.attach(this, _id, detach: this);
+  }
+
+  static final Finalizer<int> _finalizer = Finalizer((id) {
+    final b = _b;
+    if (b != null && id != 0) b.searchCancel(id);
+  });
+
+  int _id;
+  bool _closed = false;
+
+  int get id => _id;
+  bool get isClosed => _closed;
+
+  void _check() {
+    if (_closed || _id == 0) {
+      throw RrkException(1004, '检索会话已取消');
+    }
+  }
+
+  /// 拉取下一批命中（[maxHits] 条以内）。
+  SearchBatch next({int maxHits = 50}) {
+    _check();
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.searchNext(_id, maxHits, outPtr, outLen);
+      if (code != 0) {
+        throw RrkException(code, RrkEngine._lastError(b).message);
+      }
+      final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '{}';
+      final m = jsonDecode(json) as Map<String, dynamic>;
+      final hits = ((m['hits'] as List?) ?? const [])
+          .map((e) => SearchHit._(e['chapter'] as int, e['offset'] as int, e['len'] as int,
+              e['snippet'] as String, e['snippetOffset'] as int))
+          .toList();
+      return SearchBatch._(hits, m['scanned'] as int, m['total'] as int, m['done'] as bool);
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 取消检索并释放内核侧会话（幂等）。
+  void cancel() {
+    if (_closed) return;
+    _closed = true;
+    final id = _id;
+    _id = 0;
+    _finalizer.detach(this);
+    final b = _b;
+    if (b != null && id != 0) {
+      final code = b.searchCancel(id);
+      if (code != 0) {
+        throw RrkException(code, RrkEngine._lastError(b).message);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BM25 索引
+// ---------------------------------------------------------------------------
+
+/// BM25 索引会话：分步构建 → 拉取字节（宿主落盘）→ 查询排序。
+class RrkBm25Index {
+  RrkBm25Index._(this._id) {
+    _finalizer.attach(this, _id, detach: this);
+  }
+
+  static final Finalizer<int> _finalizer = Finalizer((id) {
+    final b = _b;
+    if (b != null && id != 0) b.bm25Close(id);
+  });
+
+  /// 从宿主落盘的索引字节载入（跨启动复用，免重建）。
+  static RrkBm25Index load(Uint8List bytes) {
+    if (bytes.isEmpty) throw RrkException(1004, '索引字节为空');
+    final b = _bindings;
+    final src = malloc<Uint8>(bytes.length);
+    try {
+      src.asTypedList(bytes.length).setAll(0, bytes);
+      final id = b.bm25Load(src, bytes.length);
+      if (id == 0) throw RrkException(1001, RrkEngine._lastError(b).message);
+      return RrkBm25Index._(id);
+    } finally {
+      malloc.free(src);
+    }
+  }
+
+  int _id;
+  bool _closed = false;
+
+  int get id => _id;
+  bool get isClosed => _closed;
+
+  void _check() {
+    if (_closed || _id == 0) {
+      throw RrkException(1004, '索引会话已关闭');
+    }
+  }
+
+  /// 推进构建（最多 [maxChapters] 章），返回进度；反复调用直到 `done`。
+  Bm25Progress step({int maxChapters = 50}) {
+    _check();
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.bm25Step(_id, maxChapters, outPtr, outLen);
+      if (code != 0) throw RrkException(code, RrkEngine._lastError(b).message);
+      final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '{}';
+      final m = jsonDecode(json) as Map<String, dynamic>;
+      return Bm25Progress._(m['built'] as int, m['total'] as int, m['done'] as bool,
+          m['terms'] as int, m['bytes'] as int);
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 一步建完（阻塞；宿主想分批/可中断请自己循环 [step]）。
+  Bm25Progress buildAll({int chunkChapters = 200}) {
+    var p = step(maxChapters: chunkChapters);
+    while (!p.done) {
+      p = step(maxChapters: chunkChapters);
+    }
+    return p;
+  }
+
+  /// 拉取序列化索引的一个分块：返回 (字节, 下一个 offset)。
+  (Uint8List, int) pullChunk({required int offset, int maxBytes = 1 << 20}) {
+    _check();
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    final outNext = malloc<Uint64>();
+    try {
+      final code = b.bm25Pull(_id, offset, maxBytes, outPtr, outLen, outNext);
+      if (code != 0) throw RrkException(code, RrkEngine._lastError(b).message);
+      final bytes = RrkEngine._takeBytes(b, outPtr.value, outLen.value) ?? Uint8List(0);
+      return (bytes, outNext.value);
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+      malloc.free(outNext);
+    }
+  }
+
+  /// 一次取完整份索引字节（内部按 [chunkBytes] 分块拉取，避免单次大块跨边界）。
+  Uint8List pullAll({int chunkBytes = 1 << 20}) {
+    final builder = BytesBuilder(copy: false);
+    var offset = 0;
+    while (true) {
+      final (chunk, next) = pullChunk(offset: offset, maxBytes: chunkBytes);
+      if (chunk.isEmpty) break;
+      builder.add(chunk);
+      offset = next;
+    }
+    return builder.toBytes();
+  }
+
+  /// 查询：按 BM25 得分降序返回前 [topK] 章。
+  List<Bm25Hit> query(String q, {int topK = 10}) {
+    _check();
+    final b = _bindings;
+    final qp = q.toNativeUtf8();
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.bm25Query(_id, qp, utf8.encode(q).length, topK, outPtr, outLen);
+      if (code != 0) throw RrkException(code, RrkEngine._lastError(b).message);
+      final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '[]';
+      return (jsonDecode(json) as List<dynamic>)
+          .map((e) => Bm25Hit._(e['chapter'] as int, (e['score'] as num).toDouble()))
+          .toList();
+    } finally {
+      malloc.free(qp);
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 关闭索引会话（释放内存；幂等）。
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    final id = _id;
+    _id = 0;
+    _finalizer.detach(this);
+    final b = _b;
+    if (b != null && id != 0) {
+      final code = b.bm25Close(id);
       if (code != 0) {
         throw RrkException(code, RrkEngine._lastError(b).message);
       }

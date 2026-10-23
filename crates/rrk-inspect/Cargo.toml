@@ -13,4 +13,5 @@ rrk-epub.workspace = true
 rrk-mobi.workspace = true
 rrk-cbz.workspace = true
 rrk-pdf.workspace = true
+rrk-search.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }

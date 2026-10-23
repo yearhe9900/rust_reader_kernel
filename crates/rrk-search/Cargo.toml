@@ -1,0 +1,10 @@
+[package]
+name = "rrk-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：全书检索（拉模式分块 + 可取消）与 BM25 索引"
+
+[dependencies]
+rrk-model.workspace = true
+rrk-format.workspace = true
