@@ -15,9 +15,19 @@ use rrk_model::{
 };
 use rrk_zip::{ZipArchive, ZipEntry};
 
-const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"];
+/// 图片扩展名白名单（与宿主基线 `CbzSource` 对齐，见 issue #10）。
+///
+/// `png/jpg/jpeg/jpe/gif/bmp/webp/apng/tif/tiff/avif/heic`。其中 `avif`/`heic`/`tif`
+/// 能进页表、能出原始字节，但 L2 光栅化仍需对应解码器（当前 `image` 依赖未启用 tiff）。
+const IMAGE_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "jpe", "gif", "bmp", "webp", "apng", "tif", "tiff", "avif", "heic",
+];
 
-/// 数字自然序比较：`p12.jpg` < `p100.jpg`；同段数字按数值比，其余按字节比。
+/// 数字自然序比较：`p12.jpg` < `p100.jpg`；同段数字按数值比。
+///
+/// 与宿主 `compareNatural` 同序（issue #10-4）：
+/// - **大小写不敏感**（否则 `Page10.jpg` 会排到 `page2.jpg` 前）；
+/// - 数值相等时**前导零少者在前**（`p7.jpg` < `p007.jpg`）。
 fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let (ab, bb) = (a.as_bytes(), b.as_bytes());
@@ -35,11 +45,19 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             let na: u64 = a[sa..i].trim_start_matches('0').parse().unwrap_or(0);
             let nb: u64 = b[sb..j].trim_start_matches('0').parse().unwrap_or(0);
             match na.cmp(&nb) {
-                Ordering::Equal => {}
+                Ordering::Equal => {
+                    // 数值相等 → 前导零少者在前（位数少者在前）
+                    match (i - sa).cmp(&(j - sb)) {
+                        Ordering::Equal => {}
+                        ord => return ord,
+                    }
+                }
                 ord => return ord,
             }
         } else {
-            match ca.cmp(&cb) {
+            // 大小写不敏感比较（只折叠 ASCII；非 ASCII 按原字节）
+            let (la, lb) = (ca.to_ascii_lowercase(), cb.to_ascii_lowercase());
+            match la.cmp(&lb) {
                 Ordering::Equal => {
                     i += 1;
                     j += 1;
@@ -51,6 +69,94 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     (ab.len() - i).cmp(&(bb.len() - j))
 }
 
+/// 条目名归一化：`\`→`/`、去前导 `/`、压 `//`、去 `./` 与 `.`、处理 `..`、去尾 `/`。
+///
+/// 空名（只有目录标记）返回 `None`。
+fn normalize_entry_name(raw: &str) -> Option<String> {
+    let normalized = raw.replace('\\', "/");
+    let mut out: Vec<&str> = Vec::new();
+    for seg in normalized.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out.join("/"))
+}
+
+/// 垃圾条目判定（与宿主基线一致）：
+/// - 任意层级出现 `__MACOSX`（Finder 压缩的 CBZ 必带 `__MACOSX/._page1.jpg`）；
+/// - basename 以 `.` 开头（`.DS_Store` / `._xxx` / 隐藏文件）。
+fn is_junk_path(name: &str) -> bool {
+    if name
+        .split('/')
+        .any(|seg| seg.eq_ignore_ascii_case("__macosx"))
+    {
+        return true;
+    }
+    let base = name.rsplit('/').next().unwrap_or("");
+    base.starts_with('.')
+}
+
+/// 图片名判定（按 **basename** 的扩展名匹配白名单）。
+fn is_image_name(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or("");
+    match base.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => IMAGE_EXTS.contains(&ext.to_ascii_lowercase().as_str()),
+        _ => false,
+    }
+}
+
+/// 扩展名 → MIME（含 `image` 解码器未覆盖的格式：宿主拿原始字节自行解码/降级）。
+fn mime_of_name(name: &str) -> &'static str {
+    let base = name.rsplit('/').next().unwrap_or("");
+    match base.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" | "apng" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "avif" => "image/avif",
+        "heic" => "image/heic",
+        _ => "image/jpeg",
+    }
+}
+
+/// 收集页表：归一化 → 过滤（垃圾 + 白名单）→ 大小写撞名去重 → 自然序排序。
+///
+/// 与宿主 `CbzSource` 基线对齐（issue #10）：
+/// 1. 条目名先归一化（`\`→`/`、去 `./` 与前导 `/`、压 `//`、去尾 `/`）；
+/// 2. 过滤 `__MACOSX/` 前缀与 `.` 开头的隐藏文件；
+/// 3. 扩展名白名单补全（12 种）；
+/// 4. **小写键去重**（zip 物理序只收第一件，`Page1.jpg` 与 `page1.jpg` 不会成为两页）；
+/// 5. `natural_cmp` 大小写不敏感 + 前导零少者在前（与宿主 `compareNatural` 同序）。
+fn collect_pages(entries: &[ZipEntry]) -> Vec<PageRef> {
+    let mut pages: Vec<PageRef> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for e in entries {
+        if e.name.ends_with('/') {
+            continue; // 目录条目
+        }
+        let Some(name) = normalize_entry_name(&e.name) else { continue };
+        if is_junk_path(&name) || !is_image_name(&name) {
+            continue;
+        }
+        // 大小写撞名去重：小写键（首件胜出，按 zip 物理序）
+        if !seen.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        pages.push(PageRef { zip_name: e.name.clone(), name });
+    }
+    pages.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+    pages
+}
+
 /// 图片头解析尺寸（**已下沉**到 `rrk_image::dimensions`，此处仅保留 `(w, h)` 便捷壳）。
 ///
 /// 唯一口径在内核 `rrk-image`：CBZ 页尺寸表与宿主正文插图测量共用同一份实现，
@@ -59,17 +165,19 @@ pub fn image_size(data: &[u8]) -> Option<(u32, u32)> {
     rrk_image::dimensions(data).map(|s| (s.width, s.height))
 }
 
-fn is_image_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    IMAGE_EXTS.iter().any(|e| lower.ends_with(&format!(".{e}")))
+/// 页条目：`zip_name` 用于取数据，`name` 是归一化名（过滤/排序/href 口径）。
+#[derive(Debug, Clone)]
+struct PageRef {
+    zip_name: String,
+    name: String,
 }
 
 /// CBZ 书源。
 pub struct CbzBook {
     meta: BookMeta,
     zip: Arc<ZipArchive>,
-    /// 页序（按自然序排好的 zip 条目名）。
-    page_names: Vec<String>,
+    /// 页序（按自然序排好）。
+    pages: Vec<PageRef>,
     sizes: Vec<Option<(u32, u32)>>,
 }
 
@@ -79,25 +187,18 @@ impl CbzBook {
         let content_hash = fnv1a64(&bytes[..bytes.len().min(1024 * 1024)]);
         let zip = Arc::new(ZipArchive::parse(bytes)?);
 
-        let mut page_names: Vec<String> = zip
-            .entries()
-            .iter()
-            .filter(|e| is_image_name(&e.name) && !e.name.ends_with('/'))
-            .map(|e| e.name.clone())
-            .collect();
-        if page_names.is_empty() {
+        let pages = collect_pages(zip.entries());
+        if pages.is_empty() {
             return Err(RrkError::corrupt("CBZ: 无图片条目"));
         }
-        page_names.sort_by(|a, b| natural_cmp(a, b));
 
         // 尺寸只解析头 8KB（懒解压头即可定尺寸的图；JPEG 长头兜底用完整解压）
-        let mut sizes = Vec::with_capacity(page_names.len());
-        for name in &page_names {
-            let entry = zip.entry(name).expect("entry exists");
+        let mut sizes = Vec::with_capacity(pages.len());
+        for p in &pages {
             let size = zip
-                .read(entry)
-                .ok()
-                .and_then(|data| image_size(&data));
+                .entry(&p.zip_name)
+                .and_then(|entry| zip.read(entry).ok())
+                .and_then(|data| image_size(data.as_ref()));
             sizes.push(size);
         }
 
@@ -115,29 +216,26 @@ impl CbzBook {
             cover: Some(ResourceKey("page:0".to_string())),
         };
 
-        Ok(Self { meta, zip, page_names, sizes })
+        Ok(Self { meta, zip, pages, sizes })
+    }
+
+    fn page_ref(&self, index: u32) -> RrkResult<&PageRef> {
+        self.pages
+            .get(index as usize)
+            .ok_or_else(|| RrkError::invalid(format!("页越界: {index}")))
     }
 
     fn page_entry(&self, index: u32) -> RrkResult<&ZipEntry> {
-        let name = self
-            .page_names
-            .get(index as usize)
-            .ok_or_else(|| RrkError::invalid(format!("页越界: {index}")))?;
+        let p = self.page_ref(index)?;
         self.zip
-            .entry(name)
-            .ok_or_else(|| RrkError::corrupt(format!("CBZ: 条目缺失 {name}")))
+            .entry(&p.zip_name)
+            .ok_or_else(|| RrkError::corrupt(format!("CBZ: 条目缺失 {}", p.zip_name)))
     }
 
     fn load_page_resource(&self, index: u32) -> RrkResult<Resource> {
         let entry = self.page_entry(index)?;
         let data = self.zip.read(entry)?;
-        let mime = match entry.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()) {
-            Some(ref e) if e == "png" => "image/png",
-            Some(ref e) if e == "gif" => "image/gif",
-            Some(ref e) if e == "webp" => "image/webp",
-            Some(ref e) if e == "bmp" => "image/bmp",
-            _ => "image/jpeg",
-        };
+        let mime = mime_of_name(&self.page_ref(index)?.name);
         Ok(Resource {
             key: ResourceKey(format!("page:{index}")),
             mime: mime.to_string(),
@@ -180,7 +278,7 @@ impl PagedSource for CbzBook {
 
     fn pages(&self) -> RrkResult<Vec<PageEntry>> {
         Ok(self
-            .page_names
+            .pages
             .iter()
             .enumerate()
             .map(|(i, _)| PageEntry {
@@ -216,13 +314,13 @@ impl BookSource for CbzBook {
     /// 页 = 图片章（`ChapterKind::ImageGallery`），走统一管线。
     fn chapters(&self) -> RrkResult<Vec<ChapterEntry>> {
         Ok(self
-            .page_names
+            .pages
             .iter()
             .enumerate()
-            .map(|(i, name)| ChapterEntry {
+            .map(|(i, p)| ChapterEntry {
                 id: i as ChapterId,
                 title: Some(format!("第 {} 页", i + 1)),
-                href: name.clone(),
+                href: p.name.clone(),
                 byte_range: (i as u64, (i + 1) as u64),
                 char_len: 0,
                 kind: ChapterKind::ImageGallery,
@@ -260,7 +358,7 @@ impl BookSource for CbzBook {
     }
 
     fn estimate_weights(&self) -> RrkResult<Vec<(ChapterId, u32)>> {
-        Ok(self.page_names.iter().enumerate().map(|(i, _)| (i as ChapterId, 0)).collect())
+        Ok(self.pages.iter().enumerate().map(|(i, _)| (i as ChapterId, 0)).collect())
     }
 
     /// 页 = 图片：解码 + 缩放 → RGBA 位图（CBZ 的「原版页」即图片本体）。
@@ -290,11 +388,202 @@ impl BookSource for CbzBook {
 mod tests {
     use super::*;
 
+    /// 造一个最小 **stored**（不压缩）zip：本地头 + 数据 + 中央目录 + EOCD。
+    /// 只为页表口径用例服务，不引 zip 编码依赖。
+    fn build_cbz(files: &[&str]) -> Vec<u8> {
+        const SIG_LOCAL: u32 = 0x0403_4b50;
+        const SIG_CENTRAL: u32 = 0x0201_4b50;
+        const SIG_EOCD: u32 = 0x0605_4b50;
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        let mut count = 0u16;
+        for name in files {
+            // 用 24B 的 PNG 头当"图片"，让尺寸解析也能跑通
+            let mut data = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+            data.extend_from_slice(&[0, 0, 0, 13]);
+            data.extend_from_slice(b"IHDR");
+            data.extend_from_slice(&8u32.to_be_bytes());
+            data.extend_from_slice(&8u32.to_be_bytes());
+            data.extend_from_slice(&[8, 6, 0, 0, 0]);
+            // 追加名字的长度字节，保证不同条目大小不同（CRC 不校验）
+            data.extend_from_slice(name.as_bytes());
+
+            let offset = out.len() as u32;
+            let crc = 0u32; // rrk-zip 不校验 CRC
+            let len = data.len() as u32;
+            let nlen = name.len() as u16;
+            out.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes()); // version
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // stored
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&nlen.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&data);
+
+            central.extend_from_slice(&SIG_CENTRAL.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&len.to_le_bytes());
+            central.extend_from_slice(&len.to_le_bytes());
+            central.extend_from_slice(&nlen.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes()); // extra
+            central.extend_from_slice(&0u16.to_le_bytes()); // comment
+            central.extend_from_slice(&0u16.to_le_bytes()); // disk
+            central.extend_from_slice(&0u16.to_le_bytes()); // internal
+            central.extend_from_slice(&0u32.to_le_bytes()); // external
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+            count += 1;
+        }
+        let cd_off = out.len() as u32;
+        out.extend_from_slice(&central);
+        let cd_size = out.len() as u32 - cd_off;
+        out.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    /// 从 zip 字节打开 CBZ 书源。
+    fn open_bytes(bytes: Vec<u8>) -> CbzBook {
+        let src = ContentSource::from_bytes(Some("t.cbz".to_string()), bytes);
+        CbzBook::parse(&src).expect("CBZ 解析")
+    }
+
+    fn page_names_of(book: &CbzBook) -> Vec<String> {
+        book.pages.iter().map(|p| p.name.clone()).collect()
+    }
+
     #[test]
     fn natural_order() {
         let mut names = vec!["p100.jpg", "p12.jpg", "p2.jpg", "p1.jpg"];
         names.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(names, vec!["p1.jpg", "p2.jpg", "p12.jpg", "p100.jpg"]);
+    }
+
+    #[test]
+    fn natural_order_case_insensitive_and_leading_zeros() {
+        // #10-4：大小写不敏感 + 前导零少者在前（对齐宿主 compareNatural）
+        //
+        // 关键对：`Page10.jpg` vs `page2.jpg`——按**字节**比时 'P'(0x50) < 'p'(0x70)，
+        // Page10 会错排到 page2 前；折叠大小写后按数值 10 > 2，page2 应在前（宿主口径）。
+        // 关键对：`p7.jpg` vs `p007.jpg`——数值同为 7，前导零少者在前。
+        let mut names = vec!["Page10.jpg", "page2.jpg", "p7.jpg", "p007.jpg", "P3.jpg"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            names,
+            vec!["P3.jpg", "p7.jpg", "p007.jpg", "page2.jpg", "Page10.jpg"]
+        );
+    }
+
+    #[test]
+    fn normalize_name_rules() {
+        assert_eq!(normalize_entry_name(r".\pages\page1.jpg"), Some("pages/page1.jpg".to_string()));
+        assert_eq!(normalize_entry_name("./pages/page1.jpg"), Some("pages/page1.jpg".to_string()));
+        assert_eq!(normalize_entry_name("pages//page1.jpg"), Some("pages/page1.jpg".to_string()));
+        assert_eq!(normalize_entry_name("pages/page1.jpg"), Some("pages/page1.jpg".to_string()));
+        assert_eq!(normalize_entry_name("/pages/page1.jpg"), Some("pages/page1.jpg".to_string()));
+        assert_eq!(normalize_entry_name("pages/page1.jpg/"), Some("pages/page1.jpg".to_string()));
+        assert_eq!(normalize_entry_name("./"), None);
+        assert_eq!(normalize_entry_name("/"), None);
+    }
+
+    #[test]
+    fn image_ext_whitelist() {
+        // #10-1：白名单补全（12 种）
+        for ext in ["png", "jpg", "jpeg", "jpe", "gif", "bmp", "webp", "apng", "tif", "tiff", "avif", "heic"] {
+            assert!(is_image_name(&format!("a.{ext}")), "{ext} 应在白名单");
+            assert!(is_image_name(&format!("pages/a.{ext}")), "带目录的 {ext} 应在白名单");
+        }
+        for ext in ["txt", "xml", "pdf", "docx", ""] {
+            assert!(!is_image_name(&format!("a.{ext}")), "{ext} 不应在白名单");
+        }
+        assert!(!is_image_name("pages"), "无扩展名不在白名单");
+        assert!(!is_image_name("pages/page."), "空扩展名不在白名单");
+    }
+
+    #[test]
+    fn junk_paths_filtered() {
+        // #10-2：__MACOSX 前缀与隐藏文件过滤
+        //
+        // issue 口径是「`__macosx/` 前缀 + **basename** 以 `.` 开头」，故隐藏**目录**里的
+        // 普通图片（`.well-known/image.jpg`）不在过滤范围——按字面实现，避免与宿主基线漂移。
+        for p in [
+            "__MACOSX/._page1.jpg",
+            "__macosx/sub/page.jpg", // 任意层级
+            ".DS_Store",
+            "._page1.jpg",
+            "pages/.hidden.png",
+        ] {
+            assert!(is_junk_path(p), "{p} 应被过滤");
+        }
+        for p in [
+            "pages/page1.jpg",
+            "page2.png",
+            "a/b/c.jpg",
+            ".page1.jpg.bak/x.png", // 目录段以 `.` 开头但 basename 不是 → 保留
+            "pages/.well-known/image.jpg", // 隐藏目录里的普通图片 → 保留
+        ] {
+            assert!(!is_junk_path(p), "{p} 不应被过滤");
+        }
+    }
+
+    #[test]
+    fn page_table_aligns_with_host_baseline() {
+        // #10 端到端：白名单 + 垃圾过滤 + 归一化 + 去重 + 排序
+        let bytes = build_cbz(&[
+            "cover.png",           // 应保留
+            "__MACOSX/._cover.png", // 垃圾 → 滤
+            ".DS_Store",           // 垃圾 → 滤
+            "notes.txt",           // 非白名单 → 滤
+            "./pages//page1.png",  // 归一化 → pages/page1.png
+            "pages/page2.jpg",     // 应保留
+            "page1.png",           // 与归一化后 pages/page1.png 不同名，应保留
+            "pages/PAGE1.PNG",     // 与 pages/page1.png 撞名 → 滤（首件胜出）
+            "p7.png",              // 自然序用例
+            "p10.png",             // 自然序用例
+            "p007.png",            // 与 p7.png 数值相同 → 前导零少者在前
+        ]);
+        let book = open_bytes(bytes);
+        let names = page_names_of(&book);
+        assert_eq!(
+            names,
+            vec![
+                "cover.png",
+                "p7.png",
+                "p007.png",
+                "p10.png",
+                "page1.png",
+                "pages/page1.png",
+                "pages/page2.jpg",
+            ],
+            "页序/过滤口径不符"
+        );
+        // 尺寸应从 PNG 头读出（8×8）
+        assert_eq!(book.sizes[0], Some((8, 8)));
+        // href 用归一化名
+        let chapters = book.chapters().unwrap();
+        assert_eq!(chapters[5].href, "pages/page1.png");
+        // 资源仍按 zip 原名取回（zip_name ≠ name 的场景）
+        let res = book.load_resource(&ResourceKey("page:5".to_string())).unwrap();
+        // fixture 里每条数据 = 29B PNG 头 + 原始条目名字节（见 build_cbz）
+        assert_eq!(res.data.len(), 29 + "./pages//page1.png".len());
     }
 
     #[test]

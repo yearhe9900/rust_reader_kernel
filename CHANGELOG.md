@@ -7,7 +7,22 @@
 
 ## [Unreleased]
 
-（暂无）
+### Fixed
+
+- **CBZ 页表口径与宿主基线对齐（issue #10）**：`CbzBook::parse` 的页收集改为
+  归一化 → 过滤 → 去重 → 自然序，四条对齐宿主 `CbzSource`：
+  1. **条目名先归一化**（`\`→`/`、去 `./` 与前导 `/`、压 `//`、处理 `..`、去尾 `/`），
+     过滤与 `chapters()` 的 `href` 都用归一化名；
+  2. **过滤垃圾条目**：`__MACOSX/`（任意层级，Finder 压缩的 CBZ 必带
+     `__MACOSX/._page1.jpg`）与 basename 以 `.` 开头的隐藏文件；
+  3. **扩展名白名单补全**（`png,jpeg,jpg,jpe,gif,bmp,webp,apng,tif,tiff,avif,heic`）——
+     原白名单缺 `.tif`/`.heic`/`.jpe`/`.apng`，这类页此前被内核**整页丢弃**（用户可见回归）；
+  4. **大小写撞名去重**（`Page1.jpg` 与 `page1.jpg` 只收 zip 物理序首件），
+     `natural_cmp` 改大小写不敏感 + 数值相同则前导零少者在前（`p7.jpg` < `p007.jpg`）。
+  - 新增 `mime_of_name`：`tif/tiff → image/tiff`、`avif → image/avif`、`heic → image/heic`
+    （此前一律回退 `image/jpeg`）。宿主侧适配层的临时过滤/重排可简化为纯透传。
+  - 7 项 fixture 用例（自建最小 stored zip，不引新依赖）：白名单 / 垃圾过滤 / 去重 /
+    排序 / 归一化 / 端到端页表。
 
 ## [0.1.2] - 2026-10-23
 
