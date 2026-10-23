@@ -686,6 +686,7 @@ version = "0.1.1"
 dependencies = [
  "image",
  "rrk-format",
+ "rrk-image",
  "rrk-model",
  "rrk-zip",
 ]
@@ -705,6 +706,7 @@ name = "rrk-ffi"
 version = "0.1.1"
 dependencies = [
  "rrk-cache",
+ "rrk-image",
  "rrk-kernel",
  "rrk-layout",
  "rrk-model",
@@ -714,6 +716,15 @@ dependencies = [
 name = "rrk-format"
 version = "0.1.1"
 dependencies = [
+ "rrk-model",
+]
+
+[[package]]
+name = "rrk-image"
+version = "0.1.1"
+dependencies = [
+ "flate2",
+ "image",
  "rrk-model",
 ]
 

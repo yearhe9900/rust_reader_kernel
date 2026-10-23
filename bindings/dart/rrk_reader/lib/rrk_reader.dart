@@ -13,7 +13,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 /// ABI 版本（与 rrk-ffi 的 RRK_ABI_VERSION 对齐，启动校验）。
-const int kRrkAbiVersion = 5;
+const int kRrkAbiVersion = 6;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -80,6 +80,14 @@ typedef _LoadResourceNative = Uint32 Function(
     Uint64, Pointer<Utf8>, IntPtr, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _LoadResourceDart = int Function(
     int, Pointer<Utf8>, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _ImageDimNative = Uint32 Function(
+    Pointer<Uint8>, IntPtr, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _ImageDimDart = int Function(
+    Pointer<Uint8>, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PngBgraNative = Uint32 Function(Uint32, Uint32, IntPtr, Pointer<Uint8>, IntPtr,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PngBgraDart = int Function(int, int, int, Pointer<Uint8>, int, Pointer<Pointer<Uint8>>,
+    Pointer<IntPtr>);
 
 class _Bindings {
   _Bindings(DynamicLibrary lib)
@@ -105,7 +113,11 @@ class _Bindings {
         pageCount = lib.lookupFunction<_PageCountNative, _PageCountDart>('rrk_page_count'),
         loadPage = lib.lookupFunction<_LoadPageNative, _LoadPageDart>('rrk_load_page_json'),
         loadResource =
-            lib.lookupFunction<_LoadResourceNative, _LoadResourceDart>('rrk_load_resource');
+            lib.lookupFunction<_LoadResourceNative, _LoadResourceDart>('rrk_load_resource'),
+        imageDimensions =
+            lib.lookupFunction<_ImageDimNative, _ImageDimDart>('rrk_image_dimensions'),
+        encodePngBgra =
+            lib.lookupFunction<_PngBgraNative, _PngBgraDart>('rrk_encode_png_bgra');
 
   final _OpenDart open;
   final _CloseDart close;
@@ -127,6 +139,8 @@ class _Bindings {
   final _PageCountDart pageCount;
   final _LoadPageDart loadPage;
   final _LoadResourceDart loadResource;
+  final _ImageDimDart imageDimensions;
+  final _PngBgraDart encodePngBgra;
 }
 
 _Bindings? _b;
@@ -232,6 +246,110 @@ class RrkEngine {
     final bytes = Uint8List.fromList(ptr.asTypedList(len));
     b.bufFree(ptr, len);
     return bytes;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 图像工具（与书句柄无关的纯字节能力）
+// ---------------------------------------------------------------------------
+
+/// 图片头部尺寸（只读文件头，未解码像素）。
+class RrkImageSize {
+  RrkImageSize._(this.width, this.height, this.format, this.mime);
+  final int width;
+  final int height;
+
+  /// `png` / `jpeg` / `gif` / `bmp` / `webp`。
+  final String format;
+
+  /// 如 `image/png`。
+  final String mime;
+
+  @override
+  String toString() => 'RrkImageSize(${width}x$height $format)';
+}
+
+/// 图像工具：尺寸头解析 + BGRA→PNG 编码。
+///
+/// 两者都不落盘（落盘归宿主）、都不解码/不做色彩管理，只做字节级工作。
+class RrkImage {
+  /// 只读图片头取尺寸；无法识别的格式/畸形字节返回 null。
+  ///
+  /// 只扫头部（PNG IHDR / JPEG SOFn / GIF / BMP / WebP chunk），不分配像素缓冲。
+  /// 便捷版：内部把 [bytes] 拷贝一次到原生内存，需零拷贝请用 [dimensionsPtr]。
+  static RrkImageSize? dimensions(Uint8List bytes) {
+    if (bytes.isEmpty) return null;
+    final src = malloc<Uint8>(bytes.length);
+    try {
+      src.asTypedList(bytes.length).setAll(0, bytes);
+      return dimensionsPtr(src, bytes.length);
+    } finally {
+      malloc.free(src);
+    }
+  }
+
+  /// 同上，直接读调用方持有的原生缓冲（**零拷贝**）。
+  static RrkImageSize? dimensionsPtr(Pointer<Uint8> data, int len) {
+    if (data == nullptr || len == 0) return null;
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.imageDimensions(data, len, outPtr, outLen);
+      if (code == 2) return null; // 无法识别（软结果，非错误）
+      if (code != 0) {
+        throw RrkException(code, RrkEngine._lastError(b).message);
+      }
+      final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value);
+      if (json == null) return null;
+      final m = jsonDecode(json) as Map<String, dynamic>;
+      return RrkImageSize._(m['width'] as int, m['height'] as int,
+          m['format'] as String, m['mime'] as String);
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// BGRA 原始位图 → PNG 字节（8 位 RGBA 标准 PNG）。
+  ///
+  /// [stride] 为源缓冲每行字节数（0 = 紧凑 `width*4`）。
+  /// 便捷版：内部拷贝一次（页位图可达数 MB，宿主已有原生缓冲请用 [encodePngFromBgraPtr]）。
+  static Uint8List encodePngFromBgra(Uint8List bgra,
+      {required int width, required int height, int stride = 0}) {
+    if (bgra.isEmpty) {
+      throw RrkException(1004, '位图缓冲为空');
+    }
+    final src = malloc<Uint8>(bgra.length);
+    try {
+      src.asTypedList(bgra.length).setAll(0, bgra);
+      return encodePngFromBgraPtr(src, bgra.length,
+          width: width, height: height, stride: stride);
+    } finally {
+      malloc.free(src);
+    }
+  }
+
+  /// 同上，但源缓冲为调用方持有的原生内存（**零拷贝入参**，内核只读不接管所有权）。
+  static Uint8List encodePngFromBgraPtr(Pointer<Uint8> src, int srcLen,
+      {required int width, required int height, int stride = 0}) {
+    if (src == nullptr || srcLen == 0) {
+      throw RrkException(1004, '位图缓冲为空');
+    }
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code =
+          b.encodePngBgra(width, height, stride, src, srcLen, outPtr, outLen);
+      if (code != 0) {
+        throw RrkException(code, RrkEngine._lastError(b).message);
+      }
+      return RrkEngine._takeBytes(b, outPtr.value, outLen.value) ?? Uint8List(0);
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
   }
 }
 

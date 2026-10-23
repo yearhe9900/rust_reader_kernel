@@ -14,3 +14,4 @@ rrk-model.workspace = true
 rrk-kernel.workspace = true
 rrk-layout.workspace = true
 rrk-cache.workspace = true
+rrk-image.workspace = true

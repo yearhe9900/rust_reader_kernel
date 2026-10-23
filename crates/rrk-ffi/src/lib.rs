@@ -21,7 +21,7 @@ use rrk_model::{
 };
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
-pub const RRK_ABI_VERSION: u32 = 5;
+pub const RRK_ABI_VERSION: u32 = 6;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -1038,6 +1038,78 @@ pub unsafe extern "C" fn rrk_prefetch(
                 rrk_buf_free(p, n);
             }
         }
+        Ok(0)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 图像工具（issue #8）：纯字节能力，与书句柄无关
+// ---------------------------------------------------------------------------
+
+/// 只读图片头取尺寸：成功 → `{"width","height","format","mime"}` + code 0；
+/// 无法识别（含空指针/畸形）→ code 2，不产出缓冲。
+///
+/// **不解码像素**：只扫头部（PNG IHDR / JPEG SOFn / GIF / BMP / WebP chunk），
+/// 供宿主做行内插图测量与页尺寸表，多 MB 图片也不产生分配。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_image_dimensions(
+    data: *const u8,
+    len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+        if data.is_null() || len == 0 {
+            return Ok(2); // 空输入 = 无尺寸（软结果）
+        }
+        let bytes = std::slice::from_raw_parts(data, len);
+        match rrk_image::dimensions(bytes) {
+            Some(s) => {
+                let mut json = String::with_capacity(96);
+                json.push_str(&format!("{{\"width\":{},\"height\":{},\"format\":", s.width, s.height));
+                json_str(s.format.name(), &mut json);
+                json.push_str(",\"mime\":");
+                json_str(s.format.mime(), &mut json);
+                json.push('}');
+                write_buf(json.into_bytes(), out_ptr, out_len);
+                Ok(0)
+            }
+            None => Ok(2),
+        }
+    })
+}
+
+/// BGRA 原始位图 → PNG 字节（code 0 = 成功，缓冲由调用方 `rrk_buf_free` 释放）。
+///
+/// `src/src_len` 为**调用方持有**的位图缓冲（内核只读、不接管所有权，零拷贝入参）；
+/// `stride` 传 0 = 紧凑 `width*4`。逐行 BGRA→RGBA 后直接 deflate，不打整幅中间缓冲。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_encode_png_bgra(
+    width: u32,
+    height: u32,
+    stride: usize,
+    src: *const u8,
+    src_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+        if src.is_null() || src_len == 0 {
+            return Err(set_kind(RrkError::invalid("位图缓冲为空")));
+        }
+        let pixels = std::slice::from_raw_parts(src, src_len);
+        let png = rrk_image::encode_png_bgra(width, height, stride, pixels).map_err(set_kind)?;
+        write_buf(png, out_ptr, out_len);
         Ok(0)
     })
 }

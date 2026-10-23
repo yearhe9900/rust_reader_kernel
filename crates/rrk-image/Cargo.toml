@@ -1,0 +1,14 @@
+[package]
+name = "rrk-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：纯字节级图像工具（头部尺寸解析 + BGRA→PNG 编码）"
+
+[dependencies]
+rrk-model.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+# 仅测试期用于往返校验（解码我们自己编出来的 PNG），不进发布二进制。
+image.workspace = true

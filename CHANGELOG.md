@@ -7,7 +7,20 @@
 
 ## [Unreleased]
 
-（暂无）
+**ABI 6**：Dart 封装（`kRrkAbiVersion = 6`）与预编译原生库必须同步升级（新增图像出口）。
+
+### Added
+
+- **图像工具（issue #8）**：新增 `rrk-image` crate，把宿主侧的纯字节图像算法下沉内核。
+  - `rrk_image::dimensions`：**只读文件头**取尺寸 + 格式（PNG IHDR / JPEG SOFn 段链 /
+    GIF / BMP `BITMAPINFOHEADER`·`BITMAPCOREHEADER` / WebP `VP8X`·`VP8 `·`VP8L`），
+    不解码像素、畸形输入返回 `None`；CBZ 页尺寸表与本接口共用同一份实现（`rrk-cbz`
+    原私有头解析已删除）。
+  - `rrk_image::encode_png_bgra`：BGRA 位图 → PNG。逐行 BGRA→RGBA 后直接 deflate，
+    **不分配整幅 RGBA 中间缓冲**（1080×1440 页位图峰值额外内存 ≈ 一行）；CRC32 自算，
+    只产出字节不写盘。
+  - FFI：`rrk_image_dimensions` / `rrk_encode_png_bgra`（位图缓冲零拷贝入参）；
+    Dart：`RrkImage.dimensions` / `encodePngFromBgra`（含 `…Ptr` 零拷贝变体）。
 
 ## [0.1.1] - 2026-10-22
 

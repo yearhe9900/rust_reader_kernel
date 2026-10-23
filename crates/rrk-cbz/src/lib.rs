@@ -51,69 +51,12 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     (ab.len() - i).cmp(&(bb.len() - j))
 }
 
-/// 图片头解析尺寸（PNG/JPEG/GIF/BMP/WebP 尽力而为；失败返回 None）。
+/// 图片头解析尺寸（**已下沉**到 `rrk_image::dimensions`，此处仅保留 `(w, h)` 便捷壳）。
+///
+/// 唯一口径在内核 `rrk-image`：CBZ 页尺寸表与宿主正文插图测量共用同一份实现，
+/// 避免「两处各写一份头解析、格式支持不一致」。
 pub fn image_size(data: &[u8]) -> Option<(u32, u32)> {
-    if data.len() >= 24 && data.starts_with(&[0x89, b'P', b'N', b'G']) {
-        // IHDR: 16..20 宽，20..24 高（大端）
-        return Some((
-            u32::from_be_bytes([data[16], data[17], data[18], data[19]]),
-            u32::from_be_bytes([data[20], data[21], data[22], data[23]]),
-        ));
-    }
-    if data.len() >= 4 && data.starts_with(&[0xFF, 0xD8]) {
-        // JPEG：扫 SOF 标记
-        let mut i = 2usize;
-        while i + 9 < data.len() {
-            if data[i] != 0xFF {
-                i += 1;
-                continue;
-            }
-            let marker = data[i + 1];
-            let is_sof = matches!(
-                marker,
-                0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
-            );
-            if is_sof {
-                let h = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
-                let w = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
-                return Some((w, h));
-            }
-            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
-                i += 2;
-            } else {
-                let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
-                i += 2 + len.max(2);
-            }
-        }
-        return None;
-    }
-    if data.len() >= 10 && data.starts_with(b"GIF8") {
-        return Some((
-            u16::from_le_bytes([data[6], data[7]]) as u32,
-            u16::from_le_bytes([data[8], data[9]]) as u32,
-        ));
-    }
-    if data.len() >= 26 && data.starts_with(b"BM") {
-        return Some((
-            u32::from_le_bytes([data[18], data[19], data[20], data[21]]),
-            i32::from_le_bytes([data[22], data[23], data[24], data[25]]).unsigned_abs(),
-        ));
-    }
-    if data.len() >= 30 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
-        let four = &data[12..16];
-        if four == b"VP8X" {
-            let w = 1 + (data[24] as u32 | (data[25] as u32) << 8 | (data[26] as u32) << 16);
-            let h = 1 + (data[27] as u32 | (data[28] as u32) << 8 | (data[29] as u32) << 16);
-            return Some((w, h));
-        }
-        if four == b"VP8L" && data.len() >= 25 {
-            let bits = u32::from_le_bytes([data[21], data[22], data[23], data[24]]);
-            let w = (bits & 0x3FFF) + 1;
-            let h = ((bits >> 14) & 0x3FFF) + 1;
-            return Some((w, h));
-        }
-    }
-    None
+    rrk_image::dimensions(data).map(|s| (s.width, s.height))
 }
 
 fn is_image_name(name: &str) -> bool {

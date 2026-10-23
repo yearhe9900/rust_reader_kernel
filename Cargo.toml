@@ -5,6 +5,7 @@ members = [
     "crates/rrk-format",
     "crates/rrk-markup",
     "crates/rrk-zip",
+    "crates/rrk-image",
     "crates/rrk-txt",
     "crates/rrk-epub",
     "crates/rrk-mobi",
@@ -29,6 +30,7 @@ rrk-model = { path = "crates/rrk-model" }
 rrk-format = { path = "crates/rrk-format" }
 rrk-markup = { path = "crates/rrk-markup" }
 rrk-zip = { path = "crates/rrk-zip" }
+rrk-image = { path = "crates/rrk-image" }
 rrk-txt = { path = "crates/rrk-txt" }
 rrk-epub = { path = "crates/rrk-epub" }
 rrk-mobi = { path = "crates/rrk-mobi" }
