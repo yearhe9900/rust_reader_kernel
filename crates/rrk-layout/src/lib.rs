@@ -11,6 +11,8 @@
 //! 引擎选型口径（方案 §4.2）：parley 先行 + 真实样张基准（`examples/bench_layout`），
 //! cosmic-text 对照与逃生门（自研断行）留档。
 
+use std::borrow::Cow;
+
 use rrk_model::{
     Align, Block, ChapterContent, ChapterId, Inline, LayoutPage, LineEntry, PlacedImage,
     SemanticPos, StyleSpec, TextRun, Viewport,
@@ -25,6 +27,10 @@ use parley::{
 pub struct Layouter {
     font_cx: FontContext,
     layout_cx: LayoutContext,
+    /// 块局部文本缓冲（跨块复用，免每块零容量起步的堆分配）。
+    text_buf: String,
+    /// 块局部样式 span 缓冲。
+    spans_buf: Vec<(usize, usize, bool, bool)>,
 }
 
 impl Default for Layouter {
@@ -35,7 +41,12 @@ impl Default for Layouter {
 
 impl Layouter {
     pub fn new() -> Self {
-        Self { font_cx: FontContext::new(), layout_cx: LayoutContext::new() }
+        Self {
+            font_cx: FontContext::new(),
+            layout_cx: LayoutContext::new(),
+            text_buf: String::new(),
+            spans_buf: Vec::new(),
+        }
     }
 
     /// 整章排版：Block 流 → 行序列 → 按视口分页。
@@ -51,12 +62,20 @@ impl Layouter {
         for block in &content.blocks {
             match block {
                 Block::Paragraph { inlines, indent } => {
-                    self.layout_inlines(content, inlines, style, false, *indent, width, &mut flat);
+                    self.layout_inlines(content, inlines, style, false, *indent, width, 1.0, &mut flat);
                 }
                 Block::Heading { level, inlines } => {
-                    let mut s = style.clone();
-                    s.font_size *= heading_scale(*level);
-                    self.layout_inlines(content, inlines, &s, true, false, width, &mut flat);
+                    // 只缩放字号（旧实现 clone 整个 StyleSpec：每次标题一次字体族 String 分配）
+                    self.layout_inlines(
+                        content,
+                        inlines,
+                        style,
+                        true,
+                        false,
+                        width,
+                        heading_scale(*level),
+                        &mut flat,
+                    );
                 }
                 Block::Image { key, size_hint, .. } => {
                     let (w, h) = fit_image(*size_hint, vp, style);
@@ -70,7 +89,7 @@ impl Layouter {
                 Block::Quote { blocks } => {
                     for b in blocks {
                         if let Block::Paragraph { inlines, .. } = b {
-                            self.layout_inlines(content, inlines, style, false, true, width, &mut flat);
+                            self.layout_inlines(content, inlines, style, false, true, width, 1.0, &mut flat);
                         }
                     }
                 }
@@ -92,37 +111,46 @@ impl Layouter {
         is_heading: bool,
         indent: bool,
         width: f32,
+        scale: f32,
         out: &mut Vec<FlatLine>,
     ) {
-        // 重建块局部文本 + 样式 span（章文本偏移 = base_offset + 局部偏移）
-        let mut text = String::new();
-        let mut spans: Vec<(usize, usize, bool, bool)> = Vec::new();
+        // 复用排版器 scratch（解构出字段借用，免每块 2 次零容量堆分配）
+        let Self { font_cx, layout_cx, text_buf, spans_buf, .. } = self;
+        let text = text_buf;
+        text.clear();
+        spans_buf.clear();
         let mut base_offset: Option<u32> = None;
         for inline in inlines {
             if let Inline::Text { range, style: flags } = inline {
                 base_offset = Some(base_offset.map_or(range.start, |b: u32| b.min(range.start)));
                 let start = text.len();
                 text.push_str(range.slice(&content.text));
-                spans.push((start, text.len(), flags.is_bold(), flags.is_italic()));
+                spans_buf.push((start, text.len(), flags.is_bold(), flags.is_italic()));
             }
         }
         let Some(base_offset) = base_offset else { return };
         if text.trim().is_empty() {
             return;
         }
+        let font_size = style.font_size * scale;
 
         // 首行缩进：em → 前缀空格（全角 1em / 半角 en space 0.5em），
         // 让断行宽度真实扣除缩进；同时记下缩进像素宽，供 run.x 补偿（见下）。
         let (prefix, indent_px) = if indent {
-            indent_metrics(style.para_indent_em, style.font_size)
+            indent_metrics(style.para_indent_em, font_size)
         } else {
             (String::new(), 0.0)
         };
-        let full = format!("{prefix}{text}");
+        // 无缩进时零拷贝借用块文本（旧实现无条件整段 format! 拷贝）
+        let full: Cow<'_, str> = if prefix.is_empty() {
+            Cow::Borrowed(text.as_str())
+        } else {
+            Cow::Owned(format!("{prefix}{text}"))
+        };
         let shift = prefix.len() as u32;
 
-        let mut builder = self.layout_cx.ranged_builder(&mut self.font_cx, &full, 1.0, true);
-        builder.push_default(StyleProperty::FontSize(style.font_size));
+        let mut builder = layout_cx.ranged_builder(font_cx, &full, 1.0, true);
+        builder.push_default(StyleProperty::FontSize(font_size));
         if !style.font_family.is_empty() {
             builder.push_default(StyleProperty::FontStack(FontStack::from(style.font_family.as_str())));
         }
@@ -130,7 +158,11 @@ impl Layouter {
         if is_heading {
             builder.push_default(StyleProperty::FontWeight(FontWeight::new(700.0)));
         }
-        for &(s, e, bold, italic) in &spans {
+        for &(s, e, bold, italic) in spans_buf.iter() {
+            // span 偏移基于块文本，而 builder 文本是 `full`（prefix + text）：
+            // 必须右移 prefix 字节数（旧实现未移位，缩进段落的粗体/斜体
+            // 会错位到前缀区域内）。
+            let (s, e) = (s + shift as usize, e + shift as usize);
             if bold {
                 builder.push(StyleProperty::FontWeight(FontWeight::new(700.0)), s..e);
             }
@@ -151,11 +183,11 @@ impl Layouter {
             AlignmentOptions::default(),
         );
 
-        let gap_after = style.font_size * 0.35;
+        let gap_after = font_size * 0.35;
         for line in layout.lines() {
             let metrics = *line.metrics();
             let text_range = line.text_range();
-            let mut runs = Vec::new();
+            let mut runs = Vec::with_capacity(2);
             for item in line.items() {
                 if let PositionedLayoutItem::GlyphRun(gr) = item {
                     let run = gr.run();
@@ -258,6 +290,10 @@ fn paginate(flat: Vec<FlatLine>, chapter: ChapterId, page_height: f32) -> Vec<La
     let mut pages: Vec<LayoutPage> = Vec::new();
     let mut cur = new_page(0, chapter, page_height);
     let mut y = 0.0f32;
+    // 已放置文本的末尾字节偏移：新页 start/end 初始化为它——纯图片/间隙页也
+    // 保持 start/end 单调不退（`page_at` 二分查找的前提；旧实现纯图片页
+    // start/end 恒 0，会破坏单调性导致定位错页）。
+    let mut cursor = 0u32;
 
     for line in flat {
         let slot = match &line {
@@ -266,12 +302,17 @@ fn paginate(flat: Vec<FlatLine>, chapter: ChapterId, page_height: f32) -> Vec<La
             FlatLine::Gap { height } => *height,
         };
         if y + slot > page_height && !cur.lines.is_empty() {
-            let next = new_page(pages.len() as u32 + 1, chapter, page_height);
+            let mut next = new_page(pages.len() as u32 + 1, chapter, page_height);
+            next.start = SemanticPos { chapter, char_offset: cursor };
+            next.end = SemanticPos { chapter, char_offset: cursor };
             pages.push(std::mem::replace(&mut cur, next));
             y = 0.0;
         }
         match line {
             FlatLine::Text { start, end, height, para_start, runs, gap_after: _ } => {
+                if cur.lines.is_empty() {
+                    cur.start = SemanticPos { chapter, char_offset: start };
+                }
                 let line_idx = cur.lines.len() as u32;
                 cur.lines.push(LineEntry {
                     start,
@@ -291,6 +332,7 @@ fn paginate(flat: Vec<FlatLine>, chapter: ChapterId, page_height: f32) -> Vec<La
                     });
                 }
                 cur.end = SemanticPos { chapter, char_offset: end };
+                cursor = end;
                 y += height;
             }
             FlatLine::Image { key, w, h, slot } => {
@@ -302,12 +344,6 @@ fn paginate(flat: Vec<FlatLine>, chapter: ChapterId, page_height: f32) -> Vec<La
     }
     if !cur.lines.is_empty() || !cur.images.is_empty() {
         pages.push(cur);
-    }
-    // 回填每页 start（按行表首行）
-    for page in &mut pages {
-        if let Some(first) = page.lines.first() {
-            page.start = SemanticPos { chapter, char_offset: first.start };
-        }
     }
     pages
 }
@@ -325,25 +361,30 @@ fn new_page(index: u32, chapter: ChapterId, page_height: f32) -> LayoutPage {
     }
 }
 
-/// `page_at`：定位语义坐标所在页下标（缓存命中免排版；未命中回 0 兜底）。
+/// `page_at`：定位语义坐标所在页下标（缓存命中免排版）。
+///
+/// 二分未命中时（如落在章尾之后、纯图片空区间处）回退到
+/// 「`start <= pos` 的最后一页」，全都大于 pos 才回 0。
 pub fn page_at(pages: &[LayoutPage], pos: SemanticPos) -> Option<usize> {
     if pages.is_empty() {
         return None;
     }
-    Some(
-        pages
-            .binary_search_by(|p| {
-                if pos.char_offset < p.start.char_offset {
-                    std::cmp::Ordering::Greater
-                } else if pos.char_offset >= p.end.char_offset {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .unwrap_or(0)
-            .min(pages.len() - 1),
-    )
+    match pages
+        .binary_search_by(|p| {
+            if pos.char_offset < p.start.char_offset {
+                std::cmp::Ordering::Greater
+            } else if pos.char_offset >= p.end.char_offset {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }) {
+        Ok(i) => Some(i),
+        Err(_) => {
+            let n = pages.partition_point(|p| p.start.char_offset <= pos.char_offset);
+            Some(if n == 0 { 0 } else { n - 1 })
+        }
+    }
 }
 
 #[cfg(test)]

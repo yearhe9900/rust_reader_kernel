@@ -65,39 +65,38 @@ pub fn fold_ascii(s: &str) -> Cow<'_, str> {
 /// 传入文本应已做 [`fold_ascii`]（索引与查询两侧同口径）。
 /// 词项是 `text` 的**借用切片**（零分配），调用方需要持有则自行 `to_string`。
 pub fn for_each_term<'a>(text: &'a str, mut f: impl FnMut(&'a str)) {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i].1;
+    // 游标迭代（旧实现先把整段 collect 成 Vec<(usize,char)>：章级文本一次性
+    // 800KB 瞬时分配；现改为 peekable 游标，零分配）。
+    let mut it = text.char_indices().peekable();
+    while let Some((b, c)) = it.next() {
         if is_cjk(c) {
-            let start = i;
-            let mut j = i;
-            while j < chars.len() && is_cjk(chars[j].1) {
-                j += 1;
-            }
-            if j - start == 1 {
-                let b = chars[start].0;
-                f(&text[b..b + c.len_utf8()]);
-            } else {
-                for k in start..j - 1 {
-                    let b = chars[k].0;
-                    let n = chars[k + 1];
-                    f(&text[b..n.0 + n.1.len_utf8()]);
+            // 连续 CJK 段：单字出 unigram，多字相邻出 bigram（滑窗与旧口径同序）
+            let first = (b, c);
+            let mut prev = (b, c);
+            let mut count = 1usize;
+            while let Some(&(nb, nc)) = it.peek() {
+                if !is_cjk(nc) {
+                    break;
                 }
+                it.next();
+                count += 1;
+                f(&text[prev.0..nb + nc.len_utf8()]);
+                prev = (nb, nc);
             }
-            i = j;
+            if count == 1 {
+                f(&text[first.0..first.0 + first.1.len_utf8()]);
+            }
         } else if c.is_alphanumeric() {
-            let start = i;
-            let mut j = i;
-            while j < chars.len() && chars[j].1.is_alphanumeric() && !is_cjk(chars[j].1) {
-                j += 1;
+            let start = b;
+            let mut end = b + c.len_utf8();
+            while let Some(&(nb, nc)) = it.peek() {
+                if !nc.is_alphanumeric() || is_cjk(nc) {
+                    break;
+                }
+                it.next();
+                end = nb + nc.len_utf8();
             }
-            let b = chars[start].0;
-            let e = chars.get(j).map(|(p, _)| *p).unwrap_or(text.len());
-            f(&text[b..e]);
-            i = j;
-        } else {
-            i += 1;
+            f(&text[start..end]);
         }
     }
 }
@@ -202,9 +201,6 @@ struct CurChapter {
     block: usize,
     /// 当前块内已扫到的字节位置。
     offset: usize,
-    /// 当前块的**折叠**文本（与 plain 等长，偏移可直接混用）。
-    folded: String,
-    folded_ready: bool,
 }
 
 /// 检索会话：句柄级、拉模式分块、可取消。
@@ -281,7 +277,6 @@ impl SearchSession {
     pub fn next(&mut self, max_hits: u32) -> RrkResult<SearchPage> {
         let max_hits = max_hits.max(1) as usize;
         let mut hits: Vec<SearchHit> = Vec::new();
-        let query = self.query.clone();
 
         while hits.len() < max_hits {
             if self.cancel.load(Ordering::SeqCst) {
@@ -295,7 +290,7 @@ impl SearchSession {
                 break;
             }
             let cur = self.cur.as_mut().expect("已确保有当前章");
-            scan_block(&query, &self.opts, cur, max_hits - hits.len(), &mut hits);
+            scan_block(&self.query, &self.opts, cur, max_hits - hits.len(), &mut hits);
             // 本块扫完 → 前进；整章扫完 → 释放
             if cur.block >= cur.blocks.len() {
                 self.cur = None;
@@ -336,8 +331,6 @@ impl SearchSession {
                 blocks,
                 block: 0,
                 offset: 0,
-                folded: String::new(),
-                folded_ready: false,
             });
             return Ok(true);
         }
@@ -345,7 +338,33 @@ impl SearchSession {
     }
 }
 
+/// 大小写不敏感查找（与 `fold_ascii` 同口径：仅 ASCII 大小写折叠，非 ASCII 字节精确比）。
+/// UTF-8 安全：ASCII 字节不会出现在多字节序列内，命中位置必是字符边界。
+fn find_ci(hay: &str, needle: &str) -> Option<usize> {
+    let hb = hay.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() {
+        return Some(0);
+    }
+    if nb.len() > hb.len() {
+        return None;
+    }
+    'outer: for i in 0..=(hb.len() - nb.len()) {
+        for j in 0..nb.len() {
+            if !hb[i + j].eq_ignore_ascii_case(&nb[j]) {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
+}
+
 /// 扫当前块，产出至多 `max` 条命中（块扫完则推进到下一块）。
+///
+/// **免折叠副本**：旧实现每块先把整块文本小写拷贝一份（`folded`）再扫——
+/// 中文书几乎无 ASCII 大写仍是白拷一遍；现直接在块原文上扫，
+/// 大小写不敏感走 `find_ci`（与折叠同口径，偏移与 plain 1:1）。
 fn scan_block(
     query: &str,
     opts: &SearchOptions,
@@ -355,23 +374,18 @@ fn scan_block(
 ) {
     let start_len = out.len();
     while out.len() - start_len < max && cur.block < cur.blocks.len() {
-        if !cur.folded_ready {
-            let plain = cur.blocks[cur.block].text();
-            cur.folded = if opts.case_sensitive {
-                plain.to_string()
-            } else {
-                fold_ascii(plain).into_owned()
-            };
-            cur.folded_ready = true;
-            cur.offset = 0;
-        }
-        if cur.folded.is_empty() {
+        let plain = cur.blocks[cur.block].text();
+        if plain.is_empty() {
             next_block(cur);
             continue;
         }
-        let folded = cur.folded.as_str();
-        let from = cur.offset.min(folded.len());
-        match folded[from..].find(query) {
+        let from = cur.offset.min(plain.len());
+        let rel = if opts.case_sensitive {
+            plain[from..].find(query)
+        } else {
+            find_ci(&plain[from..], query)
+        };
+        match rel {
             Some(rel) => {
                 let abs = from + rel;
                 let end = abs + query.len();
@@ -397,8 +411,6 @@ fn scan_block(
 fn next_block(cur: &mut CurChapter) {
     cur.block += 1;
     cur.offset = 0;
-    cur.folded.clear();
-    cur.folded_ready = false;
 }
 
 /// 取片段：左右各 `ctx` 字节，两端超界补 `…`；起点对齐 UTF-8 边界。

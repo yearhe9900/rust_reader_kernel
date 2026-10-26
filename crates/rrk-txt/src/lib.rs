@@ -194,7 +194,8 @@ pub fn match_heading(line: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed.chars().count() > HEADING_MAX_CHARS {
+    // 有界长度门：超长行提前退出（免对整行全文 count）
+    if trimmed.chars().take(HEADING_MAX_CHARS + 1).count() > HEADING_MAX_CHARS {
         return None;
     }
     // 正文句不作为标题
@@ -232,10 +233,10 @@ pub fn match_heading(line: &str) -> Option<String> {
         return None;
     }
 
-    // 3) Chapter/Part N
-    let lower = trimmed.to_ascii_lowercase();
+    // 3) Chapter/Part N（免 to_ascii_lowercase 分配：逐前缀大小写不敏感比对）
+    let tb = trimmed.as_bytes();
     for prefix in ["chapter", "part", "section"] {
-        if lower.starts_with(prefix) {
+        if tb.len() >= prefix.len() && tb[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
             let rest = &trimmed[prefix.len()..];
             if rest.trim_start().chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
                 return Some(trimmed.to_string());
@@ -614,10 +615,11 @@ impl BookSource for TxtBook {
     }
 
     fn load_chapter(&self, id: ChapterId) -> RrkResult<ChapterContent> {
+        // id 即 entries 下标（build_entries 顺序分配）：O(1) 直取，免 O(章数) 线性扫
         let entry = self
             .entries
-            .iter()
-            .find(|e| e.id == id)
+            .get(id as usize)
+            .filter(|e| e.id == id)
             .ok_or_else(|| RrkError::invalid(format!("章 id 越界: {id}")))?;
         let body = self.slice_of(entry);
         // ChapterContent.text 的偏移独立于全书文本：重建局部文本

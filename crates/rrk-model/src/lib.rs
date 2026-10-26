@@ -364,12 +364,18 @@ impl PlainTextBlock {
 /// 这是 [`flatten_blocks`] 的**可追溯版本**：文本内容与分块结果完全一致，
 /// 额外给出「段落文本偏移 ↔ 章正文偏移」映射（检索命中回映用）。
 pub fn flatten_blocks_spans(text: &str, blocks: &[Block]) -> Vec<PlainTextBlock> {
-    fn walk(text: &str, blocks: &[Block], out: &mut Vec<PlainTextBlock>) {
+    flatten_impl(text, blocks, true)
+}
+
+/// `want_spans=false`：只产纯文本块，**不分配每块的 `Vec<PlainSpan>`**（FFI
+/// `blocks_json` 等不需要来源映射的出口用——旧实现先建 spans 再整体丢弃）。
+fn flatten_impl(text: &str, blocks: &[Block], want_spans: bool) -> Vec<PlainTextBlock> {
+    fn walk(text: &str, blocks: &[Block], want_spans: bool, out: &mut Vec<PlainTextBlock>) {
         for b in blocks {
             match b {
                 Block::Paragraph { inlines, indent } => {
                     let mut plain = String::new();
-                    let spans = spans_of(text, inlines, &mut plain);
+                    let spans = spans_of(text, inlines, &mut plain, want_spans);
                     out.push(PlainTextBlock {
                         block: PlainBlock::Paragraph { text: plain, indent: *indent },
                         spans,
@@ -377,7 +383,7 @@ pub fn flatten_blocks_spans(text: &str, blocks: &[Block]) -> Vec<PlainTextBlock>
                 }
                 Block::Heading { level, inlines } => {
                     let mut plain = String::new();
-                    let spans = spans_of(text, inlines, &mut plain);
+                    let spans = spans_of(text, inlines, &mut plain, want_spans);
                     out.push(PlainTextBlock {
                         block: PlainBlock::Heading { level: *level, text: plain },
                         spans,
@@ -387,13 +393,27 @@ pub fn flatten_blocks_spans(text: &str, blocks: &[Block]) -> Vec<PlainTextBlock>
                     block: PlainBlock::Image { key: key.clone(), alt: alt.clone() },
                     spans: Vec::new(),
                 }),
-                Block::Quote { blocks } => walk(text, blocks, out),
+                Block::Quote { blocks } => walk(text, blocks, want_spans, out),
                 Block::Divider => {}
             }
         }
     }
 
-    fn spans_of(text: &str, inlines: &[Inline], plain: &mut String) -> Vec<PlainSpan> {
+    fn spans_of(text: &str, inlines: &[Inline], plain: &mut String, want_spans: bool) -> Vec<PlainSpan> {
+        if !want_spans {
+            // 纯文本路径：只拼 plain（含图片标记），不建 spans
+            for i in inlines {
+                match i {
+                    Inline::Text { range, .. } => plain.push_str(range.slice(text)),
+                    Inline::Image { key } => {
+                        plain.push(INLINE_IMAGE_MARKER);
+                        plain.push_str(&key.0);
+                        plain.push(INLINE_IMAGE_MARKER);
+                    }
+                }
+            }
+            return Vec::new();
+        }
         let mut spans = Vec::with_capacity(inlines.len());
         for i in inlines {
             let start = plain.len() as u32;
@@ -414,7 +434,7 @@ pub fn flatten_blocks_spans(text: &str, blocks: &[Block]) -> Vec<PlainTextBlock>
     }
 
     let mut out = Vec::with_capacity(blocks.len());
-    walk(text, blocks, &mut out);
+    walk(text, blocks, want_spans, &mut out);
     out
 }
 
@@ -423,7 +443,8 @@ pub fn flatten_blocks_spans(text: &str, blocks: &[Block]) -> Vec<PlainTextBlock>
 /// 这是「内容块如何降维成宿主段落」的唯一口径（方案 #4 轻方案）：
 /// FFI 出口与 FRB/其它绑定的宿主桥都应消费本函数，不再各写一份映射。
 pub fn flatten_blocks(text: &str, blocks: &[Block]) -> Vec<PlainBlock> {
-    flatten_blocks_spans(text, blocks).into_iter().map(|b| b.block).collect()
+    // 不建 spans（旧实现先分配每块 spans 再整体丢弃）
+    flatten_impl(text, blocks, false).into_iter().map(|b| b.block).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -573,9 +594,15 @@ pub type RrkResult<T> = Result<T, RrkError>;
 
 /// FNV-1a 64 位哈希，供 `content_hash` 与指纹使用。
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv1a64_update(FNV_INIT, bytes)
+}
+
+/// FNV 初始值（增量哈希起点）。
+pub const FNV_INIT: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a 增量入口：多段输入免拼接缓冲（结果与 [`fnv1a64`] 对整段拼接同值）。
+pub fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
     for &b in bytes {
         hash ^= b as u64;
         hash = hash.wrapping_mul(PRIME);

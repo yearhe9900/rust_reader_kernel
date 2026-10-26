@@ -7,4 +7,4 @@ pub mod clean;
 pub mod markup;
 
 pub use clean::{clean_xhtml, CleanResult};
-pub use markup::{attr, decode_entities, local_name, tokenize, Token};
+pub use markup::{attr, decode_entities, decode_entities_cow, local_name, tokenize, Token};

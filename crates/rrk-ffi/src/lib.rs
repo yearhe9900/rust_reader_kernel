@@ -11,6 +11,7 @@
 //! 大块正文走原始 UTF-8 缓冲（零拷贝语义）。
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
@@ -120,17 +121,35 @@ pub unsafe extern "C" fn rrk_last_error(out_ptr: *mut *mut u8, out_len: *mut usi
 // JSON 序列化（自研转义，零依赖）
 // ---------------------------------------------------------------------------
 
+/// JSON 字符串体转义：按「下一个需转义字符」批量拷安全段（旧实现逐字符
+/// push，长文本慢且碎；控制字符仍逐个生成 \u00XX）。
 fn esc(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    let mut start = 0usize;
+    for (pos, c) in s.char_indices() {
+        let repl: &str = match c {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            c if (c as u32) < 0x20 => {
+                if pos > start {
+                    out.push_str(&s[start..pos]);
+                }
+                let _ = write!(out, "\\u{:04x}", c as u32);
+                start = pos + c.len_utf8();
+                continue;
+            }
+            _ => continue,
+        };
+        if pos > start {
+            out.push_str(&s[start..pos]);
         }
+        out.push_str(repl);
+        start = pos + c.len_utf8();
+    }
+    if start < s.len() {
+        out.push_str(&s[start..]);
     }
 }
 
@@ -163,7 +182,8 @@ fn meta_json(meta: &BookMeta) -> Vec<u8> {
     }
     s.push_str(",\"format\":");
     json_str(&meta.format.to_string(), &mut s);
-    s.push_str(&format!(",\"contentHash\":\"{:016x}\"}}", meta.content_hash));
+    s.push_str(",\"contentHash\":\"");
+    let _ = write!(s, "{:016x}\"}}", meta.content_hash);
     s.into_bytes()
 }
 
@@ -210,24 +230,34 @@ fn paged_json(content: &PagedContent) -> Vec<u8> {
 
 fn toc_json(nodes: &[TocNode]) -> Vec<u8> {
     let mut s = String::with_capacity(256 * nodes.len().max(1));
+    write_toc(nodes, &mut s);
+    s.into_bytes()
+}
+
+/// 递归写目录 JSON（旧实现每层先序列化到独立 Vec 再 from_utf8_lossy 拷进父串：
+/// 整棵子树被复制一次；现直写同一 String）。
+fn write_toc(nodes: &[TocNode], s: &mut String) {
     s.push('[');
     for (i, n) in nodes.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
         s.push_str("{\"title\":");
-        json_str(&n.title, &mut s);
-        s.push_str(&format!(",\"chapter\":{},\"anchor\":", n.chapter));
+        json_str(&n.title, s);
+        s.push_str(",\"chapter\":");
+        let _ = write!(s, "{}", n.chapter);
+        s.push_str(",\"anchor\":");
         match n.anchor {
-            Some(a) => s.push_str(&a.to_string()),
+            Some(a) => {
+                let _ = write!(s, "{a}");
+            }
             None => s.push_str("null"),
         }
         s.push_str(",\"children\":");
-        s.push_str(&String::from_utf8_lossy(&toc_json(&n.children)));
+        write_toc(&n.children, s);
         s.push('}');
     }
     s.push(']');
-    s.into_bytes()
 }
 
 fn chapters_json(entries: &[ChapterEntry]) -> Vec<u8> {
@@ -355,12 +385,10 @@ pub unsafe extern "C" fn rrk_meta_json(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        with_kernel(|k| {
-            let book = k.book(handle).map_err(set_kind)?;
-            let json = meta_json(book.meta());
-            write_buf(json, out_ptr, out_len);
-            Ok(0)
-        })
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        let json = meta_json(book.meta());
+        write_buf(json, out_ptr, out_len);
+        Ok(0)
     })
 }
 
@@ -375,12 +403,10 @@ pub unsafe extern "C" fn rrk_toc_json(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        with_kernel(|k| {
-            let book = k.book(handle).map_err(set_kind)?;
-            let toc = book.toc().map_err(set_kind)?;
-            write_buf(toc_json(&toc), out_ptr, out_len);
-            Ok(0)
-        })
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        let toc = book.toc().map_err(set_kind)?;
+        write_buf(toc_json(&toc), out_ptr, out_len);
+        Ok(0)
     })
 }
 
@@ -395,12 +421,10 @@ pub unsafe extern "C" fn rrk_chapters_json(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        with_kernel(|k| {
-            let book = k.book(handle).map_err(set_kind)?;
-            let chapters = book.chapters().map_err(set_kind)?;
-            write_buf(chapters_json(&chapters), out_ptr, out_len);
-            Ok(0)
-        })
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        let chapters = book.chapters().map_err(set_kind)?;
+        write_buf(chapters_json(&chapters), out_ptr, out_len);
+        Ok(0)
     })
 }
 
@@ -428,16 +452,14 @@ pub unsafe extern "C" fn rrk_load_chapter(
         {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        with_kernel(|k| {
-            let book = k.book(handle).map_err(set_kind)?;
-            let content = book.load_chapter(chapter_id).map_err(set_kind)?;
-            let blocks = blocks_json(&content.text, &content.blocks);
-            let links = links_json(&content.link_ranges);
-            write_buf(content.text.as_bytes().to_vec(), text_ptr, text_len);
-            write_buf(blocks, blocks_ptr, blocks_len);
-            write_buf(links, links_ptr, links_len);
-            Ok(0)
-        })
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        let content = book.load_chapter(chapter_id).map_err(set_kind)?;
+        let blocks = blocks_json(&content.text, &content.blocks);
+        let links = links_json(&content.link_ranges);
+        write_buf(content.text.as_bytes().to_vec(), text_ptr, text_len);
+        write_buf(blocks, blocks_ptr, blocks_len);
+        write_buf(links, links_ptr, links_len);
+        Ok(0)
     })
 }
 
@@ -452,20 +474,18 @@ pub unsafe extern "C" fn rrk_cover(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        with_kernel(|k| {
-            let book = k.book(handle).map_err(set_kind)?;
-            match book.cover().map_err(set_kind)? {
-                Some(res) => {
-                    write_buf(res.data.to_vec(), out_ptr, out_len);
-                    Ok(0)
-                }
-                None => {
-                    *out_ptr = std::ptr::null_mut();
-                    *out_len = 0;
-                    Ok(2) // 无封面（软结果，非错误）
-                }
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        match book.cover().map_err(set_kind)? {
+            Some(res) => {
+                write_buf(res.data.to_vec(), out_ptr, out_len);
+                Ok(0)
             }
-        })
+            None => {
+                *out_ptr = std::ptr::null_mut();
+                *out_len = 0;
+                Ok(2) // 无封面（软结果，非错误）
+            }
+        }
     })
 }
 
@@ -529,28 +549,28 @@ fn pages_to_json(pages: &[rrk_model::LayoutPage]) -> Vec<u8> {
         if i > 0 {
             s.push(',');
         }
-        s.push_str(&format!(
+        // write! 直写 String，免 format! 临时 String（每页/每行/每 run 一次）
+        let _ = write!(
+            s,
             "{{\"index\":{},\"start\":{},\"end\":{},\"height\":{},\"lines\":[",
             p.index, p.start.char_offset, p.end.char_offset, p.height
-        ));
+        );
         for (j, l) in p.lines.iter().enumerate() {
             if j > 0 {
                 s.push(',');
             }
-            s.push_str(&format!(
-                "{{\"s\":{},\"e\":{},\"h\":{},\"p\":{}}}",
-                l.start, l.end, l.height, l.para_start
-            ));
+            let _ = write!(s, "{{\"s\":{},\"e\":{},\"h\":{},\"p\":{}}}", l.start, l.end, l.height, l.para_start);
         }
         s.push_str("],\"runs\":[");
         for (j, r) in p.runs.iter().enumerate() {
             if j > 0 {
                 s.push(',');
             }
-            s.push_str(&format!(
+            let _ = write!(
+                s,
                 "{{\"l\":{},\"x\":{},\"y\":{},\"fs\":{},\"b\":{},\"i\":{},\"s\":{},\"e\":{}}}",
                 r.line, r.x, r.baseline, r.font_size, r.bold, r.italic, r.range.0, r.range.1
-            ));
+            );
         }
         s.push_str("]}");
     }
@@ -574,18 +594,16 @@ pub unsafe extern "C" fn rrk_render_page(
         if out_ptr.is_null() || out_len.is_null() || out_w.is_null() || out_h.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        with_kernel(|k| {
-            let book = k.book(handle).map_err(set_kind)?;
-            match book.render_page(page_index, target_width).map_err(set_kind)? {
-                rrk_model::RenderResult::Bitmap { width, height, rgba } => {
-                    *out_w = width;
-                    *out_h = height;
-                    write_buf(rgba, out_ptr, out_len);
-                    Ok(0)
-                }
-                _ => Err(set_kind(RrkError::unsupported("非位图渲染结果"))),
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        match book.render_page(page_index, target_width).map_err(set_kind)? {
+            rrk_model::RenderResult::Bitmap { width, height, rgba } => {
+                *out_w = width;
+                *out_h = height;
+                write_buf(rgba, out_ptr, out_len);
+                Ok(0)
             }
-        })
+            _ => Err(set_kind(RrkError::unsupported("非位图渲染结果"))),
+        }
     })
 }
 
@@ -606,11 +624,14 @@ pub unsafe extern "C" fn rrk_page_count(handle: BookHandle, out: *mut u32) -> u3
         if out.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        with_kernel(|k| {
-            let pages = k.paged(handle).map_err(set_kind)?.pages().map_err(set_kind)?;
-            *out = pages.len() as u32;
-            Ok(0)
-        })
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        let paged = book
+            .as_paged()
+            .ok_or_else(|| RrkError::unsupported("该书不是页级格式（无 PagedSource 视图）"))
+            .map_err(set_kind)?;
+        let pages = paged.pages().map_err(set_kind)?;
+        *out = pages.len() as u32;
+        Ok(0)
     })
 }
 
@@ -626,11 +647,14 @@ pub unsafe extern "C" fn rrk_load_page_json(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        with_kernel(|k| {
-            let content = k.paged(handle).map_err(set_kind)?.load_page(index).map_err(set_kind)?;
-            write_buf(paged_json(&content), out_ptr, out_len);
-            Ok(0)
-        })
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        let paged = book
+            .as_paged()
+            .ok_or_else(|| RrkError::unsupported("该书不是页级格式（无 PagedSource 视图）"))
+            .map_err(set_kind)?;
+        let content = paged.load_page(index).map_err(set_kind)?;
+        write_buf(paged_json(&content), out_ptr, out_len);
+        Ok(0)
     })
 }
 
@@ -655,15 +679,12 @@ pub unsafe extern "C" fn rrk_load_resource(
                 Err(e) => return Err(set_kind(RrkError::invalid(format!("资源 key 非 UTF-8: {e}")))),
             }
         };
-        with_kernel(|k| {
-            let r = k
-                .book(handle)
-                .map_err(set_kind)?
-                .load_resource(&ResourceKey(key))
-                .map_err(set_kind)?;
-            write_buf(r.data.to_vec(), out_ptr, out_len);
-            Ok(0)
-        })
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        let r = book
+            .load_resource(&ResourceKey(key))
+            .map_err(set_kind)?;
+        write_buf(r.data.to_vec(), out_ptr, out_len);
+        Ok(0)
     })
 }
 
@@ -744,6 +765,89 @@ pub unsafe extern "C" fn rrk_cache_configure(
     })
 }
 
+/// 从 FFI 原始参数构造样式（字体名非 UTF-8 → Invalid 参数错误）。
+unsafe fn style_from_raw(
+    font_ptr: *const u8,
+    font_len: usize,
+    font_size: f32,
+    line_height: f32,
+    para_indent_em: f32,
+    align: u32,
+) -> Result<rrk_model::StyleSpec, u32> {
+    let font_family = if font_ptr.is_null() || font_len == 0 {
+        String::new()
+    } else {
+        match std::str::from_utf8(std::slice::from_raw_parts(font_ptr, font_len)) {
+            Ok(s) => s.to_string(),
+            Err(e) => return Err(set_kind(RrkError::invalid(format!("字体名非 UTF-8: {e}")))),
+        }
+    };
+    Ok(style_of(&font_family, font_size, line_height, para_indent_em, align))
+}
+
+/// 排版一章 → 结构化页（三要素缓存口径：C1 内存 → C2 磁盘 → 排版落盘 + 保护窗口）。
+///
+/// **锁纪律**：先取 `Arc<dyn BookSource>` 出内核锁再干活——载章（解压/清洗）、排版、
+/// 磁盘缓存 IO 全在内核锁外进行，任何其它 FFI 调用不再被排版/光栅化阻塞。
+/// `pages_json` / `page_at` / `hit_test` / `prefetch` 共用本函数，直连结构化数据。
+fn layout_pages_cached(
+    handle: BookHandle,
+    chapter_id: u32,
+    style: &rrk_model::StyleSpec,
+    vp: &rrk_model::Viewport,
+) -> Result<Vec<rrk_model::LayoutPage>, u32> {
+    let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+    let key = cache_key(book.meta().content_hash, style, vp, chapter_id);
+
+    // C1 内存 → C2 磁盘（命中免排版）
+    let cached = {
+        let mut cache_guard = CACHE.lock().map_err(|_| {
+            set_err(RrkError::io("缓存锁中毒"), RrkErrorKind::Internal.code())
+        })?;
+        match cache_guard.as_mut() {
+            Some((store, mem)) => {
+                if let Some(bytes) = mem.get(&key) {
+                    rrk_model::decode_pages(bytes)
+                } else if let Some(bytes) = store.load(&key) {
+                    let pages = rrk_model::decode_pages(&bytes);
+                    if pages.is_some() {
+                        mem.protect(key);
+                        mem.put(key, bytes);
+                    }
+                    pages
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(pages) = cached {
+        return Ok(pages);
+    }
+
+    // miss：载章 + 排版（内核锁外；排版器只在 layout 期间短暂持锁）
+    let content = book.load_chapter(chapter_id).map_err(set_kind)?;
+    let pages = {
+        let mut guard = LAYOUTER
+            .lock()
+            .map_err(|_| set_err(RrkError::io("排版器锁中毒"), RrkErrorKind::Internal.code()))?;
+        let layouter = guard.get_or_insert_with(rrk_layout::Layouter::new);
+        layouter.layout(&content, style, vp)
+    };
+    let payload = rrk_model::encode_pages(&pages);
+    if let Some((store, mem)) = CACHE
+        .lock()
+        .map_err(|_| set_err(RrkError::io("缓存锁中毒"), RrkErrorKind::Internal.code()))?
+        .as_mut()
+    {
+        let _ = store.save(&key, &payload);
+        mem.protect(key);
+        mem.put(key, payload);
+    }
+    Ok(pages)
+}
+
 /// 排版一章 → 页 JSON（三要素缓存口径：命中免排版；miss 排完落盘 + 保护窗口）。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_pages_json(
@@ -765,74 +869,11 @@ pub unsafe extern "C" fn rrk_pages_json(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        let font_family = if font_ptr.is_null() || font_len == 0 {
-            String::new()
-        } else {
-            match std::str::from_utf8(std::slice::from_raw_parts(font_ptr, font_len)) {
-                Ok(s) => s.to_string(),
-                Err(e) => return Err(set_kind(RrkError::invalid(format!("字体名非 UTF-8: {e}")))),
-            }
-        };
-        with_kernel(|k| {
-            let book = k.book(handle).map_err(set_kind)?;
-            let style = style_of(&font_family, font_size, line_height, para_indent_em, align);
-            let vp = rrk_model::Viewport { width, height, dpr };
-            let key = cache_key(book.meta().content_hash, &style, &vp, chapter_id);
-
-            // C1 → C2 → 排版
-            let pages = {
-                let mut cache_guard = CACHE.lock().map_err(|_| {
-                    set_err(RrkError::io("缓存锁中毒"), RrkErrorKind::Internal.code())
-                })?;
-                if let Some((store, mem)) = cache_guard.as_mut() {
-                    if let Some(bytes) = mem.get(&key) {
-                        if let Some(pages) = rrk_model::decode_pages(bytes) {
-                            Some(pages)
-                        } else {
-                            None
-                        }
-                    } else if let Some(bytes) = store.load(&key) {
-                        let pages = rrk_model::decode_pages(&bytes);
-                        if let Some(p) = &pages {
-                            mem.protect(key);
-                            mem.put(key, bytes);
-                        }
-                        pages
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
-
-            let pages = match pages {
-                Some(p) => p,
-                None => {
-                    let content = book.load_chapter(chapter_id).map_err(set_kind)?;
-                    let mut guard = LAYOUTER
-                        .lock()
-                        .map_err(|_| set_err(RrkError::io("排版器锁中毒"), RrkErrorKind::Internal.code()))?;
-                    let layouter = guard.get_or_insert_with(rrk_layout::Layouter::new);
-                    let pages = layouter.layout(&content, &style, &vp);
-                    let payload = rrk_model::encode_pages(&pages);
-                    if let Some((store, mem)) = CACHE
-                        .lock()
-                        .map_err(|_| set_err(RrkError::io("缓存锁中毒"), RrkErrorKind::Internal.code()))?
-                        .as_mut()
-                    {
-                        let _ = store.save(&key, &payload);
-                        mem.protect(key);
-                        mem.put(key, payload);
-                    }
-                    pages
-                }
-            };
-
-            let json = pages_to_json(&pages);
-            write_buf(json, out_ptr, out_len);
-            Ok(0)
-        })
+        let style = style_from_raw(font_ptr, font_len, font_size, line_height, para_indent_em, align)?;
+        let vp = rrk_model::Viewport { width, height, dpr };
+        let pages = layout_pages_cached(handle, chapter_id, &style, &vp)?;
+        write_buf(pages_to_json(&pages), out_ptr, out_len);
+        Ok(0)
     })
 }
 
@@ -857,49 +898,14 @@ pub unsafe extern "C" fn rrk_page_at(
         if out_page.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        // 复用 pages 链路（含缓存）
-        let mut p: *mut u8 = std::ptr::null_mut();
-        let mut n = 0usize;
-        let rc = rrk_pages_json(
-            handle, chapter_id, font_ptr, font_len, font_size, line_height, para_indent_em, align, width, height, dpr,
-            &mut p, &mut n,
-        );
-        if rc != 0 {
-            return Err(rc);
-        }
-        let json = String::from_utf8_lossy(std::slice::from_raw_parts(p, n)).into_owned();
-        rrk_buf_free(p, n);
-        let pages = rrk_layout::page_at(&[], rrk_model::SemanticPos { chapter: chapter_id, char_offset });
-        let _ = pages;
-        // 轻量扫描 JSON 的 start 字段（避免引 serde）：粗解析即可
-        let mut best = 0u32;
-        let mut best_start = 0u32;
-        let mut first = true;
-        for seg in json.split("\"index\":").skip(1) {
-            let idx: u32 = seg.split(',').next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let start: u32 = seg
-                .split("\"start\":")
-                .nth(1)
-                .and_then(|v| v.split(',').next())
-                .and_then(|v| v.parse().ok())
+        // 复用同一排版链路（含缓存），直连结构化数据——不再整章 JSON 序列化后再回扫
+        let style = style_from_raw(font_ptr, font_len, font_size, line_height, para_indent_em, align)?;
+        let vp = rrk_model::Viewport { width, height, dpr };
+        let pages = layout_pages_cached(handle, chapter_id, &style, &vp)?;
+        let idx =
+            rrk_layout::page_at(&pages, rrk_model::SemanticPos { chapter: chapter_id, char_offset })
                 .unwrap_or(0);
-            let end: u32 = seg
-                .split("\"end\":")
-                .nth(1)
-                .and_then(|v| v.split(',').next())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(u32::MAX);
-            if first || (char_offset >= start && char_offset < end) {
-                best = idx;
-                best_start = start;
-                first = false;
-                if char_offset >= start && char_offset < end {
-                    break;
-                }
-            }
-            let _ = best_start;
-        }
-        *out_page = best;
+        *out_page = idx as u32;
         Ok(0)
     })
 }
@@ -928,76 +934,34 @@ pub unsafe extern "C" fn rrk_hit_test(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        let mut p: *mut u8 = std::ptr::null_mut();
-        let mut n = 0usize;
-        let rc = rrk_pages_json(
-            handle, chapter_id, font_ptr, font_len, font_size, line_height, para_indent_em, align, width, height, dpr,
-            &mut p, &mut n,
-        );
-        if rc != 0 {
-            return Err(rc);
-        }
-        let json = String::from_utf8_lossy(std::slice::from_raw_parts(p, n)).into_owned();
-        rrk_buf_free(p, n);
+        let style = style_from_raw(font_ptr, font_len, font_size, line_height, para_indent_em, align)?;
+        let vp = rrk_model::Viewport { width, height, dpr };
+        let pages = layout_pages_cached(handle, chapter_id, &style, &vp)?;
+        let page = pages
+            .get(page_index as usize)
+            .ok_or_else(|| set_kind(RrkError::invalid("页越界")))?;
 
         // 找目标页的行（按累计行高定位 y）与 run（按 x 与比例推 offset）
-        let page_seg = match json.split("\"index\":").nth((page_index + 1) as usize) {
-            Some(s) => s,
-            None => return Err(set_kind(RrkError::invalid("页越界"))),
-        };
-        let page_head = page_seg.split("\"runs\":[").next().unwrap_or("");
         let mut y_cursor = 0.0f32;
         let mut hit_line = 0u32;
         let mut hit_range = (0u32, 0u32);
-        for (i, lseg) in page_head.split("\"s\":").skip(1).enumerate() {
-            let ls: u32 = lseg.split(',').next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let le: u32 = lseg
-                .split("\"e\":")
-                .nth(1)
-                .and_then(|v| v.split(',').next())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let lh: f32 = lseg
-                .split("\"h\":")
-                .nth(1)
-                .and_then(|v| v.split(',').next())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0);
-            if y < y_cursor + lh {
+        for (i, l) in page.lines.iter().enumerate() {
+            if y < y_cursor + l.height {
                 hit_line = i as u32;
-                hit_range = (ls, le);
+                hit_range = (l.start, l.end);
                 break;
             }
-            y_cursor += lh;
+            y_cursor += l.height;
         }
-        // run 内比例（x 与 run 起点/下一 run 起点）
-        let runs_part = page_seg.split("\"runs\":[").nth(1).unwrap_or("");
+        // run 内比例（x 与 run 起点，按平均字宽外推；钳制在 run 范围内）
         let mut best = hit_range.0;
-        for rseg in runs_part.split("{\"l\":") {
-            let rl: u32 = rseg.split(',').next().and_then(|v| v.parse().ok()).unwrap_or(u32::MAX);
-            if rl != hit_line {
+        for r in page.runs.iter() {
+            if r.line != hit_line {
                 continue;
             }
-            let rx: f32 = rseg
-                .split("\"x\":")
-                .nth(1)
-                .and_then(|v| v.split(',').next())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0);
-            let rs: u32 = rseg
-                .split("\"s\":")
-                .nth(1)
-                .and_then(|v| v.split(',').next())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let re: u32 = rseg
-                .split("\"e\":")
-                .nth(1)
-                .and_then(|v| v.split(',').next())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            if x >= rx {
-                best = rs + (((x - rx) as u32 / 20) * 3).min(re.saturating_sub(rs));
+            if x >= r.x {
+                best = r.range.0
+                    + (((x - r.x) as u32 / 20) * 3).min(r.range.1.saturating_sub(r.range.0));
             }
         }
         let mut out = String::with_capacity(64);
@@ -1026,17 +990,11 @@ pub unsafe extern "C" fn rrk_prefetch(
     dpr: f32,
 ) -> u32 {
     guard(|| {
-        // 当前章与相邻章各排一遍（走缓存链路自动落盘/保护）
+        // 当前章与相邻章各排一遍（走缓存链路自动落盘/保护；只排版，不产 JSON、不持内核锁）
+        let style = style_from_raw(font_ptr, font_len, font_size, line_height, para_indent_em, align)?;
+        let vp = rrk_model::Viewport { width, height, dpr };
         for target in [chapter_id.saturating_sub(1), chapter_id, chapter_id + 1] {
-            let mut p: *mut u8 = std::ptr::null_mut();
-            let mut n = 0usize;
-            let rc = rrk_pages_json(
-                handle, target, font_ptr, font_len, font_size, line_height, para_indent_em, align, width, height, dpr,
-                &mut p, &mut n,
-            );
-            if rc == 0 {
-                rrk_buf_free(p, n);
-            }
+            let _ = layout_pages_cached(handle, target, &style, &vp);
         }
         Ok(0)
     })

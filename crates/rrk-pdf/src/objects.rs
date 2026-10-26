@@ -563,6 +563,8 @@ pub struct PdfDocument {
     offsets: HashMap<u32, usize>,
     cache: std::sync::Mutex<HashMap<u32, Object>>,
     virtuals: std::sync::Mutex<HashMap<u32, Object>>,
+    /// 光栅字体缓存（raster 层填充：FontFile 解压/ToUnicode 解析跨页复用）。
+    pub(crate) font_cache: std::sync::Mutex<HashMap<u32, Arc<crate::raster::RasterFont>>>,
 }
 
 impl PdfDocument {
@@ -595,6 +597,7 @@ impl PdfDocument {
             offsets,
             cache: std::sync::Mutex::new(HashMap::new()),
             virtuals: std::sync::Mutex::new(HashMap::new()),
+            font_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
 

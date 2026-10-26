@@ -40,7 +40,20 @@ pub struct EpubBook {
     entries: Vec<ChapterEntry>,
     /// 目录原始树（含 href+fragment；`toc()` 时惰性解析锚点）。
     toc_raw: Vec<TocRaw>,
+    /// 章清洗结果缓存：inflate + clean 只做一次，`load_chapter` 与 TOC 锚点共用（见 `cached_clean`）。
+    chapter_cache: std::sync::Mutex<ChapterCache>,
+    /// manifest href（包内绝对路径）→ media_type（`load_resource` 免循环现算 resolve_href）。
+    mime_by_href: HashMap<String, String>,
 }
+
+/// 章清洗缓存（有界 LRU：只保最近用过的章，防大书内存无界增长）。
+struct ChapterCache {
+    map: HashMap<ChapterId, Arc<rrk_markup::CleanResult>>,
+    order: std::collections::VecDeque<ChapterId>,
+}
+
+/// 章清洗缓存保留章数（翻回上一章 / TOC 锚点复用足够；章文本大，不贪多）。
+const CHAPTER_CACHE_SLOTS: usize = 4;
 
 fn resolve_href(base_dir: &str, href: &str) -> String {
     let path = href.split('#').next().unwrap_or("");
@@ -184,6 +197,12 @@ impl EpubBook {
             })
             .unwrap_or_else(|| "未命名".to_string());
 
+        // manifest 反查表：href（包内绝对路径）→ media_type（load_resource O(1)）
+        let mut mime_by_href = HashMap::with_capacity(opf.manifest.len());
+        for i in opf.manifest.values() {
+            mime_by_href.insert(resolve_href(&opf_dir, &i.href), i.media_type.clone());
+        }
+
         let meta = BookMeta {
             title,
             authors: opf.authors.clone(),
@@ -209,6 +228,11 @@ impl EpubBook {
             href_to_chapter,
             entries,
             toc_raw,
+            chapter_cache: std::sync::Mutex::new(ChapterCache {
+                map: HashMap::new(),
+                order: std::collections::VecDeque::new(),
+            }),
+            mime_by_href,
         })
     }
 
@@ -242,11 +266,41 @@ impl EpubBook {
         out
     }
 
-    /// 章内锚点表：清洗该章后 `id → 文本字节偏移`。
+    /// 章内锚点表：清洗该章后 `id → 文本字节偏移`（命中清洗缓存，不重解压重清洗）。
     fn chapter_anchors(&self, chapter: ChapterId) -> RrkResult<BTreeMap<String, u32>> {
-        let entry = self.entry_for_chapter(chapter)?;
+        Ok(self.cached_clean(chapter)?.anchors.clone())
+    }
+
+    /// 取章清洗结果（缓存优先）：inflate + clean + 出口归一化只做一次，
+    /// `load_chapter`（正文/块/内链）与 `chapter_anchors`（TOC 锚点）共用同一份。
+    fn cached_clean(&self, id: ChapterId) -> RrkResult<Arc<rrk_markup::CleanResult>> {
+        {
+            let cache = self.chapter_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = cache.map.get(&id) {
+                return Ok(Arc::clone(c));
+            }
+        }
+        let entry = self.entry_for_chapter(id)?;
         let html = self.zip.read_string(entry)?;
-        Ok(clean_xhtml(&html).anchors)
+        let mut cleaned = clean_xhtml(&html);
+        // 图片 key 出口契约 = 包内绝对路径：清洗层保留的是文档里的原始 `src`
+        // （相对**文档**目录），在出口统一归一化，宿主可直接拿去 `load_resource`。
+        let base = dir_of(&entry.name);
+        resolve_image_keys(&mut cleaned.blocks, &base);
+        // 内链出口契约：路径部分按文档目录归一化为包内绝对路径，`#frag` 原样保留。
+        for l in &mut cleaned.links {
+            l.href = resolve_link_href(&base, &l.href);
+        }
+        let cleaned = Arc::new(cleaned);
+        let mut cache = self.chapter_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.map.len() >= CHAPTER_CACHE_SLOTS {
+            if let Some(old) = cache.order.pop_front() {
+                cache.map.remove(&old);
+            }
+        }
+        cache.order.push_back(id);
+        cache.map.insert(id, Arc::clone(&cleaned));
+        Ok(cleaned)
     }
 
     /// 回退 2：spine 首个可渲染文档里的首个 `<img src>` → 包内绝对路径。
@@ -272,16 +326,16 @@ impl EpubBook {
         None
     }
 
+    /// 章 id → zip 条目（id 即 `entries` 下标，O(1) 直取；不再反扫 `href_to_chapter`）。
     fn entry_for_chapter(&self, id: ChapterId) -> RrkResult<&ZipEntry> {
-        let href = self
-            .href_to_chapter
-            .iter()
-            .find(|(_, &cid)| cid == id)
-            .map(|(h, _)| h.as_str())
+        let entry = self
+            .entries
+            .get(id as usize)
+            .filter(|e| e.id == id)
             .ok_or_else(|| RrkError::invalid(format!("章 id 越界: {id}")))?;
         self.zip
-            .entry(href)
-            .ok_or_else(|| RrkError::corrupt(format!("EPUB: 章条目缺失 {href}")))
+            .entry(&entry.href)
+            .ok_or_else(|| RrkError::corrupt(format!("EPUB: 章条目缺失 {}", entry.href)))
     }
 }
 
@@ -457,7 +511,8 @@ fn backfill_titles(
     for r in raws {
         let path = normalize_path(r.href.split('#').next().unwrap_or(""));
         if let Some(&ch) = href_to_chapter.get(&path) {
-            if let Some(e) = entries.iter_mut().find(|e| e.id == ch) {
+            // 章 id 即 entries 下标（parse 时顺序分配），直取免 O(章数) 线性扫
+            if let Some(e) = entries.get_mut(ch as usize).filter(|e| e.id == ch) {
                 if e.title.is_none() {
                     e.title = Some(r.title.clone());
                 }
@@ -665,7 +720,8 @@ impl BookSource for EpubBook {
     }
 
     fn toc(&self) -> RrkResult<Vec<TocNode>> {
-        // 锚点惰性解析：只在 toc() 时按需清洗目标文档取 `id → 偏移`，打开书不做全量预扫。
+        // 锚点惰性解析：只清洗被 fragment 引用的文档；结果驻 `chapter_cache`，
+        // 跨 toc() 调用与 load_chapter 复用（旧实现每次 toc() 重解压重清洗全书带锚点章）。
         let mut cache: HashMap<ChapterId, BTreeMap<String, u32>> = HashMap::new();
         Ok(self.build_toc_nodes(&self.toc_raw, &mut cache))
     }
@@ -675,24 +731,22 @@ impl BookSource for EpubBook {
     }
 
     fn load_chapter(&self, id: ChapterId) -> RrkResult<ChapterContent> {
-        let entry = self.entry_for_chapter(id)?;
-        let html = self.zip.read_string(entry)?;
-        let mut cleaned = clean_xhtml(&html);
-        // 图片 key 出口契约 = 包内绝对路径：清洗层保留的是文档里的原始 `src`
-        // （相对**文档**目录），在出口统一归一化，宿主可直接拿去 `load_resource`。
-        let base = dir_of(&entry.name);
-        resolve_image_keys(&mut cleaned.blocks, &base);
-        // 内链出口契约：路径部分按文档目录归一化为包内绝对路径，`#frag` 原样保留。
-        for l in &mut cleaned.links {
-            l.href = resolve_link_href(&base, &l.href);
-        }
-        let link_ranges = std::mem::take(&mut cleaned.links);
+        // 缓存命中时免 inflate + 重清洗，只需结构克隆（比重新解析便宜一个量级）
+        let cleaned = self.cached_clean(id)?;
+        let link_ranges = cleaned.links.clone();
         Ok(ChapterContent {
             id,
-            text: Arc::from(cleaned.text),
-            blocks: cleaned.blocks,
+            text: Arc::from(cleaned.text.as_str()),
+            blocks: cleaned.blocks.clone(),
             link_ranges,
         })
+    }
+
+    fn unload_chapter(&self, id: ChapterId) {
+        let mut cache = self.chapter_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.map.remove(&id).is_some() {
+            cache.order.retain(|&c| c != id);
+        }
     }
 
     fn load_resource(&self, key: &ResourceKey) -> RrkResult<Resource> {
@@ -709,10 +763,9 @@ impl BookSource for EpubBook {
             .entry(&href)
             .ok_or_else(|| RrkError::invalid(format!("资源不存在: {}", key.0)))?;
         let mime = self
-            .manifest
-            .values()
-            .find(|i| resolve_href(&self.opf_dir, &i.href) == href)
-            .map(|i| i.media_type.clone())
+            .mime_by_href
+            .get(&href)
+            .cloned()
             .unwrap_or_else(|| "application/octet-stream".to_string());
         Ok(Resource {
             key: ResourceKey(href),

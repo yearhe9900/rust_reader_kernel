@@ -1,6 +1,7 @@
 //! XHTML → Block 清洗管线（方案 §3.3-4）：标签白名单 + CSS 最小集，
 //! 产出干净 `Block` 流 + UTF-8 正文（`Inline` 偏移基于清洗后文本）。
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use rrk_model::{Block, Inline, LinkRange, ResourceKey, StyleFlags, TextRange};
@@ -19,7 +20,11 @@ pub struct CleanResult {
 }
 
 /// 空白折叠（XHTML 缩进空白不进正文；CJK 无空格语义不受影响）。
-fn collapse_ws(s: &str) -> String {
+/// 无空白时零拷贝借用（CJK 正文常态）。
+fn collapse_ws(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(|c| c.is_whitespace()) {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     let mut in_ws = false;
     for c in s.chars() {
@@ -35,7 +40,7 @@ fn collapse_ws(s: &str) -> String {
             out.push(c);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 struct Cleaner {
@@ -68,6 +73,7 @@ impl Cleaner {
             return;
         }
         let t = collapse_ws(raw);
+        let t = t.as_ref();
         if t.is_empty() {
             return;
         }
@@ -143,8 +149,9 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
                         c.out.anchors.entry(id.to_string()).or_insert(off);
                     }
                 }
-                let n = local_name(&name).to_string();
-                match n.as_str() {
+                // 标签名借用匹配（免 to_string 分配）
+                let n = local_name(&name);
+                match n {
                     "head" | "script" | "style" | "title" | "meta" | "link" => {
                         if !self_closing {
                             c.skip_depth += 1;
@@ -207,7 +214,7 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
                 }
                 if self_closing {
                     // 自闭合回滚 skip 计数
-                    if matches!(n.as_str(), "head" | "script" | "style" | "title" | "meta" | "link")
+                    if matches!(n, "head" | "script" | "style" | "title" | "meta" | "link")
                         && c.skip_depth > 0
                     {
                         c.skip_depth -= 1;
@@ -215,8 +222,8 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
                 }
             }
             Token::Close(name) => {
-                let n = local_name(&name).to_string();
-                match n.as_str() {
+                let n = local_name(&name);
+                match n {
                     "head" | "script" | "style" | "title" => {
                         if c.skip_depth > 0 {
                             c.skip_depth -= 1;

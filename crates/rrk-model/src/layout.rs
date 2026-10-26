@@ -299,22 +299,26 @@ pub fn decode_pages(data: &[u8]) -> Option<Vec<LayoutPage>> {
 
 /// 样式哈希输入（三要素之二）。
 pub fn style_hash(s: &StyleSpec) -> u64 {
-    let mut bytes = Vec::with_capacity(64);
-    bytes.extend_from_slice(s.font_family.as_bytes());
-    bytes.extend_from_slice(&s.font_size.to_bits().to_le_bytes());
-    bytes.extend_from_slice(&s.line_height.to_bits().to_le_bytes());
-    bytes.extend_from_slice(&s.para_indent_em.to_bits().to_le_bytes());
-    bytes.push(s.align as u8);
-    crate::fnv1a64(&bytes)
+    // 增量喂入（免 64B Vec 拼接；每次 pagesOf/page_at 都会调）；字节序与旧实现
+    // 逐字段拼接完全一致，已有磁盘缓存不失效。
+    use crate::{fnv1a64_update, FNV_INIT};
+    let mut h = FNV_INIT;
+    h = fnv1a64_update(h, s.font_family.as_bytes());
+    h = fnv1a64_update(h, &s.font_size.to_bits().to_le_bytes());
+    h = fnv1a64_update(h, &s.line_height.to_bits().to_le_bytes());
+    h = fnv1a64_update(h, &s.para_indent_em.to_bits().to_le_bytes());
+    fnv1a64_update(h, &[s.align as u8])
 }
 
 /// 视口哈希输入（三要素之三）。
 pub fn viewport_hash(v: &Viewport) -> u64 {
-    let mut bytes = [0u8; 12];
-    bytes[..4].copy_from_slice(&v.width.to_bits().to_le_bytes());
-    bytes[4..8].copy_from_slice(&v.height.to_bits().to_le_bytes());
-    bytes[8..].copy_from_slice(&v.dpr.to_bits().to_le_bytes());
-    crate::fnv1a64(&bytes)
+    // 只含 width/height：排版引擎只消费这两项（width 断行 / height 分页）；
+    // dpr 不参与排版，不入 key——免「改 dpr / 旋转设备白打散整章布局缓存」。
+    // 旧 key 含 dpr，口径变更后旧缓存自然 miss 重算，无正确性影响。
+    use crate::{fnv1a64_update, FNV_INIT};
+    let mut h = FNV_INIT;
+    h = fnv1a64_update(h, &v.width.to_bits().to_le_bytes());
+    fnv1a64_update(h, &v.height.to_bits().to_le_bytes())
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 //! 只读：EOCD → 中央目录条目表 → 按需取单条目数据（stored/deflate）。
 //! 不整包解压；Zip64 / 加密条目明确报错。
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -29,6 +30,8 @@ pub struct ZipEntry {
 pub struct ZipArchive {
     data: Arc<[u8]>,
     entries: Vec<ZipEntry>,
+    /// 条目名 → 下标（解析中央目录时一次建好；重名保留首个，与旧线性 find 同序）。
+    by_name: HashMap<Box<str>, u32>,
 }
 
 fn u16le(b: &[u8], off: usize) -> u16 {
@@ -72,6 +75,7 @@ impl ZipArchive {
         }
 
         let mut entries = Vec::with_capacity(total);
+        let mut by_name = HashMap::with_capacity(total);
         let mut p = cd_off;
         while p + 46 <= cd_off + cd_size {
             if u32le(&data, p) != SIG_CENTRAL {
@@ -101,29 +105,30 @@ impl ZipArchive {
                 return Err(RrkError::unsupported(format!("zip: 加密条目 {name}")));
             }
 
+            by_name.entry(Box::from(name.as_str())).or_insert(entries.len() as u32);
             entries.push(ZipEntry { name, method, comp_size, uncomp_size, crc32, local_offset });
             p = name_end + extra_len + comment_len;
         }
 
-        Ok(Self { data, entries })
+        Ok(Self { data, entries, by_name })
     }
 
     pub fn entries(&self) -> &[ZipEntry] {
         &self.entries
     }
 
-    /// 按精确名取条目。
+    /// 按精确名取条目（O(1)：名字下标在解析中央目录时已建好）。
     pub fn entry(&self, name: &str) -> Option<&ZipEntry> {
-        self.entries.iter().find(|e| e.name == name)
+        self.by_name.get(name).map(|&i| &self.entries[i as usize])
     }
 
-    /// 按后缀模糊匹配（OPF/NCX 定位辅助）。
+    /// 按后缀模糊匹配（OPF/NCX 定位辅助；仅 open 期调用）。
     pub fn entry_by_suffix(&self, suffix: &str) -> Option<&ZipEntry> {
         self.entries.iter().find(|e| e.name.ends_with(suffix))
     }
 
-    /// 读取并按需 inflate 单个条目。
-    pub fn read(&self, entry: &ZipEntry) -> RrkResult<Arc<[u8]>> {
+    /// 条目压缩字节的源切片（本地头校验后）。
+    fn raw_of(&self, entry: &ZipEntry) -> RrkResult<&[u8]> {
         let lo = entry.local_offset as usize;
         if lo + 30 > self.data.len() || u32le(&self.data, lo) != SIG_LOCAL {
             return Err(RrkError::corrupt(format!("zip: 本地头损坏 {}", entry.name)));
@@ -135,30 +140,58 @@ impl ZipArchive {
         if data_end > self.data.len() {
             return Err(RrkError::corrupt(format!("zip: 条目数据越界 {}", entry.name)));
         }
-        let raw = &self.data[data_start..data_end];
+        Ok(&self.data[data_start..data_end])
+    }
 
+    /// 读取并按需 inflate 单个条目（`Vec` 所有权；deflate 路径零二次拷贝）。
+    pub fn read_vec(&self, entry: &ZipEntry) -> RrkResult<Vec<u8>> {
+        let raw = self.raw_of(entry)?;
         match entry.method {
-            0 => Ok(Arc::from(raw)),
+            0 => Ok(raw.to_vec()),
             8 => {
                 let mut out = Vec::with_capacity(entry.uncomp_size as usize);
                 flate2::read::DeflateDecoder::new(raw)
                     .read_to_end(&mut out)
                     .map_err(|e| RrkError::corrupt(format!("zip: inflate 失败 {}", entry.name)).with_context(e.to_string()))?;
-                Ok(out.into())
+                Ok(out)
             }
             m => Err(RrkError::unsupported(format!("zip: 压缩方法 {m} 不支持（{}）", entry.name))),
         }
     }
 
-    /// 读取文本条目（UTF-8 宽容解码）。
+    /// 读取并按需 inflate 单个条目（共享缓冲）。
+    pub fn read(&self, entry: &ZipEntry) -> RrkResult<Arc<[u8]>> {
+        Ok(self.read_vec(entry)?.into())
+    }
+
+    /// 限流读条目头部：最多解压/拷贝 `max` 字节（开书探头场景——图片尺寸等
+    /// 免全量 inflate，大图条目开书不再整本解压）。
+    pub fn read_prefix(&self, entry: &ZipEntry, max: usize) -> RrkResult<Vec<u8>> {
+        let raw = self.raw_of(entry)?;
+        match entry.method {
+            0 => Ok(raw[..raw.len().min(max)].to_vec()),
+            8 => {
+                let mut out = Vec::with_capacity((entry.uncomp_size.min(max as u64)) as usize);
+                flate2::read::DeflateDecoder::new(raw)
+                    .take(max as u64)
+                    .read_to_end(&mut out)
+                    .map_err(|e| RrkError::corrupt(format!("zip: inflate 失败 {}", entry.name)).with_context(e.to_string()))?;
+                Ok(out)
+            }
+            m => Err(RrkError::unsupported(format!("zip: 压缩方法 {m} 不支持（{}）", entry.name))),
+        }
+    }
+
+    /// 读取文本条目（UTF-8 宽容解码；UTF-8 正文零拷贝直接进 `String`）。
     pub fn read_string(&self, entry: &ZipEntry) -> RrkResult<String> {
-        let bytes = self.read(entry)?;
-        let text = if let Ok(s) = std::str::from_utf8(&bytes) {
-            s.to_string()
-        } else {
-            // XHTML 偶发 GBK/ISO-8859-1；宽容转 UTF-8
-            let (cow, _, _) = encoding_rs::WINDOWS_1252.decode(&bytes);
-            cow.into_owned()
+        let bytes = self.read_vec(entry)?;
+        let text = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                // XHTML 偶发 GBK/ISO-8859-1；宽容转 UTF-8
+                let (cow, _, _) = encoding_rs::WINDOWS_1252.decode(e.as_bytes());
+                cow.into_owned()
+            }
         };
         Ok(text)
     }

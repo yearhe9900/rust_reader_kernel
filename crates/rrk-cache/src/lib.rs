@@ -11,7 +11,7 @@
 //! 已预留**——P1 排版内核产出 `LayoutPage` 后按 `CacheKind::Layout` 直接落盘，
 //! 框架（key/淘汰/校验/失效）无需改动。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rrk_model::{fnv1a64, RrkResult};
@@ -82,24 +82,35 @@ impl CacheKey {
 // C1 内存层：LRU + 保护窗口
 // ---------------------------------------------------------------------------
 
+/// 内存缓存条目：载荷 + 最近访问序号（lazy-LRU）。
+struct MemEntry {
+    payload: Vec<u8>,
+    /// get/put 时刷新的单调序号；淘汰时序号最小的未保护项最旧。
+    stamp: u64,
+}
+
 /// 内存缓存（字节载荷；上层自行序列化）。
+///
+/// 命中/写入 **O(1)**：条目自带访问序号，只有淘汰时才线性找最旧。
+/// （旧实现每次 `get` 都对 `order` 做 `retain` 全表扫，条目数千时命中热路径 O(n)。）
 pub struct MemoryCache {
-    map: HashMap<CacheKey, Vec<u8>>,
-    order: VecDeque<CacheKey>,
+    map: HashMap<CacheKey, MemEntry>,
     protected: HashSet<CacheKey>,
     /// 载荷总字节上限。
     max_bytes: usize,
     used: usize,
+    /// 单调访问时钟。
+    clock: u64,
 }
 
 impl MemoryCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             map: HashMap::new(),
-            order: VecDeque::new(),
             protected: HashSet::new(),
             max_bytes,
             used: 0,
+            clock: 0,
         }
     }
 
@@ -113,38 +124,35 @@ impl MemoryCache {
     }
 
     pub fn get(&mut self, key: &CacheKey) -> Option<&[u8]> {
-        if self.map.contains_key(key) {
-            self.order.retain(|k| k != key);
-            self.order.push_back(*key);
-            self.map.get(key).map(|v| v.as_slice())
-        } else {
-            None
-        }
+        let e = self.map.get_mut(key)?;
+        self.clock += 1;
+        e.stamp = self.clock;
+        Some(e.payload.as_slice())
     }
 
     pub fn put(&mut self, key: CacheKey, payload: Vec<u8>) {
+        self.clock += 1;
+        let stamp = self.clock;
         if let Some(old) = self.map.remove(&key) {
-            self.used -= old.len();
-            self.order.retain(|k| k != &key);
+            self.used -= old.payload.len();
         }
         self.used += payload.len();
-        self.map.insert(key, payload);
-        self.order.push_back(key);
+        self.map.insert(key, MemEntry { payload, stamp });
         self.evict();
     }
 
     fn evict(&mut self) {
         while self.used > self.max_bytes {
-            // 找最久的未保护项；全保护则停止（纪律：全保护不淘汰）
+            // 找最久未访问的未保护项；全保护则停止（纪律：全保护不淘汰）
             let victim = self
-                .order
+                .map
                 .iter()
-                .find(|k| !self.protected.contains(k))
-                .copied();
+                .filter(|(k, _)| !self.protected.contains(k))
+                .min_by_key(|(_, e)| e.stamp)
+                .map(|(k, _)| *k);
             let Some(victim) = victim else { break };
-            self.order.retain(|k| *k != victim);
             if let Some(v) = self.map.remove(&victim) {
-                self.used -= v.len();
+                self.used -= v.payload.len();
             }
         }
     }
@@ -162,9 +170,8 @@ impl MemoryCache {
             .copied()
             .collect();
         for k in keys {
-            self.order.retain(|x| *x != k);
             if let Some(v) = self.map.remove(&k) {
-                self.used -= v.len();
+                self.used -= v.payload.len();
             }
             self.protected.remove(&k);
         }

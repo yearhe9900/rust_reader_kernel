@@ -31,7 +31,9 @@ use rrk_model::{RrkError, RrkErrorKind, RrkResult};
 // 字体
 // ---------------------------------------------------------------------------
 
-struct RasterFont {
+/// 已解析的光栅字体（文档级缓存，按字体对象号跨页复用——FontFile2 解压与
+/// ToUnicode 解析是每页重建时的最大单项开销）。
+pub(crate) struct RasterFont {
     data: Arc<[u8]>,
     to_unicode: Option<HashMap<u16, String>>,
     two_byte: bool,
@@ -84,7 +86,10 @@ fn system_font_path(base: &str) -> String {
     file.to_string()
 }
 
-fn collect_raster_fonts(doc: &PdfDocument, resources: Option<&Object>) -> HashMap<String, RasterFont> {
+fn collect_raster_fonts(
+    doc: &PdfDocument,
+    resources: Option<&Object>,
+) -> HashMap<String, Arc<RasterFont>> {
     let mut fonts = HashMap::new();
     let Some(res) = resources else { return fonts };
     let res = doc.resolve(res);
@@ -93,6 +98,18 @@ fn collect_raster_fonts(doc: &PdfDocument, resources: Option<&Object>) -> HashMa
     let font_dict = doc.resolve(font_obj);
     let Some(entries) = font_dict.as_dict() else { return fonts };
     for (name, ref_obj) in entries {
+        // 文档级缓存：同一字体对象跨页只 inflate/解析一次（旧实现每页重建，
+        // CJK 子集字体数百 KB 的 FontFile2 被逐页重复解压）
+        let cached_num = match ref_obj {
+            Object::Ref(num, _) => Some(*num),
+            _ => None,
+        };
+        if let Some(num) = cached_num {
+            if let Some(f) = doc.font_cache.lock().unwrap().get(&num) {
+                fonts.insert(name.clone(), Arc::clone(f));
+                continue;
+            }
+        }
         let font = doc.resolve(ref_obj);
         let Some(fd) = font.as_dict() else { continue };
 
@@ -152,17 +169,18 @@ fn collect_raster_fonts(doc: &PdfDocument, resources: Option<&Object>) -> HashMa
             .unwrap_or("Helvetica")
             .to_string();
 
-        fonts.insert(
-            name.clone(),
-            RasterFont {
-                data,
-                to_unicode,
-                two_byte,
-                fallback_path: system_font_path(&base),
-                cid_mode,
-                cid_to_gid,
-            },
-        );
+        let built = Arc::new(RasterFont {
+            data,
+            to_unicode,
+            two_byte,
+            fallback_path: system_font_path(&base),
+            cid_mode,
+            cid_to_gid,
+        });
+        if let Some(num) = cached_num {
+            doc.font_cache.lock().unwrap().insert(num, Arc::clone(&built));
+        }
+        fonts.insert(name.clone(), built);
     }
     fonts
 }
@@ -177,7 +195,7 @@ struct GState {
     fill: (f32, f32, f32, f32),
     stroke: (f32, f32, f32, f32),
     line_width: f32,
-    clip: Option<tiny_skia::Mask>,
+    clip: Option<Arc<tiny_skia::Mask>>,
     /// ExtGState 透明度（/ca /CA）。
     fill_alpha: f32,
     stroke_alpha: f32,
@@ -244,7 +262,7 @@ pub struct Rasterizer<'a> {
     gs: GState,
     stack: Vec<GState>,
     text: TextState,
-    fonts: HashMap<String, RasterFont>,
+    fonts: HashMap<String, Arc<RasterFont>>,
     font_bytes: HashMap<String, Arc<[u8]>>,
     scale_cx: ScaleContext,
     pb: Option<PathBuilder>,
@@ -330,8 +348,8 @@ impl<'a> Rasterizer<'a> {
                 p.pos += 1;
                 continue;
             }
-            let kw = p.data[start..p.pos].to_vec();
-            self.op(&kw, &ops);
+            let kw: &[u8] = &p.data[start..p.pos];
+            self.op(kw, &ops);
             ops.clear();
         }
     }
@@ -495,7 +513,8 @@ impl<'a> Rasterizer<'a> {
                                     *x = (*x).min(*y);
                                 }
                             }
-                            self.gs.clip = Some(mask);
+                            // Arc 包装：q/Q 克隆 GState 不再整页 memcpy 裁剪遮罩
+                            self.gs.clip = Some(Arc::new(mask));
                         }
                     }
                 }
@@ -546,19 +565,14 @@ impl<'a> Rasterizer<'a> {
                     self.text.tm = self.text.tlm;
                 }
                 if let Some(s) = ops.last().and_then(|o| o.as_str()) {
-                    let s = s.to_vec();
-                    self.show_text(&s);
+                    self.show_text(s);
                 }
             }
             b"TJ" => {
                 if let Some(Object::Arr(items)) = ops.last() {
-                    let items = items.clone();
-                    for it in &items {
+                    for it in items {
                         match it {
-                            Object::Str(s) => {
-                                let s = s.clone();
-                                self.show_text(&s);
-                            }
+                            Object::Str(s) => self.show_text(s),
                             Object::Real(f) => self.kern(*f as f32),
                             Object::Int(i) => self.kern(*i as f32),
                             _ => {}
@@ -623,7 +637,7 @@ impl<'a> Rasterizer<'a> {
             let mut paint = Paint::default();
             let (r, g, b, a) = self.gs.fill;
             paint.set_color_rgba8(fc(r), fc(g), fc(b), fc(a * self.gs.fill_alpha));
-            let clip = self.gs.clip.as_ref();
+            let clip = self.gs.clip.as_deref();
             self.pixmap.fill_path(&path, &paint, rule, Transform::identity(), clip);
             self.last_path = Some(path);
         }
@@ -649,7 +663,7 @@ impl<'a> Rasterizer<'a> {
         paint.set_color_rgba8(fc(r), fc(g), fc(b), fc(a * self.gs.stroke_alpha));
         let mut stroke = tiny_skia::Stroke::default();
         stroke.width = self.gs.line_width * self.scale;
-        let clip = self.gs.clip.as_ref();
+        let clip = self.gs.clip.as_deref();
         self.pixmap.stroke_path(path, &paint, &stroke, Transform::identity(), clip);
     }
 
@@ -715,10 +729,11 @@ impl<'a> Rasterizer<'a> {
                 .collect()
         };
 
-        let mut render = Render::new(&[Source::Outline]);
+        // scaler/Render 提到循环外：同一字体同一 ppem 整段文本不变——
+        // 旧实现在逐字形循环里每次 builder().build()（swash 内部查表）+ Render::new
+        let mut scaler = self.scale_cx.builder(font_ref).size(ppem).build();
+        let render = Render::new(&[Source::Outline]);
         for gid in targets {
-            let ch_advance_space = false;
-            let _ = ch_advance_space;
             let adv_units = if gid == 0 { upem * 0.5 } else { glyph_metrics.advance_width(gid) };
             let adv = adv_units / upem * size * self.text.h_scale + self.text.char_space;
 
@@ -726,14 +741,14 @@ impl<'a> Rasterizer<'a> {
                 // 设备位置 = CTM ∘ Tm（文本空间先作用）
                 let t = self.text.tm.post_concat(self.gs.ctm);
                 let (dx, dy) = map_xy(&t, 0.0, 0.0);
-                let mut scaler = self.scale_cx.builder(font_ref).size(ppem).build();
                 if let Some(img) = render.render(&mut scaler, gid) {
                     let (mw, mh) = (img.placement.width as u32, img.placement.height as u32);
                     if mw > 0 && mh > 0 && img.data.len() == (mw * mh) as usize {
                         let px = dx.round() + img.placement.left as f32;
                         let py = dy.round() - img.placement.top as f32;
                         let color = self.gs.fill;
-                        self.blend_mask(&img.data, mw, mh, px, py, color);
+                        // 只借 pixmap 字段（scaler 仍借着 scale_cx，不能 &mut self）
+                        Self::blend_mask(&mut self.pixmap, &img.data, mw, mh, px, py, color);
                     }
                 }
             }
@@ -794,32 +809,52 @@ impl<'a> Rasterizer<'a> {
         data
     }
 
-    /// alpha 遮罩按填充色混合进位图（原始字节，premultiplied RGBA）。
-    fn blend_mask(&mut self, mask: &[u8], w: u32, h: u32, x0: f32, y0: f32, color: (f32, f32, f32, f32)) {
-        let (pw, ph) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
-        let data = self.pixmap.data_mut();
-        let (cr, cg, cb) = (fc(color.0) as u32, fc(color.1) as u32, fc(color.2) as u32);
-        for row in 0..h as i32 {
-            for col in 0..w as i32 {
-                let alpha = mask[(row as u32 * w + col as u32) as usize];
-                if alpha == 0 {
-                    continue;
-                }
-                let px = x0 as i32 + col;
-                let py = y0 as i32 + row;
-                if px < 0 || py < 0 || px >= pw || py >= ph {
-                    continue;
-                }
-                let idx = (py * pw + px) as usize * 4;
-                let sa = alpha as u32;
-                let inv = 255 - sa;
-                data[idx] = ((cr * sa + data[idx] as u32 * inv) / 255).min(255) as u8;
-                data[idx + 1] = ((cg * sa + data[idx + 1] as u32 * inv) / 255).min(255) as u8;
-                data[idx + 2] = ((cb * sa + data[idx + 2] as u32 * inv) / 255).min(255) as u8;
-                data[idx + 3] = ((sa + data[idx + 3] as u32 * inv) / 255).min(255) as u8;
+    /// alpha 遮罩按填充色混合进位图（关联函数：字形上屏循环持有 scale_cx
+    /// 借用，只借 pixmap 字段避免全量 &mut self）。
+    fn blend_mask(
+        pixmap: &mut Pixmap,
+        mask: &[u8],
+        w: u32,
+        h: u32,
+        x0: f32,
+        y0: f32,
+        color: (f32, f32, f32, f32),
+    ) {
+    let (pw_i, ph_i) = (pixmap.width() as i32, pixmap.height() as i32);
+    if pw_i <= 0 || ph_i <= 0 || w == 0 || h == 0 {
+        return;
+    }
+    let (tx, ty) = (x0 as i32, y0 as i32);
+    //先裁出与位图相交的矩形：行内切片混合，免逐像素边界判断与索引重算
+    let cs = tx.max(0) as u32;
+    let ce = (tx.saturating_add(w as i32)).min(pw_i) as u32;
+    let rs = ty.max(0) as u32;
+    let re = (ty.saturating_add(h as i32)).min(ph_i) as u32;
+    if cs >= ce || rs >= re {
+        return;
+    }
+    let pw = pixmap.width();
+    let (cr, cg, cb) = (fc(color.0) as u32, fc(color.1) as u32, fc(color.2) as u32);
+    let data = pixmap.data_mut();
+    for row in rs..re {
+        let mrow = ((row as i32 - ty) as usize) * w as usize;
+        let ms = &mask[mrow + cs as usize..mrow + ce as usize];
+        let dstart = (row * pw + cs) as usize * 4;
+        let dend = (row * pw + ce) as usize * 4;
+        for (m, d) in ms.iter().zip(data[dstart..dend].chunks_exact_mut(4)) {
+            let alpha = *m;
+            if alpha == 0 {
+                continue;
             }
+            let sa = alpha as u32;
+            let inv = 255 - sa;
+            d[0] = ((cr * sa + d[0] as u32 * inv) / 255).min(255) as u8;
+            d[1] = ((cg * sa + d[1] as u32 * inv) / 255).min(255) as u8;
+            d[2] = ((cb * sa + d[2] as u32 * inv) / 255).min(255) as u8;
+            d[3] = ((sa + d[3] as u32 * inv) / 255).min(255) as u8;
         }
     }
+}
 
     // ---- 图像 XObject ----
 
@@ -974,7 +1009,7 @@ impl<'a> Rasterizer<'a> {
         pb.line_to(0.0, ph);
         pb.close();
         if let Some(path) = pb.finish() {
-            let clip = self.gs.clip.as_ref();
+            let clip = self.gs.clip.as_deref();
             self.pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), clip);
         }
     }

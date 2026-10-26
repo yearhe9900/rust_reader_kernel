@@ -40,11 +40,14 @@ pub struct ScoredHit {
 }
 
 /// 索引构建器：逐章投喂（可分步、可中途放弃）。
+///
+/// 构建期用逐词项临时 `Vec` 攒 postings（新词追加天然是随机位置，扁平 arena
+/// 无法就地续写）；`build()` 一次压实成 CSR，临时结构随构建器释放。
 #[derive(Default)]
 pub struct Bm25Builder {
     docs: Vec<u32>,
     doc_len: Vec<u32>,
-    dict: HashMap<String, u32>,
+    dict: HashMap<Box<str>, u32>,
     terms: Vec<Vec<(u32, u32)>>,
     total_tokens: u64,
 }
@@ -67,11 +70,14 @@ impl Bm25Builder {
             tokens += 1;
         });
         for (term, count) in tf {
+            // 命中路径单次哈希查找；仅「新词」时才 insert（stable Rust 的 entry
+            // 必须先持有所有权键，会让每次命中都多一次分配，反而更慢）。
+            // 键用 Box<str>：比 String 少 8 字节（无 capacity 字段）。
             let id = match self.dict.get(term) {
                 Some(&id) => id,
                 None => {
                     let id = self.terms.len() as u32;
-                    self.dict.insert(term.to_string(), id);
+                    self.dict.insert(term.into(), id);
                     self.terms.push(Vec::new());
                     id
                 }
@@ -94,18 +100,27 @@ impl Bm25Builder {
         self.terms.len()
     }
 
-    /// 收尾成可查询索引。
+    /// 收尾成可查询索引（逐词项临时倒排一次压实成扁平 CSR）。
     pub fn build(self) -> Bm25 {
         let avgdl = if self.docs.is_empty() {
             0.0
         } else {
             self.total_tokens as f32 / self.docs.len() as f32
         };
+        let total: usize = self.terms.iter().map(|p| p.len()).sum();
+        let mut postings = Vec::with_capacity(total);
+        let mut offsets = Vec::with_capacity(self.terms.len() + 1);
+        offsets.push(0);
+        for p in &self.terms {
+            postings.extend_from_slice(p);
+            offsets.push(postings.len() as u32);
+        }
         Bm25 {
             docs: self.docs,
             doc_len: self.doc_len,
             dict: self.dict,
-            terms: self.terms,
+            postings,
+            offsets,
             total_tokens: self.total_tokens,
             avgdl,
         }
@@ -113,12 +128,20 @@ impl Bm25Builder {
 }
 
 /// BM25 倒排索引（内存态；`encode`/`decode` 与宿主落盘字节互转）。
+///
+/// 倒排表用扁平 CSR 布局：所有词项的 postings 串接在单一 `postings` arena 里，
+/// `offsets[id]..offsets[id + 1]` 是词项 `id` 的区间——百万词项只有两次 Vec
+/// 分配，替代原先每词项一次的小堆分配（碎片/耗时主源）。
 #[derive(Debug, Clone)]
 pub struct Bm25 {
     docs: Vec<u32>,
     doc_len: Vec<u32>,
-    dict: HashMap<String, u32>,
-    terms: Vec<Vec<(u32, u32)>>,
+    dict: HashMap<Box<str>, u32>,
+    /// CSR 的 data 段：全部词项倒排串接（词内按 doc 升序）。
+    postings: Vec<(u32, u32)>,
+    /// CSR 的索引段：长度恒为 `term_cnt + 1`，词项 `id` 的倒排是
+    /// `postings[offsets[id] as usize..offsets[id + 1] as usize]`。
+    offsets: Vec<u32>,
     total_tokens: u64,
     avgdl: f32,
 }
@@ -131,7 +154,14 @@ impl Bm25 {
 
     /// 唯一词项数。
     pub fn term_count(&self) -> usize {
-        self.terms.len()
+        self.offsets.len().saturating_sub(1)
+    }
+
+    /// 取词项 `id` 的倒排切片（CSR 区间）。
+    #[inline]
+    fn postings_of(&self, id: u32) -> &[(u32, u32)] {
+        let id = id as usize;
+        &self.postings[self.offsets[id] as usize..self.offsets[id + 1] as usize]
     }
 
     /// 全库词项总数。
@@ -172,7 +202,7 @@ impl Bm25 {
         let mut scores = vec![0f32; n];
         let avgdl = self.avgdl.max(1e-6);
         for id in qterms {
-            let postings = &self.terms[id as usize];
+            let postings = self.postings_of(id);
             let df = postings.len() as f32;
             // Lucene 口径的 idf（恒正，避免 df > N/2 时出现负分）
             let idf = (1.0 + (n as f32 - df + 0.5) / (df + 0.5)).ln();
@@ -201,12 +231,12 @@ impl Bm25 {
 
     /// 序列化为自描述字节（宿主落盘；内核不写盘）。
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64 + self.terms.len() * 24);
+        let mut out = Vec::with_capacity(64 + self.postings.len() * 12 + self.offsets.len() * 16);
         out.extend_from_slice(&MAGIC);
         put_u32(&mut out, VERSION);
         put_u32(&mut out, self.docs.len() as u32);
         out.extend_from_slice(&self.total_tokens.to_le_bytes());
-        put_u32(&mut out, self.terms.len() as u32);
+        put_u32(&mut out, self.term_count() as u32);
         for d in &self.docs {
             put_u32(&mut out, *d);
         }
@@ -214,11 +244,12 @@ impl Bm25 {
             put_u32(&mut out, *l);
         }
         // term id → token（dict 是 token→id，这里反向取一次）
-        let mut tokens: Vec<&str> = vec![""; self.terms.len()];
+        let mut tokens: Vec<&str> = vec![""; self.term_count()];
         for (t, &id) in &self.dict {
-            tokens[id as usize] = t.as_str();
+            tokens[id as usize] = &**t;
         }
-        for (id, postings) in self.terms.iter().enumerate() {
+        for id in 0..self.term_count() {
+            let postings = self.postings_of(id as u32);
             let t = tokens[id].as_bytes();
             put_u32(&mut out, t.len() as u32);
             out.extend_from_slice(t);
@@ -257,15 +288,17 @@ impl Bm25 {
         for _ in 0..doc_cnt {
             doc_len.push(cur.u32()?);
         }
-        let mut dict: HashMap<String, u32> = HashMap::with_capacity(term_cnt);
-        let mut terms: Vec<Vec<(u32, u32)>> = Vec::with_capacity(term_cnt);
+        // 直接解进扁平 CSR：dict 只 insert（无查找），postings 顺序追加。
+        let mut dict: HashMap<Box<str>, u32> = HashMap::with_capacity(term_cnt);
+        let mut postings: Vec<(u32, u32)> = Vec::new();
+        let mut offsets: Vec<u32> = Vec::with_capacity(term_cnt + 1);
+        offsets.push(0);
         for id in 0..term_cnt {
             let len = cur.u32()? as usize;
-            let token = std::str::from_utf8(cur.take(len)?)
+            let token: Box<str> = std::str::from_utf8(cur.take(len)?)
                 .map_err(|e| RrkError::corrupt(format!("BM25 索引：词项非 UTF-8: {e}")))?
-                .to_string();
+                .into();
             let df = cur.varint()? as usize;
-            let mut postings = Vec::with_capacity(df);
             let mut prev = 0u32;
             for _ in 0..df {
                 let delta = cur.varint()?;
@@ -282,11 +315,11 @@ impl Bm25 {
                 prev = doc;
             }
             dict.insert(token, id as u32);
-            terms.push(postings);
+            offsets.push(postings.len() as u32);
         }
 
         let avgdl = if docs.is_empty() { 0.0 } else { total_tokens as f32 / docs.len() as f32 };
-        Ok(Bm25 { docs, doc_len, dict, terms, total_tokens, avgdl })
+        Ok(Bm25 { docs, doc_len, dict, postings, offsets, total_tokens, avgdl })
     }
 }
 
@@ -438,6 +471,82 @@ mod tests {
         assert!(Bm25::decode(&bad2).is_err());
         // 空输入
         assert!(Bm25::decode(&[]).is_err());
+    }
+
+    /// wire 格式回归：按模块文档的格式规范**独立**解析 `encode()` 输出，
+    /// 再用测试内的参考编码器重编码，必须逐字节一致——证明内存布局改为
+    /// CSR 后，字段、顺序、varint/delta 编码逻辑均未变。
+    #[test]
+    fn encode_wire_format_unchanged() {
+        let idx = build();
+        let bytes = idx.encode();
+
+        // ── 独立解析（只依赖文档里的格式说明，不碰内部布局）──
+        let mut c = Cursor { bytes: &bytes, pos: 0 };
+        assert_eq!(c.take(4).unwrap(), b"RRKI");
+        assert_eq!(c.u32().unwrap(), 1, "version 应为 1");
+        let doc_cnt = c.u32().unwrap() as usize;
+        let total_tokens = u64::from_le_bytes(c.take(8).unwrap().try_into().unwrap());
+        let term_cnt = c.u32().unwrap() as usize;
+        assert_eq!(doc_cnt, idx.doc_count());
+        assert_eq!(term_cnt, idx.term_count());
+        assert_eq!(total_tokens, idx.total_tokens());
+        let docs: Vec<u32> = (0..doc_cnt).map(|_| c.u32().unwrap()).collect();
+        let doc_len: Vec<u32> = (0..doc_cnt).map(|_| c.u32().unwrap()).collect();
+        assert_eq!(docs, vec![0, 1, 2, 3], "docs 按投喂顺序逐个 u32");
+        // handbook() 各章词项数（for_each_term 分词稳定，与旧实现同值）
+        assert_eq!(doc_len, vec![14, 16, 12, 13], "doc_len 段格式未变");
+        assert_eq!(total_tokens as u32, doc_len.iter().sum::<u32>());
+        let mut terms: Vec<(String, Vec<(u32, u32)>)> = Vec::with_capacity(term_cnt);
+        for _ in 0..term_cnt {
+            let len = c.u32().unwrap() as usize;
+            let token = std::str::from_utf8(c.take(len).unwrap()).unwrap().to_string();
+            let df = c.varint().unwrap();
+            let mut postings = Vec::with_capacity(df as usize);
+            let mut prev = 0u32;
+            for _ in 0..df {
+                let doc = prev + c.varint().unwrap();
+                let tf = c.varint().unwrap();
+                postings.push((doc, tf));
+                prev = doc;
+            }
+            assert!(postings.windows(2).all(|w| w[0].0 < w[1].0), "postings 按 doc 升序");
+            terms.push((token, postings));
+        }
+        assert_eq!(c.pos, bytes.len(), "解析后应恰好耗尽全部字节");
+
+        // ── 参考编码器（照格式注释独立实现）→ 必须与 encode() 逐字节一致 ──
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RRKI");
+        put_u32(&mut out, 1);
+        put_u32(&mut out, doc_cnt as u32);
+        out.extend_from_slice(&total_tokens.to_le_bytes());
+        put_u32(&mut out, term_cnt as u32);
+        for d in &docs {
+            put_u32(&mut out, *d);
+        }
+        for l in &doc_len {
+            put_u32(&mut out, *l);
+        }
+        for (t, postings) in &terms {
+            put_u32(&mut out, t.len() as u32);
+            out.extend_from_slice(t.as_bytes());
+            put_varint(&mut out, postings.len() as u32);
+            let mut prev = 0u32;
+            for &(doc, tf) in postings {
+                put_varint(&mut out, doc - prev);
+                put_varint(&mut out, tf);
+                prev = doc;
+            }
+        }
+        assert_eq!(out, bytes, "wire 格式（字段顺序/编码方式）应与改造前逐字节一致");
+
+        // ── decode 后 query 结果与内存态一致 ──
+        let back = Bm25::decode(&bytes).expect("应能解回");
+        assert_eq!(back.encode(), bytes);
+        for q in ["萧炎", "斗气", "修炼 斗气", "萧炎的"] {
+            assert_eq!(back.query(q, 4), idx.query(q, 4), "query({q}) 应一致");
+        }
     }
 
     #[test]

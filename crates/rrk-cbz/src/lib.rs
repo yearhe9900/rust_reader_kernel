@@ -179,7 +179,15 @@ pub struct CbzBook {
     /// 页序（按自然序排好）。
     pages: Vec<PageRef>,
     sizes: Vec<Option<(u32, u32)>>,
+    /// 最近渲染页缓存（(页, 目标宽) → 位图；保留 2 档：翻回 + resize 后回看）。
+    render_cache: std::sync::Mutex<Vec<Rendered>>,
 }
+
+/// 渲染缓存条目：(页, 目标宽, 宽, 高, RGBA)。
+type Rendered = (u32, u32, u32, u32, Vec<u8>);
+
+/// 渲染缓存容量（档位少：页位图大，只防最近动作的重复 inflate+解码）。
+const RENDER_CACHE_SLOTS: usize = 2;
 
 impl CbzBook {
     pub fn parse(src: &ContentSource) -> RrkResult<Self> {
@@ -192,13 +200,16 @@ impl CbzBook {
             return Err(RrkError::corrupt("CBZ: 无图片条目"));
         }
 
-        // 尺寸只解析头 8KB（懒解压头即可定尺寸的图；JPEG 长头兜底用完整解压）
+        // 尺寸只限流读条目前缀（64KB 内不解全图；头内定不出尺寸的
+        // 如超长 EXIF JPEG 才退全量解压）——开书不再逐页整图 inflate。
+        const SIZE_PROBE: usize = 64 * 1024;
         let mut sizes = Vec::with_capacity(pages.len());
         for p in &pages {
-            let size = zip
-                .entry(&p.zip_name)
-                .and_then(|entry| zip.read(entry).ok())
-                .and_then(|data| image_size(data.as_ref()));
+            let size = zip.entry(&p.zip_name).and_then(|entry| {
+                let head = zip.read_prefix(entry, SIZE_PROBE).ok()?;
+                image_size(&head)
+                    .or_else(|| zip.read(entry).ok().and_then(|d| image_size(&d)))
+            });
             sizes.push(size);
         }
 
@@ -216,7 +227,7 @@ impl CbzBook {
             cover: Some(ResourceKey("page:0".to_string())),
         };
 
-        Ok(Self { meta, zip, pages, sizes })
+        Ok(Self { meta, zip, pages, sizes, render_cache: std::sync::Mutex::new(Vec::new()) })
     }
 
     fn page_ref(&self, index: u32) -> RrkResult<&PageRef> {
@@ -361,8 +372,25 @@ impl BookSource for CbzBook {
         Ok(self.pages.iter().enumerate().map(|(i, _)| (i as ChapterId, 0)).collect())
     }
 
-    /// 页 = 图片：解码 + 缩放 → RGBA 位图（CBZ 的「原版页」即图片本体）。
+    /// 页 = 图片：优先走渲染缓存（免重复 inflate + 解码 + 缩放），未命中再解码并入缓存。
     fn render_page(&self, index: u32, target_width_px: u32) -> RrkResult<rrk_model::RenderResult> {
+        {
+            let cache = self
+                .render_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((_, _, w, h, rgba)) = cache
+                .iter()
+                .find(|(i, tw, _, _, _)| *i == index && *tw == target_width_px)
+            {
+                return Ok(rrk_model::RenderResult::Bitmap {
+                    width: *w,
+                    height: *h,
+                    rgba: rgba.clone(),
+                });
+            }
+        }
+
         let res = self.load_page_resource(index)?;
         let img = image::load_from_memory(&res.data)
             .map_err(|e| RrkError::corrupt(format!("CBZ 图片解码失败: {e}")))?;
@@ -376,11 +404,17 @@ impl BookSource for CbzBook {
             img
         };
         let rgba = resized.to_rgba8().into_raw();
-        Ok(rrk_model::RenderResult::Bitmap {
-            width: target_w,
-            height: target_h,
-            rgba,
-        })
+        {
+            let mut cache = self
+                .render_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= RENDER_CACHE_SLOTS {
+                cache.remove(0);
+            }
+            cache.push((index, target_width_px, target_w, target_h, rgba.clone()));
+        }
+        Ok(rrk_model::RenderResult::Bitmap { width: target_w, height: target_h, rgba })
     }
 }
 
