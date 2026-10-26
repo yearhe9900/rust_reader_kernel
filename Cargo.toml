@@ -26,7 +26,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/yearhe9900/rust_reader_kernel"
 
 [workspace.dependencies]
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp", "tiff"] }
 rrk-model = { path = "crates/rrk-model" }
 rrk-format = { path = "crates/rrk-format" }
 rrk-markup = { path = "crates/rrk-markup" }

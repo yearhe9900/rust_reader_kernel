@@ -847,6 +847,111 @@ pub unsafe extern "C" fn rrk_content_cache_stats(
     })
 }
 
+// ---------------------------------------------------------------------------
+// 进度 / 坐标映射 / 选区取文（进度条、UTF-16 绑定、标注——第三方接入面）
+// ---------------------------------------------------------------------------
+
+/// 语义坐标 → 全书进度百分比 [0,1]（估算口径，见 `Kernel::progress_of`）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_progress_of(
+    handle: BookHandle,
+    chapter: u32,
+    byte_offset: u32,
+    out_percent: *mut f32,
+) -> u32 {
+    guard(|| {
+        if out_percent.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        with_kernel(|k| {
+            *out_percent = k.progress_of(handle, chapter, byte_offset).map_err(set_kind)?;
+            Ok(0)
+        })
+    })
+}
+
+/// 进度百分比 [0,1] → `(chapter, 章内字节偏移)`（`rrk_progress_of` 的逆）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_locate(
+    handle: BookHandle,
+    percent: f32,
+    out_chapter: *mut u32,
+    out_offset: *mut u32,
+) -> u32 {
+    guard(|| {
+        if out_chapter.is_null() || out_offset.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        with_kernel(|k| {
+            let (c, o) = k.locate(handle, percent).map_err(set_kind)?;
+            *out_chapter = c;
+            *out_offset = o;
+            Ok(0)
+        })
+    })
+}
+
+/// 批量偏移映射：章文本 UTF-8 字节偏移 ↔ UTF-16 code unit 偏移。
+///
+/// `direction`：0 = 字节→UTF-16，1 = UTF-16→字节；输入 `in_ptr` 为 `count` 个
+/// u32 小端，输出缓冲同样为 `count` 个 u32 小端（调用方 `rrk_buf_free`）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_map_offsets(
+    handle: BookHandle,
+    chapter: u32,
+    direction: u32,
+    in_ptr: *const u32,
+    count: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        if count == 0 {
+            write_buf(Vec::new(), out_ptr, out_len);
+            return Ok(0);
+        }
+        if in_ptr.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        let offsets = std::slice::from_raw_parts(in_ptr, count);
+        with_kernel(|k| {
+            let mapped = k
+                .map_offsets(handle, chapter, direction == 0, offsets)
+                .map_err(set_kind)?;
+            let mut bytes = Vec::with_capacity(mapped.len() * 4);
+            for v in mapped {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            write_buf(bytes, out_ptr, out_len);
+            Ok(0)
+        })
+    })
+}
+
+/// 选区取文：`[start, end)` 夹到字符边界后返回章文本切片（UTF-8 缓冲）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_slice_text(
+    handle: BookHandle,
+    chapter: u32,
+    start: u32,
+    end: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        with_kernel(|k| {
+            let s = k.slice_text(handle, chapter, start, end).map_err(set_kind)?;
+            write_buf(s.into_bytes(), out_ptr, out_len);
+            Ok(0)
+        })
+    })
+}
 /// 从 FFI 原始参数构造样式（字体名非 UTF-8 → Invalid 参数错误）。
 unsafe fn style_from_raw(
     font_ptr: *const u8,

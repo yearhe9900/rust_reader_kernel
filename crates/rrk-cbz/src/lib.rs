@@ -392,8 +392,21 @@ impl BookSource for CbzBook {
         }
 
         let res = self.load_page_resource(index)?;
-        let img = image::load_from_memory(&res.data)
-            .map_err(|e| RrkError::corrupt(format!("CBZ 图片解码失败: {e}")))?;
+        let img = image::load_from_memory(&res.data).map_err(|e| {
+            // 模式 B（内核栅格化）只覆盖可解码格式；AVIF/HEIC 内核只做头解析——
+            // 明确报 UnsupportedFormat（宿主据 1002 回落模式 A：取原始字节自行解码），
+            // 不再混入 CorruptData 让宿主误判为文件损坏。
+            match rrk_image::sniff(&res.data) {
+                Some(fmt) if !fmt.decodable() => RrkError::unsupported(format!(
+                    "CBZ 页 {index}：{} 内核不做像素解码，请用模式 A 取原始字节自行解码",
+                    fmt.name()
+                )),
+                Some(_) => RrkError::corrupt(format!("CBZ 图片解码失败: {e}")),
+                None => RrkError::unsupported(format!(
+                    "CBZ 页 {index}：无法识别的图片格式（解码器: {e}），请用模式 A 取原始字节"
+                )),
+            }
+        })?;
         let w = img.width();
         let h = img.height();
         let target_w = target_width_px.max(1);

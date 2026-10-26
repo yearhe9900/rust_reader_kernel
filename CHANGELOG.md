@@ -9,6 +9,23 @@
 
 ### Added
 
+- **第三方接入面批次（ABI 8 追加，符号只增）**：
+  1. **进度 API**：`rrk_progress_of` / `rrk_locate`（kernel 同步提供）——按章权重的
+     估算口径，供进度条与跨设备同步；Dart `progressOf/locateByPercent`。
+  2. **UTF-16 偏移映射**：`rrk_map_offsets`（批量、单趟、代理对安全，方向可选）——
+     Dart/JS/Java/Swift 字符串索引皆 UTF-16，标注/选区必经；Dart `mapOffsets`。
+  3. **选区取文**：`rrk_slice_text`（夹到字符边界，免整章拉回）；Dart `sliceText`。
+  4. **C 头文件 `bindings/rrk.h`**（38 个导出手工同步）与
+     **《FFI 调用约定与线程安全》契约文档**（缓冲所有权 / 错误模型 / 线程安全
+     矩阵 / 坐标系速查），README 文档索引已挂。
+  5. **图片格式缺口修复（CBZ 白名单 vs 解码能力不对齐）**：`image` 启用纯 Rust
+     `tiff` 解码 feature；`rrk-image` 头部探测新增 TIFF（IFD0）与 AVIF/HEIC
+     （ISO-BMFF `ispe`）——这三类页尺寸不再为 0；`render_page` 对内核不可解码的
+     AVIF/HEIC 明确报 UnsupportedFormat（1002，宿主回落模式 A 取原始字节），
+     不再混入 CorruptData；`ImageFormat` 新增 Tiff/Avif/Heic（码值 5/6/7 只增）。
+  - 验证：cargo test --workspace 119 通过；dart analyze 无问题；release DLL +
+    Dart 端到端：进度往返、UTF-16 映射代理对往返、选区夹取、命中统计均正确。
+
 - **稳定错误码透出 FFI（issue #11，ABI 7 → 8）**：新增 `rrk_last_error_code() -> u32`，
   返回与 `rrk_last_error()` 消息同源的 `RrkErrorKind::code()`（1001–1999 只增不改，
   panic=2001，0=尚无记录）；Dart 封装同步（`_lastError` 不再硬编码 1001），

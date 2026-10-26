@@ -196,6 +196,172 @@ impl Kernel {
         Ok(content)
     }
 
+    // -----------------------------------------------------------------------
+    // 进度 / 坐标映射 / 选区取文（第三方接入期望：进度条、UTF-16 绑定、标注）
+    // -----------------------------------------------------------------------
+
+    /// 语义坐标 → 全书进度百分比 [0, 1]。
+    ///
+    /// **估算口径**：按各章权重（`estimate_weights`：重排类≈字数、CBZ 页级
+    /// 均分）线性插值，用于进度条与跨设备同步；精确定位请用
+    /// `locate → page_at → hit_test` 链路。越界自动夹取。
+    pub fn progress_of(
+        &mut self,
+        handle: BookHandle,
+        chapter: u32,
+        byte_offset: u32,
+    ) -> RrkResult<f32> {
+        let book = self.book_arc(handle)?;
+        let weights = book.estimate_weights()?;
+        if weights.is_empty() {
+            return Err(RrkError::invalid("无章索引，无法计算进度"));
+        }
+        let total: f64 = weights.iter().map(|(_, w)| *w as f64).sum();
+        if total <= 0.0 {
+            // 权重全 0（CBZ 页级）：章序均分
+            let pos = weights.iter().position(|(id, _)| *id == chapter).unwrap_or(0);
+            return Ok((pos as f64 / weights.len() as f64).clamp(0.0, 1.0) as f32);
+        }
+        let mut before = 0.0f64;
+        let mut w_chapter = 0.0f64;
+        for (id, w) in &weights {
+            if *id == chapter {
+                w_chapter = *w as f64;
+                break;
+            }
+            before += *w as f64;
+        }
+        let frac = self
+            .chapters_cached(handle)?
+            .into_iter()
+            .find(|e| e.id == chapter)
+            .map(|e| {
+                let len = e.byte_range.1.saturating_sub(e.byte_range.0);
+                if len == 0 {
+                    0.0
+                } else {
+                    (byte_offset as f64 / len as f64).clamp(0.0, 1.0)
+                }
+            })
+            .unwrap_or(0.0);
+        Ok(((before + w_chapter * frac) / total).clamp(0.0, 1.0) as f32)
+    }
+
+    /// 进度百分比 [0, 1] → 语义坐标（`progress_of` 的逆；同为估算口径）。
+    /// 返回 `(chapter, 章内字节偏移)`；建议再经 `page_at` 精确定页。
+    pub fn locate(&mut self, handle: BookHandle, percent: f32) -> RrkResult<(u32, u32)> {
+        let book = self.book_arc(handle)?;
+        let weights = book.estimate_weights()?;
+        if weights.is_empty() {
+            return Err(RrkError::invalid("无章索引，无法定位进度"));
+        }
+        let scaled = (percent as f64).clamp(0.0, 1.0) * weights.iter().map(|(_, w)| *w as f64).sum::<f64>();
+        if scaled <= 0.0 || weights.iter().all(|(_, w)| *w == 0) {
+            // 全 0 权重（CBZ）：按章序均分
+            let n = weights.len();
+            let idx = (((percent as f64).clamp(0.0, 1.0) * n as f64) as usize).min(n - 1);
+            return Ok((weights[idx].0, 0));
+        }
+        let mut acc = 0.0f64;
+        for (id, w) in &weights {
+            let w = *w as f64;
+            if acc + w >= scaled {
+                let frac = if w > 0.0 { ((scaled - acc) / w).clamp(0.0, 1.0) } else { 0.0 };
+                let offset = self
+                    .chapters_cached(handle)?
+                    .into_iter()
+                    .find(|e| e.id == *id)
+                    .map(|e| {
+                        let len = e.byte_range.1.saturating_sub(e.byte_range.0);
+                        (frac * len as f64) as u32
+                    })
+                    .unwrap_or(0);
+                return Ok((*id, offset));
+            }
+            acc += w;
+        }
+        // target == 1.0 边界：落最后一章末尾
+        let last = weights[weights.len() - 1].0;
+        let offset = self
+            .chapters_cached(handle)?
+            .into_iter()
+            .find(|e| e.id == last)
+            .map(|e| (e.byte_range.1 - e.byte_range.0) as u32)
+            .unwrap_or(0);
+        Ok((last, offset))
+    }
+
+    /// 批量偏移映射：章文本 UTF-8 字节偏移 ↔ UTF-16 code unit 偏移。
+    ///
+    /// `to_utf16=true`：输入字节偏移（越界夹取、非字符边界向下取整）→ UTF-16
+    /// 单元偏移；`false`：输入 UTF-16 偏移 → 字节偏移（落在代理对中间时取对首）。
+    /// 绑定语言（Dart/JS/Java/Swift）字符串皆 UTF-16，标注与选区必经此映射。
+    pub fn map_offsets(
+        &mut self,
+        handle: BookHandle,
+        chapter: u32,
+        to_utf16: bool,
+        offsets: &[u32],
+    ) -> RrkResult<Vec<u32>> {
+        let text = self.load_chapter_cached(handle, chapter)?.text;
+        let text = &*text;
+        let mut out = vec![0u32; offsets.len()];
+        // 输入可无序：排序后单趟前进扫，输出按原索引回填
+        let mut order: Vec<(usize, u32)> = offsets.iter().copied().enumerate().collect();
+        order.sort_by_key(|&(_, o)| o);
+        let mut bpos = 0usize;
+        let mut uacc = 0u32;
+        for (idx, raw) in order {
+            if to_utf16 {
+                let mut target = (raw as usize).min(text.len());
+                while target > 0 && !text.is_char_boundary(target) {
+                    target -= 1; // 非边界向下取整
+                }
+                while bpos < target {
+                    let ch = text[bpos..].chars().next().unwrap();
+                    bpos += ch.len_utf8();
+                    uacc += ch.len_utf16() as u32;
+                }
+                out[idx] = uacc;
+            } else {
+                while uacc < raw && bpos < text.len() {
+                    let ch = text[bpos..].chars().next().unwrap();
+                    if uacc + ch.len_utf16() as u32 > raw {
+                        break; // 代理对中间：停在对首
+                    }
+                    bpos += ch.len_utf8();
+                    uacc += ch.len_utf16() as u32;
+                }
+                out[idx] = bpos as u32;
+            }
+        }
+        Ok(out)
+    }
+
+    /// 选区取文：把 `[start, end)` 夹到字符边界后返回章文本切片（免整章拉回）。
+    pub fn slice_text(
+        &mut self,
+        handle: BookHandle,
+        chapter: u32,
+        start: u32,
+        end: u32,
+    ) -> RrkResult<String> {
+        let content = self.load_chapter_cached(handle, chapter)?;
+        let text = &*content.text;
+        let mut s = (start as usize).min(text.len());
+        let mut e = (end as usize).min(text.len());
+        while s > 0 && !text.is_char_boundary(s) {
+            s -= 1; // 起点向下取整（不半个字符）
+        }
+        while e < text.len() && !text.is_char_boundary(e) {
+            e += 1; // 终点向上取整（选中字符保持完整）
+        }
+        if s > e {
+            std::mem::swap(&mut s, &mut e);
+        }
+        Ok(text[s..e].to_string())
+    }
+
     /// 打开一本书（路径），返回句柄。
     pub fn open_path(&mut self, path: &str) -> RrkResult<BookHandle> {
         self.open(&ContentSource::from_path(path))
@@ -549,6 +715,73 @@ mod tests {
     fn fastrand() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
+
+    /// 进度 API：progress_of 与 locate 互逆（估算口径），单调且越界夹取。
+    #[test]
+    fn progress_and_locate_roundtrip() {
+        let mut k = Kernel::new();
+        let h = k.open_path("../../fixtures/sample.txt").unwrap();
+        let p0 = k.progress_of(h, 0, 0).unwrap();
+        assert!((p0 - 0.0).abs() < 1e-6, "首页应为 0：{p0}");
+        let p1 = k.progress_of(h, 1, 0).unwrap();
+        assert!(p1 > 0.5, "第二章起点应过半：{p1}");
+        let plast = k.progress_of(h, 1, u32::MAX).unwrap();
+        assert!((plast - 1.0).abs() < 1e-6, "末章末尾应为 1：{plast}");
+        // locate 逆变换：中点应落在中间章附近，且单调
+        let (c_mid, _) = k.locate(h, 0.5).unwrap();
+        assert!(c_mid <= 1, "50% 应落前两章：{c_mid}");
+        let (c_end, _) = k.locate(h, 1.0).unwrap();
+        assert_eq!(c_end, 1, "100% 应落最后一章");
+        let (c0, o0) = k.locate(h, 0.0).unwrap();
+        assert_eq!((c0, o0), (0, 0), "0% 应回章首");
+    }
+
+    /// UTF-16 映射：CJK + emoji（代理对）往返一致；无序批量正确回填。
+    #[test]
+    fn map_offsets_utf16_roundtrip() {
+        let mut k = Kernel::new();
+        let h = k.open_path("../../fixtures/sample.txt").unwrap();
+        // 用章内字节偏移采样，映射到 UTF-16 再映射回来
+        let text_len = {
+            let c = k.load_chapter_cached(h, 0).unwrap();
+            c.text.len() as u32
+        };
+        let samples = [0u32, 3, 9, text_len / 2, text_len];
+        let u16s = k.map_offsets(h, 0, true, &samples).unwrap();
+        assert_eq!(u16s.len(), samples.len());
+        assert!(u16s.windows(2).all(|w| w[0] <= w[1]), "单调不减");
+        let back = k.map_offsets(h, 0, false, &u16s).unwrap();
+        // 往返应回到字符边界上的原采样点（采样点本身是边界则完全相等）
+        for (orig, &b) in samples.iter().zip(back.iter()) {
+            let text = { let c = k.load_chapter_cached(h, 0).unwrap(); c.text };
+            let mut o = *orig as usize;
+            while o > 0 && !text.is_char_boundary(o) { o -= 1; }
+            assert_eq!(b as usize, o, "往返映射不一致（orig={orig}）");
+        }
+        // 无序输入：乱序给入也按位回填
+        let messy = [samples[3], samples[0], samples[1]];
+        let u = k.map_offsets(h, 0, true, &messy).unwrap();
+        assert_eq!(u[1], u16s[0]);
+        assert_eq!(u[2], u16s[1]);
+    }
+
+    /// 选区取文：越界夹取 + 字符边界对齐。
+    #[test]
+    fn slice_text_clamps() {
+        let mut k = Kernel::new();
+        let h = k.open_path("../../fixtures/sample.txt").unwrap();
+        let full = k.slice_text(h, 0, 0, u32::MAX).unwrap();
+        let text = { let c = k.load_chapter_cached(h, 0).unwrap(); c.text };
+        assert_eq!(full, &*text, "全范围应返回整章");
+        let mid = k.slice_text(h, 0, 3, 9).unwrap();
+        assert_eq!(mid, &text[3..9]);
+        // 非边界起点（4 落在 CJK 字中间）→ 向下取整到 3
+        let snapped = k.slice_text(h, 0, 4, 5).unwrap();
+        assert_eq!(snapped, &text[3..6.min(text.len())]);
+        // 反转区间自动交换
+        let swapped = k.slice_text(h, 0, 9, 3).unwrap();
+        assert_eq!(swapped, &text[3..9]);
     }
 
     /// 端到端：建索引 → 拉字节 → 从字节重载 → 查询结果一致。

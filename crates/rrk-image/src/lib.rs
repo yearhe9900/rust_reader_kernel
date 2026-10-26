@@ -14,7 +14,9 @@
 //! - PNG 编码自研（约 120 行 + 自算 CRC32），不引 `image` 的编码器：既减重，也避免
 //!   「解码器把整幅 RGBA 拷一遍」的峰值。`image` 仅作 dev-dependency 用于单测往返校验。
 //!
-//! 支持的格式：PNG / JPEG / GIF / BMP / WebP（与 `image` 依赖启用的解码器集合一致）。
+//! 支持的格式：PNG / JPEG / GIF / BMP / WebP（与 `image` 依赖启用的解码器集合一致），
+//! 头部探测另覆盖 TIFF 与 AVIF/HEIC（ISO-BMFF `ispe`，尺寸可得但内核不解像素——
+//! `render_page` 明确报 UnsupportedFormat，由宿主自行解码）。
 
 mod png;
 
@@ -30,6 +32,12 @@ pub enum ImageFormat {
     Gif,
     Bmp,
     Webp,
+    /// TIFF（头解析 + `image` 解码均支持）。
+    Tiff,
+    /// AVIF（头解析可得尺寸；像素解码归宿主）。
+    Avif,
+    /// HEIC/HEIF（头解析可得尺寸；像素解码归宿主）。
+    Heic,
 }
 
 impl ImageFormat {
@@ -41,6 +49,9 @@ impl ImageFormat {
             ImageFormat::Gif => "gif",
             ImageFormat::Bmp => "bmp",
             ImageFormat::Webp => "webp",
+            ImageFormat::Tiff => "tiff",
+            ImageFormat::Avif => "avif",
+            ImageFormat::Heic => "heic",
         }
     }
 
@@ -52,10 +63,19 @@ impl ImageFormat {
             ImageFormat::Gif => "image/gif",
             ImageFormat::Bmp => "image/bmp",
             ImageFormat::Webp => "image/webp",
+            ImageFormat::Tiff => "image/tiff",
+            ImageFormat::Avif => "image/avif",
+            ImageFormat::Heic => "image/heic",
         }
     }
 
-    /// FFI 整数编码：0=png 1=jpeg 2=gif 3=bmp 4=webp（只增不改）。
+    /// 内核能否解码像素（`render_page` 模式 B 的可用性）。
+    /// AVIF/HEIC 只做头解析，像素解码归宿主（模式 A 取原始字节）。
+    pub fn decodable(self) -> bool {
+        !matches!(self, ImageFormat::Avif | ImageFormat::Heic)
+    }
+
+    /// FFI 整数编码：0=png 1=jpeg 2=gif 3=bmp 4=webp 5=tiff 6=avif 7=heic（只增不改）。
     pub fn code(self) -> u32 {
         match self {
             ImageFormat::Png => 0,
@@ -63,6 +83,9 @@ impl ImageFormat {
             ImageFormat::Gif => 2,
             ImageFormat::Bmp => 3,
             ImageFormat::Webp => 4,
+            ImageFormat::Tiff => 5,
+            ImageFormat::Avif => 6,
+            ImageFormat::Heic => 7,
         }
     }
 }
@@ -85,6 +108,8 @@ pub fn dimensions(bytes: &[u8]) -> Option<ImageSize> {
         .or_else(|| gif(bytes))
         .or_else(|| bmp(bytes))
         .or_else(|| webp(bytes))
+        .or_else(|| tiff(bytes))
+        .or_else(|| heif_family(bytes))
 }
 
 fn nonzero(width: u32, height: u32, format: ImageFormat) -> Option<ImageSize> {
@@ -227,6 +252,124 @@ fn webp(data: &[u8]) -> Option<ImageSize> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// TIFF：II/MM 魔数 → IFD0 找 ImageWidth(256)/ImageLength(257)（有界扫描，不碰像素）
+// ---------------------------------------------------------------------------
+
+fn tiff(data: &[u8]) -> Option<ImageSize> {
+    let (le, ifd_off) = match data.get(0..8)? {
+        [b'I', b'I', 0x2A, 0x00, a, b, c, d] => {
+            (true, u32::from_le_bytes([*a, *b, *c, *d]) as usize)
+        }
+        [b'M', b'M', 0x00, 0x2A, a, b, c, d] => {
+            (false, u32::from_be_bytes([*a, *b, *c, *d]) as usize)
+        }
+        _ => return None, // BigTIFF(43) 等不在范围
+    };
+    let u16at = |p: usize| -> Option<u16> {
+        let b = data.get(p..p + 2)?;
+        Some(if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) })
+    };
+    let u32at = |p: usize| -> Option<u32> {
+        let b = data.get(p..p + 4)?;
+        Some(if le {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        })
+    };
+    let n = u16at(ifd_off)? as usize;
+    if n == 0 || n > 512 {
+        return None; // 防损坏数据深扫描
+    }
+    let mut w = 0u32;
+    let mut h = 0u32;
+    for k in 0..n {
+        let e = ifd_off + 2 + k * 12;
+        let tag = u16at(e)?;
+        if tag != 256 && tag != 257 {
+            continue;
+        }
+        let ty = u16at(e + 2)?;
+        // SHORT(3)/LONG(4) 两种常见宽高类型；值内联在 value/offset 字段
+        let v = match ty {
+            3 => {
+                if le {
+                    u16::from_le_bytes([*data.get(e + 8)?, *data.get(e + 9)?]) as u32
+                } else {
+                    u16::from_be_bytes([*data.get(e + 8)?, *data.get(e + 9)?]) as u32
+                }
+            }
+            4 => u32at(e + 8)?,
+            _ => continue,
+        };
+        if tag == 256 {
+            w = v;
+        } else {
+            h = v;
+        }
+    }
+    nonzero(w, h, ImageFormat::Tiff)
+}
+
+// ---------------------------------------------------------------------------
+// AVIF/HEIC（ISO-BMFF）：ftyp 认家族 → 顶层 meta/iprp/ipco 里取首个 ispe
+// ---------------------------------------------------------------------------
+
+fn heif_family(data: &[u8]) -> Option<ImageSize> {
+    if data.len() < 16 || &data[4..8] != b"ftyp" {
+        return None;
+    }
+    let is_avif = matches!(&data[8..12], b"avif" | b"avis");
+    let is_heic = matches!(
+        &data[8..12],
+        b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1" | b"heim" | b"heis"
+    );
+    if !is_avif && !is_heic {
+        return None;
+    }
+    let format = if is_avif { ImageFormat::Avif } else { ImageFormat::Heic };
+    let meta = find_box(data, 0, data.len(), b"meta")?;
+    // meta 是 FullBox：跳 4 字节 version+flags 再遍子盒
+    let inner = (meta.0 + 4).min(meta.1);
+    let iprp = find_box(data, inner, meta.1, b"iprp")?;
+    let ipco = find_box(data, iprp.0, iprp.1, b"ipco")?;
+    let ispe = find_box(data, ipco.0, ipco.1, b"ispe")?;
+    // ispe 也是 FullBox：body 起 4 字节 version+flags 后是 u32 宽、u32 高
+    let p = ispe.0 + 4;
+    let w = u32::from_be_bytes(data.get(p..p + 4)?.try_into().ok()?);
+    let h = u32::from_be_bytes(data.get(p + 4..p + 8)?.try_into().ok()?);
+    nonzero(w, h, format)
+}
+
+/// 在 [from, to) 区间顺序找顶层盒，返回其 body 区间（8 字节盒头之后）。
+fn find_box(data: &[u8], from: usize, to: usize, fourcc: &[u8; 4]) -> Option<(usize, usize)> {
+    let mut i = from;
+    let mut steps = 0usize;
+    while i + 8 <= to && steps < 64 {
+        steps += 1;
+        let size = u32::from_be_bytes(data[i..i + 4].try_into().ok()?) as usize;
+        let typ = &data[i + 4..i + 8];
+        let (body, next) = match size {
+            0 => (i + 8, to), // size=0 = 延伸到父盒尾
+            1 => {
+                let big = u64::from_be_bytes(data.get(i + 8..i + 16)?.try_into().ok()?) as usize;
+                (i + 16, i + big)
+            }
+            s if s >= 8 => (i + 8, i + s),
+            _ => return None,
+        };
+        if next > to || body > to {
+            return None;
+        }
+        if typ == fourcc {
+            return Some((body, next));
+        }
+        i = next;
+    }
+    None
+}
+
 /// 按 MIME/扩展名归一到 [`ImageFormat`]（宿主按资源名分流时用）。
 pub fn format_of_name(name: &str) -> Option<ImageFormat> {
     let lower = name.rsplit('.').next()?.to_ascii_lowercase();
@@ -236,6 +379,9 @@ pub fn format_of_name(name: &str) -> Option<ImageFormat> {
         "gif" => Some(ImageFormat::Gif),
         "bmp" | "dib" => Some(ImageFormat::Bmp),
         "webp" => Some(ImageFormat::Webp),
+        "tif" | "tiff" => Some(ImageFormat::Tiff),
+        "avif" => Some(ImageFormat::Avif),
+        "heic" | "heif" => Some(ImageFormat::Heic),
         _ => None,
     }
 }
@@ -248,7 +394,7 @@ pub fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
 /// 校验 + 取出尺寸，失败给中文原因（FFI 出口用）。
 pub fn dimensions_strict(bytes: &[u8]) -> RrkResult<ImageSize> {
     dimensions(bytes).ok_or_else(|| {
-        RrkError::unsupported("无法识别的图片格式（支持 PNG/JPEG/GIF/BMP/WebP）")
+        RrkError::unsupported("无法识别的图片格式（支持 PNG/JPEG/GIF/BMP/WebP/TIFF/AVIF/HEIC）")
     })
 }
 
@@ -384,9 +530,110 @@ mod tests {
     #[test]
     fn name_and_sniff() {
         assert_eq!(format_of_name("a/b/PIC.JPEG"), Some(ImageFormat::Jpeg));
-        assert_eq!(format_of_name("x.avif"), None);
+        assert_eq!(format_of_name("x.avif"), Some(ImageFormat::Avif));
+        assert_eq!(format_of_name("x.heic"), Some(ImageFormat::Heic));
+        assert_eq!(format_of_name("x.tif"), Some(ImageFormat::Tiff));
         assert_eq!(sniff(&png_header(1, 1)), Some(ImageFormat::Png));
         assert_eq!(ImageFormat::Webp.mime(), "image/webp");
         assert_eq!(ImageFormat::Bmp.code(), 3);
+        assert_eq!(ImageFormat::Tiff.code(), 5);
+        assert!(ImageFormat::Tiff.decodable());
+        assert!(!ImageFormat::Avif.decodable(), "AVIF 像素解码归宿主");
+    }
+
+    /// TIFF 头解析：II LE 与 MM BE 两种字节序，SHORT/LONG 两种宽高类型。
+    #[test]
+    fn tiff_header_probe() {
+        fn tiff_ifd(le: bool, tag_type: u16, w: u32, h: u32) -> Vec<u8> {
+            let mut v = Vec::new();
+            if le {
+                v.extend_from_slice(b"II*\x00");
+                v.extend_from_slice(&8u32.to_le_bytes()); // IFD 在偏移 8
+                v.extend_from_slice(&2u16.to_le_bytes()); // 2 个条目
+                for (tag, val) in [(256u16, w), (257, h)] {
+                    v.extend_from_slice(&tag.to_le_bytes());
+                    v.extend_from_slice(&tag_type.to_le_bytes());
+                    v.extend_from_slice(&1u32.to_le_bytes());
+                    if tag_type == 3 {
+                        v.extend_from_slice(&(val as u16).to_le_bytes());
+                        v.extend_from_slice(&[0, 0]);
+                    } else {
+                        v.extend_from_slice(&val.to_le_bytes());
+                    }
+                }
+            } else {
+                v.extend_from_slice(b"MM\x00*");
+                v.extend_from_slice(&8u32.to_be_bytes());
+                v.extend_from_slice(&2u16.to_be_bytes());
+                for (tag, val) in [(256u16, w), (257, h)] {
+                    v.extend_from_slice(&tag.to_be_bytes());
+                    v.extend_from_slice(&tag_type.to_be_bytes());
+                    v.extend_from_slice(&1u32.to_be_bytes());
+                    if tag_type == 3 {
+                        v.extend_from_slice(&(val as u16).to_be_bytes());
+                        v.extend_from_slice(&[0, 0]);
+                    } else {
+                        v.extend_from_slice(&val.to_be_bytes());
+                    }
+                }
+            }
+            v
+        }
+        assert_eq!(dimensions(&tiff_ifd(true, 3, 640, 480)), Some(size(640, 480, ImageFormat::Tiff)));
+        assert_eq!(dimensions(&tiff_ifd(true, 4, 1024, 768)), Some(size(1024, 768, ImageFormat::Tiff)));
+        assert_eq!(dimensions(&tiff_ifd(false, 4, 33, 44)), Some(size(33, 44, ImageFormat::Tiff)));
+        // BigTIFF / 截断 → None
+        assert!(dimensions(b"II+\x00\x08\x00\x00\x00").is_none());
+        assert!(dimensions(b"II*\x00\x08").is_none());
+    }
+
+    /// AVIF/HEIC：ftyp + meta/iprp/ipco/ispe 盒链取尺寸；坏盒不 panic。
+    #[test]
+    fn heif_ispe_probe() {
+        fn bmff(brand: &[u8; 4], w: u32, h: u32) -> Vec<u8> {
+            let mut v = Vec::new();
+            // ftyp：size(4) + 'ftyp' + major brand + minor + compatible
+            let ftyp_body = [brand.as_slice(), &0u32.to_be_bytes(), b"mif1avif"].concat();
+            v.extend_from_slice(&((ftyp_body.len() + 8) as u32).to_be_bytes());
+            v.extend_from_slice(b"ftyp");
+            v.extend_from_slice(&ftyp_body);
+            // ispe：FullBox + 宽高
+            let mut ispe = Vec::new();
+            ispe.extend_from_slice(&16u32.to_be_bytes());
+            ispe.extend_from_slice(b"ispe");
+            ispe.extend_from_slice(&0u32.to_be_bytes());
+            ispe.extend_from_slice(&w.to_be_bytes());
+            ispe.extend_from_slice(&h.to_be_bytes());
+            // ipco
+            let mut ipco = Vec::new();
+            ipco.extend_from_slice(&((ispe.len() + 8) as u32).to_be_bytes());
+            ipco.extend_from_slice(b"ipco");
+            ipco.extend_from_slice(&ispe);
+            // iprp
+            let mut iprp = Vec::new();
+            iprp.extend_from_slice(&((ipco.len() + 8) as u32).to_be_bytes());
+            iprp.extend_from_slice(b"iprp");
+            iprp.extend_from_slice(&ipco);
+            // meta（FullBox：头后 4 字节 version+flags）
+            let mut meta = Vec::new();
+            meta.extend_from_slice(&((iprp.len() + 12) as u32).to_be_bytes());
+            meta.extend_from_slice(b"meta");
+            meta.extend_from_slice(&0u32.to_be_bytes());
+            meta.extend_from_slice(&iprp);
+            v.extend_from_slice(&meta);
+            v
+        }
+        assert_eq!(dimensions(&bmff(b"avif", 800, 600)), Some(size(800, 600, ImageFormat::Avif)));
+        assert_eq!(dimensions(&bmff(b"heic", 320, 240)), Some(size(320, 240, ImageFormat::Heic)));
+        assert_eq!(dimensions(&bmff(b"mif1", 32, 64)), Some(size(32, 64, ImageFormat::Heic)));
+        // 非 heif 家族（mp42）→ None；缺 ispe → None
+        assert!(dimensions(&bmff(b"mp42", 1, 1)).is_none());
+        let mut broken = bmff(b"avif", 10, 10);
+        broken.truncate(20);
+        assert!(dimensions(&broken).is_none());
+    }
+
+    fn size(w: u32, h: u32, format: ImageFormat) -> ImageSize {
+        ImageSize { width: w, height: h, format }
     }
 }

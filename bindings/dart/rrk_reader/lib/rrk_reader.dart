@@ -39,6 +39,18 @@ typedef _ErrorNative = Uint32 Function(Pointer<Pointer<Uint8>>, Pointer<IntPtr>)
 typedef _ErrorDart = int Function(Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _ErrorCodeNative = Uint32 Function();
 typedef _ErrorCodeDart = int Function();
+typedef _ProgressNative = Uint32 Function(Uint64, Uint32, Uint32, Pointer<Float>);
+typedef _ProgressDart = int Function(int, int, int, Pointer<Float>);
+typedef _LocateNative = Uint32 Function(Uint64, Float, Pointer<Uint32>, Pointer<Uint32>);
+typedef _LocateDart = int Function(int, double, Pointer<Uint32>, Pointer<Uint32>);
+typedef _MapOffsetsNative = Uint32 Function(
+    Uint64, Uint32, Uint32, Pointer<Uint32>, IntPtr, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _MapOffsetsDart = int Function(
+    int, int, int, Pointer<Uint32>, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _SliceNative = Uint32 Function(
+    Uint64, Uint32, Uint32, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _SliceDart = int Function(
+    int, int, int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _PagesNative = Uint32 Function(Uint64, Uint32, Pointer<Utf8>, IntPtr, Float, Float,
     Float, Uint32, Float, Float, Float, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _PagesDart = int Function(int, int, Pointer<Utf8>, int, double, double, double, int,
@@ -126,6 +138,12 @@ class _Bindings {
             lib.lookupFunction<_CacheCfgNative, _CacheCfgDart>('rrk_content_cache_configure'),
         contentCacheStats =
             lib.lookupFunction<_ErrorNative, _ErrorDart>('rrk_content_cache_stats'),
+        progressOf =
+            lib.lookupFunction<_ProgressNative, _ProgressDart>('rrk_progress_of'),
+        locate = lib.lookupFunction<_LocateNative, _LocateDart>('rrk_locate'),
+        mapOffsets =
+            lib.lookupFunction<_MapOffsetsNative, _MapOffsetsDart>('rrk_map_offsets'),
+        sliceText = lib.lookupFunction<_SliceNative, _SliceDart>('rrk_slice_text'),
         loadChapter =
             lib.lookupFunction<_LoadChapterNative, _LoadChapterDart>('rrk_load_chapter'),
         pagesJson = lib.lookupFunction<_PagesNative, _PagesDart>('rrk_pages_json'),
@@ -166,6 +184,10 @@ class _Bindings {
   final _ErrorCodeDart lastErrorCode;
   final _CacheCfgDart contentCacheConfigure;
   final _ErrorDart contentCacheStats;
+  final _ProgressDart progressOf;
+  final _LocateDart locate;
+  final _MapOffsetsDart mapOffsets;
+  final _SliceDart sliceText;
   final _LoadChapterDart loadChapter;
   final _PagesDart pagesJson;
   final _PageAtDart pageAt;
@@ -915,6 +937,81 @@ class RrkBook {
     } finally {
       malloc.free(fontPtr);
       malloc.free(out);
+    }
+  }
+
+  /// 语义坐标 → 全书进度 [0,1]（估算口径：按章权重，进度条/跨设备同步用）。
+  double progressOf(int chapterId, int byteOffset) {
+    _check();
+    final out = malloc<Float>();
+    try {
+      final code = _bindings.progressOf(_handle, chapterId, byteOffset, out);
+      if (code != 0) _throwCode(code);
+      return out.value;
+    } finally {
+      malloc.free(out);
+    }
+  }
+
+  /// 进度 [0,1] → (chapterId, 章内字节偏移)；建议再经 pageAt 精确定页。
+  (int, int) locateByPercent(double percent) {
+    _check();
+    final c = malloc<Uint32>();
+    final o = malloc<Uint32>();
+    try {
+      final code = _bindings.locate(_handle, percent, c, o);
+      if (code != 0) _throwCode(code);
+      return (c.value, o.value);
+    } finally {
+      malloc.free(c);
+      malloc.free(o);
+    }
+  }
+
+  /// 批量偏移映射：章文本 UTF-8 字节偏移 ↔ UTF-16 code unit 偏移
+  /// （Dart 字符串即 UTF-16，标注/选区必经）。非边界自动夹取（详见内核文档）。
+  List<int> mapOffsets(int chapterId, List<int> offsets,
+      {bool toUtf16 = true}) {
+    _check();
+    if (offsets.isEmpty) return const [];
+    final b = _bindings;
+    final inPtr = malloc<Uint32>(offsets.length);
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      for (var i = 0; i < offsets.length; i++) {
+        inPtr[i] = offsets[i];
+      }
+      final code = b.mapOffsets(_handle, chapterId, toUtf16 ? 0 : 1, inPtr,
+          offsets.length, outPtr, outLen);
+      if (code != 0) _throwCode(code);
+      final bytes = RrkEngine._takeBytes(b, outPtr.value, outLen.value) ??
+          Uint8List(0);
+      final bd = ByteData.sublistView(bytes);
+      return [
+        for (var i = 0; i + 4 <= bytes.length; i += 4)
+          bd.getUint32(i, Endian.little)
+      ];
+    } finally {
+      malloc.free(inPtr);
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 选区取文：`[start, end)` 夹到字符边界后返回章文本切片（免整章拉回）。
+  String sliceText(int chapterId, int start, int end) {
+    _check();
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.sliceText(_handle, chapterId, start, end, outPtr, outLen);
+      if (code != 0) _throwCode(code);
+      return RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '';
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
     }
   }
 

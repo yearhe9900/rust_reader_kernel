@@ -89,7 +89,20 @@ dart run example/smoke.dart <ffi库路径> <书路径>
 API 概览：`RrkEngine.init/openBook` → `meta()/toc()/chapters()/loadChapter()`
 → `pagesOf()/pageAt()/hitTest()/prefetch()`（排版与进度）→ `renderPage()`（整页位图）
 → `search()/buildIndex()`（全书检索与 BM25 索引）→ `RrkImage.*`（尺寸头解析 / BGRA→PNG）
-→ `configureContentCache()/contentCacheStatsJson()`（内容级缓存，见下）。
+→ `configureContentCache()/contentCacheStatsJson()`（内容级缓存，见下）
+→ `progressOf()/locateByPercent()/mapOffsets()/sliceText()`（进度与坐标，见下）。
+
+C 接入方请直接用头文件 [`bindings/rrk.h`](bindings/rrk.h)；线程安全与调用约定见
+[`docs/FFI-调用约定与线程安全.md`](docs/FFI-调用约定与线程安全.md)。
+
+#### 进度与坐标（`rrk_progress_of` / `rrk_locate` / `rrk_map_offsets` / `rrk_slice_text`）
+
+- **进度**：`progressOf(chapter, byteOffset) -> [0,1]` 与其逆 `locateByPercent`——
+  按章权重估算的口径，专供进度条与跨设备同步；精确定位仍走 `pageAt/hitTest`。
+- **UTF-16 映射**：`mapOffsets(chapter, offsets, {toUtf16})`——Dart/JS/Java/Swift
+  字符串索引皆 UTF-16 code unit，标注/选区必经；代理对安全，批量单趟。
+- **选区取文**：`sliceText(chapter, start, end)`——夹到字符边界后返回切片，
+  免为取一段选区拉回整章。
 
 #### 稳定错误码（ABI 契约，只增不改）
 
@@ -190,6 +203,7 @@ rust_reader_kernel/
 | [设计-极速开书与渲染统一方案](docs/设计-极速开书与渲染统一方案.md) | 解析/渲染统一数据面 |
 | [分析-渲染层性能与按需渲染改造方案](docs/分析-渲染层性能与按需渲染改造方案.md) | 按需渲染分析 |
 | [设计-检索与BM25索引](docs/设计-检索与BM25索引.md) | 全书搜索会话、偏移映射、BM25 索引格式 |
+| [FFI 调用约定与线程安全](docs/FFI-调用约定与线程安全.md) | C ABI 契约：缓冲所有权、错误模型、线程安全矩阵、坐标系速查（配头文件 `bindings/rrk.h`） |
 | [性能-排版与解析基准](docs/性能-排版与解析基准.md) | 实测数据与验收判据 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
 
