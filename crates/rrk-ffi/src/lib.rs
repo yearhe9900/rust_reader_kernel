@@ -22,7 +22,8 @@ use rrk_model::{
 };
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
-pub const RRK_ABI_VERSION: u32 = 7;
+/// v8 = 新增 `rrk_last_error_code` / `rrk_content_cache_*`（issue #11、#12）。
+pub const RRK_ABI_VERSION: u32 = 8;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -34,11 +35,12 @@ static LAYOUTER: Mutex<Option<rrk_layout::Layouter>> = Mutex::new(None);
 static CACHE: Mutex<Option<(rrk_cache::DiskStore, rrk_cache::MemoryCache)>> = Mutex::new(None);
 
 thread_local! {
-    static LAST_ERROR: RefCell<String> = RefCell::new(String::new());
+    /// 最近一次错误：稳定错误码（0 = 尚无记录） + 消息。
+    static LAST_ERROR: RefCell<(u32, String)> = RefCell::new((0, String::new()));
 }
 
-fn set_last_error(msg: impl Into<String>) {
-    LAST_ERROR.with(|e| *e.borrow_mut() = msg.into());
+fn set_last_error(code: u32, msg: impl Into<String>) {
+    LAST_ERROR.with(|e| *e.borrow_mut() = (code, msg.into()));
 }
 
 fn with_kernel<T>(f: impl FnOnce(&mut Kernel) -> Result<T, u32>) -> Result<T, u32> {
@@ -50,7 +52,7 @@ fn with_kernel<T>(f: impl FnOnce(&mut Kernel) -> Result<T, u32>) -> Result<T, u3
 }
 
 fn set_err(e: RrkError, code: u32) -> u32 {
-    set_last_error(e.to_string());
+    set_last_error(code, e.to_string());
     code
 }
 
@@ -64,7 +66,7 @@ fn guard(f: impl FnOnce() -> Result<u32, u32>) -> u32 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(r) => r.unwrap_or_else(|code| code),
         Err(_) => {
-            set_last_error("内部 panic（已拦截）");
+            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
             ERR_PANIC
         }
     }
@@ -111,10 +113,18 @@ pub unsafe extern "C" fn rrk_last_error(out_ptr: *mut *mut u8, out_len: *mut usi
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        let msg = LAST_ERROR.with(|e| e.borrow().clone());
+        let msg = LAST_ERROR.with(|e| e.borrow().1.clone());
         write_buf(msg.into_bytes(), out_ptr, out_len);
         Ok(0)
     })
+}
+
+/// 取最近一次错误的**稳定错误码**（issue #11）：`RrkErrorKind::code()`
+/// （1001–1999，只增不改，码值表见 README）；panic = 2001；0 = 本线程尚无错误。
+/// 与 `rrk_last_error` 的消息来自同一次错误（设置时一并写入）。
+#[no_mangle]
+pub extern "C" fn rrk_last_error_code() -> u32 {
+    LAST_ERROR.with(|e| e.borrow().0)
 }
 
 // ---------------------------------------------------------------------------
@@ -344,14 +354,14 @@ fn blocks_json(text: &str, blocks: &[Block]) -> Vec<u8> {
 pub unsafe extern "C" fn rrk_open(path: *const u8, path_len: usize) -> u64 {
     match catch_unwind(AssertUnwindSafe(|| {
         if path.is_null() {
-            set_last_error("路径为空指针");
+            set_last_error(RrkErrorKind::InvalidParam.code(), "路径为空指针");
             return 0;
         }
         let bytes = std::slice::from_raw_parts(path, path_len);
         let path = match std::str::from_utf8(bytes) {
             Ok(s) => s.to_string(),
             Err(e) => {
-                set_last_error(format!("路径非 UTF-8: {e}"));
+                set_last_error(RrkErrorKind::InvalidParam.code(), format!("路径非 UTF-8: {e}"));
                 return 0;
             }
         };
@@ -362,7 +372,7 @@ pub unsafe extern "C" fn rrk_open(path: *const u8, path_len: usize) -> u64 {
     })) {
         Ok(h) => h,
         Err(_) => {
-            set_last_error("内部 panic（已拦截）");
+            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
             0
         }
     }
@@ -403,10 +413,11 @@ pub unsafe extern "C" fn rrk_toc_json(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
-        let toc = book.toc().map_err(set_kind)?;
-        write_buf(toc_json(&toc), out_ptr, out_len);
-        Ok(0)
+        with_kernel(|k| {
+            let toc = k.toc_cached(handle).map_err(set_kind)?;
+            write_buf(toc_json(&toc), out_ptr, out_len);
+            Ok(0)
+        })
     })
 }
 
@@ -421,10 +432,11 @@ pub unsafe extern "C" fn rrk_chapters_json(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
-        let chapters = book.chapters().map_err(set_kind)?;
-        write_buf(chapters_json(&chapters), out_ptr, out_len);
-        Ok(0)
+        with_kernel(|k| {
+            let chapters = k.chapters_cached(handle).map_err(set_kind)?;
+            write_buf(chapters_json(&chapters), out_ptr, out_len);
+            Ok(0)
+        })
     })
 }
 
@@ -452,14 +464,16 @@ pub unsafe extern "C" fn rrk_load_chapter(
         {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
-        let content = book.load_chapter(chapter_id).map_err(set_kind)?;
-        let blocks = blocks_json(&content.text, &content.blocks);
-        let links = links_json(&content.link_ranges);
-        write_buf(content.text.as_bytes().to_vec(), text_ptr, text_len);
-        write_buf(blocks, blocks_ptr, blocks_len);
-        write_buf(links, links_ptr, links_len);
-        Ok(0)
+        with_kernel(|k| {
+            // 内容级缓存（issue #12）：命中免 inflate + 清洗 + 分块
+            let content = k.load_chapter_cached(handle, chapter_id).map_err(set_kind)?;
+            let blocks = blocks_json(&content.text, &content.blocks);
+            let links = links_json(&content.link_ranges);
+            write_buf(content.text.as_bytes().to_vec(), text_ptr, text_len);
+            write_buf(blocks, blocks_ptr, blocks_len);
+            write_buf(links, links_ptr, links_len);
+            Ok(0)
+        })
     })
 }
 
@@ -527,6 +541,25 @@ mod tests {
         assert_eq!(rc, 0);
         assert!(n > 0);
         unsafe { rrk_buf_free(p, n) };
+    }
+
+    /// issue #11：`rrk_last_error_code` 与消息同源，返回稳定错误码。
+    #[test]
+    fn last_error_code_stable() {
+        // 尚无记录 → 0（或上一个测试留下的码，但必是合法码）
+        let c0 = rrk_last_error_code();
+        assert!(c0 == 0 || (1001..=2001).contains(&c0), "非法码: {c0}");
+        // 打开不存在的文件 → 非 0 稳定码（Io/InvalidParam 之一）
+        let h = unsafe { rrk_open(b"definitely-missing.txt\0".as_ptr(), 23) };
+        assert_eq!(h, 0);
+        let c1 = rrk_last_error_code();
+        assert!(c1 != 0, "失败后应有错误码");
+        assert!((1001..=1999).contains(&c1), "应是 RrkErrorKind 稳定码: {c1}");
+        // 空指针参数 → InvalidParam（1004）
+        let mut n = 0usize;
+        let rc = unsafe { rrk_meta_json(0, std::ptr::null_mut(), &mut n) };
+        assert!(rc != 0);
+        assert_eq!(rrk_last_error_code(), 1004, "空指针应为 InvalidParam");
     }
 
     #[test]
@@ -761,6 +794,55 @@ pub unsafe extern "C" fn rrk_cache_configure(
             let store = rrk_cache::DiskStore::open(&dir).map_err(set_kind)?;
             Some((store, rrk_cache::MemoryCache::new(mem_bytes.max(1 << 20))))
         };
+        Ok(0)
+    })
+}
+
+/// 配置**内容级**缓存（issue #12：目录树 / 章文本 / 章大纲；命中免重新解析）。
+///
+/// key 只含 `content_hash`（不随样式/视口变）：内容变了整本失效，同文件重开
+/// 命中；空路径 = 关闭。与布局缓存（`rrk_cache_configure`）互不干扰。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_content_cache_configure(
+    dir_ptr: *const u8,
+    dir_len: usize,
+    mem_bytes: usize,
+) -> u32 {
+    guard(|| {
+        let dir = if dir_ptr.is_null() || dir_len == 0 {
+            String::new()
+        } else {
+            match std::str::from_utf8(std::slice::from_raw_parts(dir_ptr, dir_len)) {
+                Ok(s) => s.to_string(),
+                Err(e) => return Err(set_kind(RrkError::invalid(format!("缓存目录非 UTF-8: {e}")))),
+            }
+        };
+        with_kernel(|k| {
+            k.configure_content_cache(&dir, mem_bytes).map_err(set_kind)?;
+            Ok(0)
+        })
+    })
+}
+
+/// 内容级缓存命中统计 JSON（issue #12：可观测性）：
+/// `{"toc":{"hits","misses"},"chapter":{...},"outline":{...}}`。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_content_cache_stats(
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        let s = with_kernel(|k| Ok(k.content_cache_stats()))?;
+        let mut out = String::with_capacity(160);
+        let _ = write!(
+            out,
+            "{{\"toc\":{{\"hits\":{},\"misses\":{}}},\"chapter\":{{\"hits\":{},\"misses\":{}}},\"outline\":{{\"hits\":{},\"misses\":{}}}}}",
+            s.toc_hits, s.toc_misses, s.chapter_hits, s.chapter_misses, s.outline_hits, s.outline_misses
+        );
+        write_buf(out.into_bytes(), out_ptr, out_len);
         Ok(0)
     })
 }
@@ -1164,7 +1246,7 @@ pub unsafe extern "C" fn rrk_search_open(
     })) {
         Ok(id) => id,
         Err(_) => {
-            set_last_error("内部 panic（已拦截）");
+            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
             0
         }
     }
@@ -1212,7 +1294,7 @@ pub extern "C" fn rrk_bm25_open(handle: BookHandle) -> u64 {
     })) {
         Ok(id) => id,
         Err(_) => {
-            set_last_error("内部 panic（已拦截）");
+            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
             0
         }
     }
@@ -1223,7 +1305,7 @@ pub extern "C" fn rrk_bm25_open(handle: BookHandle) -> u64 {
 pub unsafe extern "C" fn rrk_bm25_load(data_ptr: *const u8, data_len: usize) -> u64 {
     match catch_unwind(AssertUnwindSafe(|| {
         if data_ptr.is_null() || data_len == 0 {
-            set_last_error("索引字节为空");
+            set_last_error(RrkErrorKind::InvalidParam.code(), "索引字节为空");
             return 0;
         }
         let bytes = std::slice::from_raw_parts(data_ptr, data_len);
@@ -1231,7 +1313,7 @@ pub unsafe extern "C" fn rrk_bm25_load(data_ptr: *const u8, data_len: usize) -> 
     })) {
         Ok(id) => id,
         Err(_) => {
-            set_last_error("内部 panic（已拦截）");
+            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
             0
         }
     }

@@ -88,7 +88,39 @@ dart run example/smoke.dart <ffi库路径> <书路径>
 
 API 概览：`RrkEngine.init/openBook` → `meta()/toc()/chapters()/loadChapter()`
 → `pagesOf()/pageAt()/hitTest()/prefetch()`（排版与进度）→ `renderPage()`（整页位图）
-→ `search()/buildIndex()`（全书检索与 BM25 索引）→ `RrkImage.*`（尺寸头解析 / BGRA→PNG）。
+→ `search()/buildIndex()`（全书检索与 BM25 索引）→ `RrkImage.*`（尺寸头解析 / BGRA→PNG）
+→ `configureContentCache()/contentCacheStatsJson()`（内容级缓存，见下）。
+
+#### 稳定错误码（ABI 契约，只增不改）
+
+任何入口失败后，除返回码（非 0）外，可用 `rrk_last_error_code()` 取**稳定错误码**，
+配合 `rrk_last_error()` 的中文/调试消息——宿主应按码值映射用户文案，勿对消息做
+字符串匹配（消息可随调试需要变更）。
+
+| 码值 | 枚举（`rrk_model::RrkErrorKind`） | 含义 |
+|------|----------------------------------|------|
+| 1001 | `Io` | IO 失败（文件不存在/不可读等） |
+| 1002 | `UnsupportedFormat` | 格式不支持（含 DRM、CBR 明确拒绝） |
+| 1003 | `CorruptData` | 数据损坏（结构解析失败） |
+| 1004 | `InvalidParam` | 参数非法（空指针/越界/非 UTF-8） |
+| 1005 | `Cancelled` | 任务被取消（检索取消等） |
+| 1006 | `ResourceLimit` | 资源超限（内存/大小上限） |
+| 1999 | `Internal` | 内部错误（含锁中毒等兜底） |
+| 2001 | （`ERR_PANIC` 常量） | 边界 panic 被拦截 |
+| 0 | — | 本线程尚无错误记录 |
+
+#### 内容级缓存（issue #12）
+
+与布局缓存（`rrk_cache_configure`，三要素 key）并行的另一层：**内容级 key**
+（只含 `content_hash`，kind = toc / chapter_text / txt_outline），命中即免
+重新解析（免 inflate + 清洗 + 分块）：
+
+- C ABI：`rrk_content_cache_configure(dir, mem_bytes)`（空目录 = 关闭）；
+  `rrk_content_cache_stats()` → `{"toc","chapter","outline"}` 各 `{hits,misses}`。
+- Dart：`RrkEngine.configureContentCache(dir)` / `contentCacheStatsJson()`。
+- `rrk_toc_json` / `rrk_chapters_json` / `rrk_load_chapter` 自动走该缓存。
+- **失效口径**：内容 hash 变了整本失效（与宿主原 Dart 缓存的「副本 mtime/size
+  判据」等价）；payload 自带 schema 号，内核升级/损坏自动丢弃重算。
 
 ### 接入选型：C ABI（`rrk-ffi`）还是 FRB 直连
 

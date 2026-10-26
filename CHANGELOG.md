@@ -7,6 +7,27 @@
 
 ## [Unreleased]
 
+### Added
+
+- **稳定错误码透出 FFI（issue #11，ABI 7 → 8）**：新增 `rrk_last_error_code() -> u32`，
+  返回与 `rrk_last_error()` 消息同源的 `RrkErrorKind::code()`（1001–1999 只增不改，
+  panic=2001，0=尚无记录）；Dart 封装同步（`_lastError` 不再硬编码 1001），
+  码值表写入 README。宿主可按码映射文案，不再对消息做字符串匹配。
+- **内容级解析结果缓存（issue #12，ABI 8）**：`rrk-cache` 新增内容级 key
+  （`CacheKey::content(content_hash, kind)`，kind = Toc / ChapterText / TxtOutline，
+  style/viewport 恒 0）；`rrk-kernel` 新增 `toc_cached / chapters_cached /
+  load_chapter_cached`（payload 为自研紧凑二进制，magic+schema 自校验，损坏自动
+  重算）与命中统计（`content_cache_stats`）；FFI 暴露
+  `rrk_content_cache_configure` / `rrk_content_cache_stats`，`rrk_toc_json` /
+  `rrk_chapters_json` / `rrk_load_chapter` 自动走缓存——命中即免 inflate+清洗+分块，
+  同文件重开命中磁盘、内容 hash 变了整本失效（与宿主原 Dart 三层缓存的
+  mtime/size 判据等价，宿主侧 `structureCache/txtOutlineCache/chapterTextCache`
+  可正式下线）。
+- **全链路性能批次（`perf(core)` 6105ab1）**：FFI 锁范围收敛（排版/光栅/载章出锁）、
+  page_at/hit_test/prefetch 直连结构化数据免整章 JSON、CBZ 开书限流读头、
+  EPUB 章清洗 LRU、清洗层零拷贝（`Token<'a>`）、搜索免折叠副本、BM25 扁平 CSR、
+  PDF 字体跨页缓存等（详见提交说明）。
+
 ### Fixed
 
 - **CBZ 页表口径与宿主基线对齐（issue #10）**：`CbzBook::parse` 的页收集改为

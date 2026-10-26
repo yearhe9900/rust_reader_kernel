@@ -13,7 +13,8 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 /// ABI 版本（与 rrk-ffi 的 RRK_ABI_VERSION 对齐，启动校验）。
-const int kRrkAbiVersion = 7;
+/// v8 = 新增 rrk_last_error_code / rrk_content_cache_*（issue #11、#12）。
+const int kRrkAbiVersion = 8;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -36,6 +37,8 @@ typedef _QueryNative = Uint32 Function(Uint64, Pointer<Pointer<Uint8>>, Pointer<
 typedef _QueryDart = int Function(int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _ErrorNative = Uint32 Function(Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _ErrorDart = int Function(Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _ErrorCodeNative = Uint32 Function();
+typedef _ErrorCodeDart = int Function();
 typedef _PagesNative = Uint32 Function(Uint64, Uint32, Pointer<Utf8>, IntPtr, Float, Float,
     Float, Uint32, Float, Float, Float, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _PagesDart = int Function(int, int, Pointer<Utf8>, int, double, double, double, int,
@@ -118,6 +121,11 @@ class _Bindings {
         chaptersJson = lib.lookupFunction<_QueryNative, _QueryDart>('rrk_chapters_json'),
         cover = lib.lookupFunction<_QueryNative, _QueryDart>('rrk_cover'),
         lastError = lib.lookupFunction<_ErrorNative, _ErrorDart>('rrk_last_error'),
+        lastErrorCode = lib.lookupFunction<_ErrorCodeNative, _ErrorCodeDart>('rrk_last_error_code'),
+        contentCacheConfigure =
+            lib.lookupFunction<_CacheCfgNative, _CacheCfgDart>('rrk_content_cache_configure'),
+        contentCacheStats =
+            lib.lookupFunction<_ErrorNative, _ErrorDart>('rrk_content_cache_stats'),
         loadChapter =
             lib.lookupFunction<_LoadChapterNative, _LoadChapterDart>('rrk_load_chapter'),
         pagesJson = lib.lookupFunction<_PagesNative, _PagesDart>('rrk_pages_json'),
@@ -155,6 +163,9 @@ class _Bindings {
   final _QueryDart chaptersJson;
   final _QueryDart cover;
   final _ErrorDart lastError;
+  final _ErrorCodeDart lastErrorCode;
+  final _CacheCfgDart contentCacheConfigure;
+  final _ErrorDart contentCacheStats;
   final _LoadChapterDart loadChapter;
   final _PagesDart pagesJson;
   final _PageAtDart pageAt;
@@ -242,6 +253,36 @@ class RrkEngine {
     }
   }
 
+  /// 配置内容级缓存（目录树/章文本/章大纲；key 只含内容 hash，命中免重新解析）。
+  /// 空路径 = 关闭。issue #12。
+  static void configureContentCache(String dir,
+      {int memBytes = 32 * 1024 * 1024}) {
+    final b = _bindings;
+    final p = dir.toNativeUtf8();
+    try {
+      final code =
+          b.contentCacheConfigure(p, utf8.encode(dir).length, memBytes);
+      if (code != 0) throw _lastError(b);
+    } finally {
+      malloc.free(p);
+    }
+  }
+
+  /// 内容级缓存命中统计（原始 JSON：toc/chapter/outline 各 hits/misses）。issue #12。
+  static String contentCacheStatsJson() {
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.contentCacheStats(outPtr, outLen);
+      if (code != 0) throw _lastError(b);
+      return _takeBuffer(b, outPtr.value, outLen.value) ?? '{}';
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
   /// 打开一本书（文件路径）。
   static RrkBook openBook(String path) {
     final b = _bindings;
@@ -263,7 +304,13 @@ class RrkEngine {
     try {
       b.lastError(outPtr, outLen);
       final msg = _takeBuffer(b, outPtr.value, outLen.value);
-      return RrkException(1001, msg ?? '未知错误');
+      // 稳定错误码（issue #11）：与消息同源；老库无此符号时退回 1001
+      var code = 1001;
+      try {
+        code = b.lastErrorCode();
+      } catch (_) {}
+      if (code == 0) code = 1001;
+      return RrkException(code, msg ?? '未知错误');
     } finally {
       malloc.free(outPtr);
       malloc.free(outLen);

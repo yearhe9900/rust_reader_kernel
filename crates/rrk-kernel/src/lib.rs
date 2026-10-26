@@ -8,16 +8,34 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use rrk_cache::{CacheKey, CacheKind, DiskStore, MemoryCache};
 use rrk_cbz::CbzAdapter;
 use rrk_epub::EpubAdapter;
 use rrk_format::{BookSource, ContentSource, FormatRegistry, PagedSource};
 use rrk_mobi::MobiAdapter;
 use rrk_model::{
-    flatten_blocks_spans, BookKind, ChapterEntry, ChapterKind, RrkError, RrkResult,
+    flatten_blocks_spans, BookKind, ChapterContent, ChapterEntry, ChapterKind, RrkError, RrkResult,
+    TocNode,
 };
 use rrk_pdf::PdfAdapter;
 use rrk_search::{search_text, Bm25, Bm25Builder, SearchOptions, SearchSession};
 use rrk_txt::TxtAdapter;
+
+mod codec;
+
+/// 内容级缓存命中统计（issue #12：可观测性）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentCacheStats {
+    /// 目录树命中/未命中次数。
+    pub toc_hits: u64,
+    pub toc_misses: u64,
+    /// 章文本命中/未命中次数。
+    pub chapter_hits: u64,
+    pub chapter_misses: u64,
+    /// 章大纲命中/未命中次数。
+    pub outline_hits: u64,
+    pub outline_misses: u64,
+}
 
 /// 书句柄（0 = 非法）。FFI 边界只传句柄，不传引用。
 pub type BookHandle = u64;
@@ -35,6 +53,10 @@ pub struct Kernel {
     indexes: HashMap<IndexId, Arc<Mutex<Bm25Job>>>,
     next_search_id: SearchId,
     next_index_id: IndexId,
+    /// 内容级缓存（目录/章文本/大纲；key 只含 content_hash，见 issue #12）。
+    /// 关闭时以下访问路径退化为原样解析（无缓存语义）。
+    content_cache: Option<(DiskStore, MemoryCache)>,
+    content_stats: ContentCacheStats,
 }
 
 impl Default for Kernel {
@@ -60,7 +82,118 @@ impl Kernel {
             indexes: HashMap::new(),
             next_search_id: 0,
             next_index_id: 0,
+            content_cache: None,
+            content_stats: ContentCacheStats::default(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 内容级缓存（issue #12）：目录树 / 章文本 / 章大纲
+    // -----------------------------------------------------------------------
+
+    /// 配置内容级缓存（目录 + 内存上限字节；空路径 = 关闭）。
+    ///
+    /// key = `content_hash`（内容级，不随样式/视口变）：内容变了整本失效，
+    /// 同文件重开命中。payload 自带 schema 号，升级/损坏自动丢弃重算。
+    pub fn configure_content_cache(&mut self, dir: &str, mem_bytes: usize) -> RrkResult<()> {
+        self.content_cache = if dir.trim().is_empty() {
+            None
+        } else {
+            let store = DiskStore::open(dir)?;
+            Some((store, MemoryCache::new(mem_bytes.max(1 << 20))))
+        };
+        Ok(())
+    }
+
+    /// 内容级缓存命中统计快照。
+    pub fn content_cache_stats(&self) -> ContentCacheStats {
+        self.content_stats
+    }
+
+    /// 清零命中统计。
+    pub fn reset_content_cache_stats(&mut self) {
+        self.content_stats = ContentCacheStats::default();
+    }
+
+    /// 按内容哈希整本失效（换文件/换版即清）；返回内存+磁盘删除条数。
+    pub fn invalidate_content_cache(&mut self, content_hash: u64) -> RrkResult<usize> {
+        let mut removed = 0usize;
+        if let Some((store, mem)) = self.content_cache.as_mut() {
+            mem.invalidate_content(content_hash);
+            removed += store.invalidate_content(content_hash)?;
+        }
+        Ok(removed)
+    }
+
+    /// 缓存读（C1 内存 → C2 磁盘；磁盘命中回填内存）。
+    fn content_cache_get(&mut self, key: &CacheKey) -> Option<Vec<u8>> {
+        let (store, mem) = self.content_cache.as_mut()?;
+        if let Some(bytes) = mem.get(key) {
+            return Some(bytes.to_vec());
+        }
+        let bytes = store.load(key)?;
+        mem.put(*key, bytes.clone());
+        Some(bytes)
+    }
+
+    /// 缓存写（C1 + C2；落盘失败不致命，降级为仅内存）。
+    fn content_cache_put(&mut self, key: CacheKey, payload: Vec<u8>) {
+        if let Some((store, mem)) = self.content_cache.as_mut() {
+            let _ = store.save(&key, &payload);
+            mem.put(key, payload);
+        }
+    }
+
+    /// 目录树（内容级缓存：命中免 nav/NCX 解析与 TOC 锚点清洗）。
+    pub fn toc_cached(&mut self, handle: BookHandle) -> RrkResult<Vec<TocNode>> {
+        let book = self.book_arc(handle)?;
+        let key = CacheKey::content(book.meta().content_hash, CacheKind::Toc);
+        if let Some(bytes) = self.content_cache_get(&key) {
+            if let Some(toc) = codec::decode_toc(&bytes) {
+                self.content_stats.toc_hits += 1;
+                return Ok(toc);
+            }
+        }
+        self.content_stats.toc_misses += 1;
+        let toc = book.toc()?;
+        self.content_cache_put(key, codec::encode_toc(&toc));
+        Ok(toc)
+    }
+
+    /// 章索引（内容级缓存：命中免分章扫描，主要省 TXT 大纲重建）。
+    pub fn chapters_cached(&mut self, handle: BookHandle) -> RrkResult<Vec<ChapterEntry>> {
+        let book = self.book_arc(handle)?;
+        let key = CacheKey::content(book.meta().content_hash, CacheKind::TxtOutline);
+        if let Some(bytes) = self.content_cache_get(&key) {
+            if let Some(entries) = codec::decode_outline(&bytes) {
+                self.content_stats.outline_hits += 1;
+                return Ok(entries);
+            }
+        }
+        self.content_stats.outline_misses += 1;
+        let entries = book.chapters()?;
+        self.content_cache_put(key, codec::encode_outline(&entries));
+        Ok(entries)
+    }
+
+    /// 章内容（内容级缓存：命中免 inflate + 清洗 + 分块；part = 章 id）。
+    pub fn load_chapter_cached(
+        &mut self,
+        handle: BookHandle,
+        id: u32,
+    ) -> RrkResult<ChapterContent> {
+        let book = self.book_arc(handle)?;
+        let key = CacheKey::content(book.meta().content_hash, CacheKind::ChapterText).with_part(id);
+        if let Some(bytes) = self.content_cache_get(&key) {
+            if let Some(content) = codec::decode_chapter(&bytes) {
+                self.content_stats.chapter_hits += 1;
+                return Ok(content);
+            }
+        }
+        self.content_stats.chapter_misses += 1;
+        let content = book.load_chapter(id)?;
+        self.content_cache_put(key, codec::encode_chapter(&content));
+        Ok(content)
     }
 
     /// 打开一本书（路径），返回句柄。
@@ -366,6 +499,56 @@ mod tests {
         let err = k.open(&bad).unwrap_err();
         assert_eq!(err.kind, rrk_model::RrkErrorKind::UnsupportedFormat);
         assert_eq!(k.open_count(), 0);
+    }
+
+    /// issue #12：内容级缓存端到端——首次 miss 解析，重开同文件命中磁盘缓存。
+    #[test]
+    fn content_cache_hit_across_reopen() {
+        let dir = std::env::temp_dir()
+            .join(format!("rrk-content-cache-{}-{:x}", std::process::id(), fastrand()));
+        let dir_str = dir.to_string_lossy().into_owned();
+
+        // 第一次开：toc/chapter 各一次 miss（写缓存），再读一次 hit
+        {
+            let mut k = Kernel::new();
+            k.configure_content_cache(&dir_str, 8 * 1024 * 1024).unwrap();
+            let h = k.open_path("../../fixtures/sample.epub").unwrap();
+            let toc1 = k.toc_cached(h).unwrap();
+            assert!(!toc1.is_empty(), "样例书应有目录");
+            let c1 = k.load_chapter_cached(h, 0).unwrap();
+            assert!(!c1.text.is_empty());
+            let ch1 = k.chapters_cached(h).unwrap();
+            assert!(!ch1.is_empty());
+            // 再读一轮：全部命中且内容一致
+            assert_eq!(k.toc_cached(h).unwrap(), toc1, "命中缓存的目录应一致");
+            let c2 = k.load_chapter_cached(h, 0).unwrap();
+            assert_eq!(&*c2.text, &*c1.text);
+            assert_eq!(c2.blocks, c1.blocks);
+            assert_eq!(c2.link_ranges, c1.link_ranges);
+            assert_eq!(k.chapters_cached(h).unwrap(), ch1);
+            let s = k.content_cache_stats();
+            assert_eq!((s.toc_hits, s.toc_misses), (1, 1));
+            assert_eq!((s.chapter_hits, s.chapter_misses), (1, 1));
+            assert_eq!((s.outline_hits, s.outline_misses), (1, 1));
+        }
+
+        // 新内核实例（模拟重启）：同一文件重开，磁盘缓存直接命中，零 miss
+        {
+            let mut k = Kernel::new();
+            k.configure_content_cache(&dir_str, 8 * 1024 * 1024).unwrap();
+            let h = k.open_path("../../fixtures/sample.epub").unwrap();
+            let toc = k.toc_cached(h).unwrap();
+            assert!(!toc.is_empty());
+            let s = k.content_cache_stats();
+            assert_eq!((s.toc_hits, s.toc_misses), (1, 0), "重开应磁盘命中");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fastrand() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
     }
 
     /// 端到端：建索引 → 拉字节 → 从字节重载 → 查询结果一致。

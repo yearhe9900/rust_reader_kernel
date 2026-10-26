@@ -748,6 +748,7 @@ dependencies = [
 name = "rrk-kernel"
 version = "0.1.2"
 dependencies = [
+ "rrk-cache",
  "rrk-cbz",
  "rrk-epub",
  "rrk-format",

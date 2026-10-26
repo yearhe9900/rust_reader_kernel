@@ -31,6 +31,12 @@ pub enum CacheKind {
     ContentChunk,
     /// 缩略图。
     Thumbnail,
+    /// 目录树（**内容级**：key 只含 content_hash，见 [`CacheKey::content`]；issue #12）。
+    Toc,
+    /// 章文本（含块/内链；内容级）。
+    ChapterText,
+    /// 章大纲（`chapters()` 条目表；内容级；以 TXT 大纲为主，其它格式顺带）。
+    TxtOutline,
 }
 
 impl CacheKind {
@@ -40,6 +46,9 @@ impl CacheKind {
             CacheKind::Layout => 2,
             CacheKind::ContentChunk => 3,
             CacheKind::Thumbnail => 4,
+            CacheKind::Toc => 5,
+            CacheKind::ChapterText => 6,
+            CacheKind::TxtOutline => 7,
         }
     }
 }
@@ -63,6 +72,22 @@ impl CacheKey {
     pub fn with_part(mut self, part: u32) -> Self {
         self.part = part;
         self
+    }
+
+    /// **内容级** key：只含 `content_hash` + 产物种类（style/viewport 恒 0）。
+    ///
+    /// 解析结果（目录树 / 章文本 / 章大纲）不随样式与视口变：内容 hash 变了
+    /// 整本失效，与宿主原 Dart 缓存的「副本 mtime/size 判据」等价（同文件重开
+    /// hash 不变，命中；文件变了 hash 变，key 全变，自然 miss）。分片号放
+    /// `part`（章文本 = 章 id）。issue #12。
+    pub fn content(content_hash: u64, kind: CacheKind) -> Self {
+        Self {
+            content_hash,
+            style_hash: 0,
+            viewport_hash: 0,
+            kind,
+            part: 0,
+        }
     }
 
     /// 文件名（hex 平铺）。

@@ -113,7 +113,7 @@ pub struct BookMeta {
 }
 
 /// 目录节点（树形；`anchor` 为章内字节偏移锚点）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TocNode {
     pub title: String,
     pub chapter: ChapterId,
@@ -131,7 +131,7 @@ pub enum ChapterKind {
 }
 
 /// 章索引项：标题 + 稳定定位串 + 字节范围 + 字数权重 + 锚点。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChapterEntry {
     pub id: ChapterId,
     pub title: Option<String>,
