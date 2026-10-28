@@ -18,6 +18,10 @@
      大内存机器上 3GB 分配会“成功”然后耗尽内存
   3. decode_image_rgba 尺寸防御（u32 乘法溢出 + 上限），超限回空向量由调用方跳图
   - 回归用例嵌入完整崩溃输入（fuzz_oom_huge_pixmap_rejected）
+  4. **防御回打（CI 种子语料二轮命中）**：上条的防御性 `pos += 1` 可把游标推过
+     末尾，dict 循环 `data[pos..]` 裸切片越界 panic（123 字节截断输入）——
+     防御推进全部钳到 len + 四处裸切片改 `.get(..)` 安全访问；回归用例
+     fuzz_crash_dict_slice_oob_terminated
 
 ### Added
 

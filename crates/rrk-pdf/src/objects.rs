@@ -142,7 +142,7 @@ impl<'a> Parser<'a> {
                     let before = self.pos;
                     let o = self.parse_object()?;
                     if self.pos == before {
-                        self.pos += 1;
+                        self.pos = (self.pos + 1).min(self.data.len());
                         continue;
                     }
                     arr.push(o);
@@ -185,9 +185,9 @@ impl<'a> Parser<'a> {
                     b"null" => Object::Null,
                     _ => {
                         // 防御：空词（游标停在非法分隔符上）必须前进，
-                        // 否则上层循环（数组/dict）会原地空转
+                        // 否则上层循环（数组/dict）会原地空转；钳到末尾防越界
                         if word.is_empty() {
-                            self.pos += 1;
+                            self.pos = (self.pos + 1).min(self.data.len());
                         }
                         Object::Null
                     }
@@ -327,7 +327,7 @@ impl<'a> Parser<'a> {
         let mut dict: Dict = BTreeMap::new();
         loop {
             self.skip_ws();
-            if self.data[self.pos..].starts_with(b">>") {
+            if self.data.get(self.pos..).is_some_and(|s| s.starts_with(b">>")) {
                 self.pos += 2;
                 break;
             }
@@ -341,7 +341,7 @@ impl<'a> Parser<'a> {
                 Object::Name(n) => n,
                 _ => {
                     if self.pos == kb {
-                        self.pos += 1;
+                        self.pos = (self.pos + 1).min(self.data.len());
                     }
                     continue;
                 }
@@ -349,18 +349,18 @@ impl<'a> Parser<'a> {
             let vb = self.pos;
             let value = self.parse_object()?;
             if self.pos == vb {
-                self.pos += 1;
+                self.pos = (self.pos + 1).min(self.data.len());
             }
             dict.insert(key, value);
         }
         // stream？
         let save = self.pos;
         self.skip_ws();
-        if self.data[self.pos..].starts_with(b"stream") {
+        if self.data.get(self.pos..).is_some_and(|s| s.starts_with(b"stream")) {
             self.pos += 6;
-            if self.data[self.pos..].starts_with(b"\r\n") {
+            if self.data.get(self.pos..).is_some_and(|s| s.starts_with(b"\r\n")) {
                 self.pos += 2;
-            } else if self.data[self.pos..].starts_with(b"\n") {
+            } else if self.data.get(self.pos..).is_some_and(|s| s.starts_with(b"\n")) {
                 self.pos += 1;
             }
             let data_start = self.pos;
