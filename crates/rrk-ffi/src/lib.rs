@@ -26,8 +26,10 @@ use rrk_model::{
 /// v8 = `rrk_last_error_code` / `rrk_content_cache_*`（issue #11、#12）；
 /// v9 = blocks JSON 改**部件流**（文本区间+图片 key，不再内嵌正文）+
 ///      `rrk_search_chapter` / `rrk_image_thumbnail` / `rrk_layout_cancel` /
-///      `rrk_stats` / 进度与坐标 API / 排版器池（并行排版）。
-pub const RRK_ABI_VERSION: u32 = 9;
+///      `rrk_stats` / 进度与坐标 API / 排版器池（并行排版）；
+/// v10 = `rrk_load_headings`（issue #13：章标题块轻量出口，另 EPUB 无 TOC 书
+///       open 期自动回填首个最小级标题）。
+pub const RRK_ABI_VERSION: u32 = 10;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -1029,6 +1031,39 @@ pub unsafe extern "C" fn rrk_slice_text(
         }
         with_kernel(|k| {
             let s = k.slice_text(handle, chapter, start, end).map_err(set_kind)?;
+            write_buf(s.into_bytes(), out_ptr, out_len);
+            Ok(0)
+        })
+    })
+}
+
+/// 章标题块（issue #13 轻量出口）：JSON `[{"level":n,"text":"..."}]`，
+/// 走章内容级缓存（命中免解析）；无标题/图片章返回 `[]`。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_load_headings(
+    handle: BookHandle,
+    chapter: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        with_kernel(|k| {
+            let hs = k.chapter_headings(handle, chapter).map_err(set_kind)?;
+            let mut s = String::with_capacity(64 * hs.len().max(1));
+            s.push('[');
+            for (i, (level, text)) in hs.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"level\":");
+                let _ = write!(s, "{level},\"text\":");
+                json_str(text, &mut s);
+                s.push('}');
+            }
+            s.push(']');
             write_buf(s.into_bytes(), out_ptr, out_len);
             Ok(0)
         })

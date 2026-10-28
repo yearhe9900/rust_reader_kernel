@@ -5,6 +5,23 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- **issue #13（无 TOC 书的章标题）**：
+  1. **首选落地**：EPUB 无 nav/NCX 时，open 期用「限流前缀（64KB）+ 同一条
+     清洗管线」提取正文首个**最小级**标题回填 `ChapterEntry.title`（不全量
+     inflate；前缀内无标题回 None 由宿主回落占位）；有目录的书不受影响
+     （backfill 只填空缺）。
+  2. **轻量出口**：`rrk_load_headings`（JSON `[{"level","text"}]`）+
+     `Kernel::chapter_headings` + Dart `loadHeadings`——走章内容级缓存，命中
+     免解析；宿主的临时 `_resolvePlaceholderTitles` 逐章扫描可换到这里。
+  3. **h 块排除**：v9 部件流已按 `type` 区分块型，宿主直接过滤 `type=="h"`
+     即可（无需内核删块——块流保持完整，偏移坐标系不变）。
+  - ABI 9 → 10；配套测试：TOC-less 回填/无标题回 None/有目录不覆盖/kernel
+    标题块出口（含 CBZ 图片章空表）。
+
 ## [0.2.0] - 2026-10-28
 
 **ABI 7 → 9**：本版含两轮破坏性变更（v8 = 稳定错误码/内容级缓存，v9 = blocks

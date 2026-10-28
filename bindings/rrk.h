@@ -12,8 +12,10 @@
 // v8 = `rrk_last_error_code` / `rrk_content_cache_*`（issue #11、#12）；
 // v9 = blocks JSON 改**部件流**（文本区间+图片 key，不再内嵌正文）+
 //      `rrk_search_chapter` / `rrk_image_thumbnail` / `rrk_layout_cancel` /
-//      `rrk_stats` / 进度与坐标 API / 排版器池（并行排版）。
-#define RRK_ABI_VERSION 9
+//      `rrk_stats` / 进度与坐标 API / 排版器池（并行排版）；
+// v10 = `rrk_load_headings`（issue #13：章标题块轻量出口，另 EPUB 无 TOC 书
+//       open 期自动回填首个最小级标题）。
+#define RRK_ABI_VERSION 10
 
 // panic 被捕获时的错误码。
 #define ERR_PANIC 2001
@@ -143,6 +145,13 @@ uint32_t rrk_slice_text(BookHandle handle,
                         uint32_t end,
                         uint8_t **out_ptr,
                         uintptr_t *out_len);
+
+// 章标题块（issue #13 轻量出口）：JSON `[{"level":n,"text":"..."}]`，
+// 走章内容级缓存（命中免解析）；无标题/图片章返回 `[]`。
+uint32_t rrk_load_headings(BookHandle handle,
+                           uint32_t chapter,
+                           uint8_t **out_ptr,
+                           uintptr_t *out_len);
 
 // 排版一章 → 页 JSON（三要素缓存口径：命中免排版；miss 排完落盘 + 保护窗口）。
 uint32_t rrk_pages_json(BookHandle handle,

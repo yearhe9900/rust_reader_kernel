@@ -14,8 +14,9 @@ import 'package:ffi/ffi.dart';
 
 /// ABI 版本（与 rrk-ffi 的 RRK_ABI_VERSION 对齐，启动校验）。
 /// v8 = rrk_last_error_code / rrk_content_cache_*（issue #11、#12）；
-/// v9 = blocks JSON 改部件流（文本区间+图片 key，不再内嵌正文）等接入面扩充。
-const int kRrkAbiVersion = 9;
+/// v9 = blocks JSON 改部件流（文本区间+图片 key，不再内嵌正文）等接入面扩充；
+/// v10 = rrk_load_headings（issue #13：章标题块轻量出口）。
+const int kRrkAbiVersion = 10;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -52,6 +53,10 @@ typedef _SliceNative = Uint32 Function(
     Uint64, Uint32, Uint32, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _SliceDart = int Function(
     int, int, int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _HeadingsNative = Uint32 Function(
+    Uint64, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _HeadingsDart = int Function(
+    int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _ThumbNative = Uint32 Function(Pointer<Uint8>, IntPtr, Uint32,
     Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint32>, Pointer<Uint32>);
 typedef _ThumbDart = int Function(Pointer<Uint8>, int, int,
@@ -153,6 +158,8 @@ class _Bindings {
         mapOffsets =
             lib.lookupFunction<_MapOffsetsNative, _MapOffsetsDart>('rrk_map_offsets'),
         sliceText = lib.lookupFunction<_SliceNative, _SliceDart>('rrk_slice_text'),
+        loadHeadings =
+            lib.lookupFunction<_HeadingsNative, _HeadingsDart>('rrk_load_headings'),
         imageThumbnail =
             lib.lookupFunction<_ThumbNative, _ThumbDart>('rrk_image_thumbnail'),
         searchChapter = lib.lookupFunction<_SearchChapterNative, _SearchChapterDart>(
@@ -204,6 +211,7 @@ class _Bindings {
   final _LocateDart locate;
   final _MapOffsetsDart mapOffsets;
   final _SliceDart sliceText;
+  final _HeadingsDart loadHeadings;
   final _ThumbDart imageThumbnail;
   final _SearchChapterDart searchChapter;
   final _ErrorCodeDart layoutCancel;
@@ -1116,6 +1124,26 @@ class RrkBook {
       final code = b.sliceText(_handle, chapterId, start, end, outPtr, outLen);
       if (code != 0) _throwCode(code);
       return RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '';
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 章标题块（issue #13）：`(level, 文本)` 列表，走章内容级缓存
+  /// （命中免解析）；无标题/图片章返回空表。无 TOC 书的章名回填用它。
+  List<(int, String)> loadHeadings(int chapterId) {
+    _check();
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.loadHeadings(_handle, chapterId, outPtr, outLen);
+      if (code != 0) _throwCode(code);
+      final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '[]';
+      return ((jsonDecode(json) as List)
+          .map((e) => (e['level'] as int, e['text'] as String))
+          .toList());
     } finally {
       malloc.free(outPtr);
       malloc.free(outLen);

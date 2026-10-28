@@ -189,6 +189,17 @@ impl EpubBook {
         let toc_raw = build_toc_raw(&zip, &opf, &opf_dir);
         backfill_titles(&toc_raw, &href_to_chapter, &mut entries);
 
+        // issue #13：无 nav/NCX 的书，用正文首个最小级标题回填章名——
+        // 限流读前缀（64KB）+ 同一条清洗管线（清洗器对截断输入容错），
+        // 不全量 inflate；前缀内无标题则保持 None（宿主回落占位）。
+        if toc_raw.is_empty() {
+            for e in entries.iter_mut().filter(|e| e.title.is_none()) {
+                if let Some(t) = probe_heading_title(&zip, &e.href) {
+                    e.title = Some(t);
+                }
+            }
+        }
+
         let title = opf
             .title
             .clone()
@@ -491,6 +502,40 @@ struct TocRaw {
 }
 
 /// 递归归一化目录树 href（路径按 base 解析，fragment 保留）。
+/// 探测章首标题（issue #13）：限流读前缀 → 清洗 → 取 **level 最小**的标题块
+/// （同级取文档序首个）。前缀内探测不到（标题在 64KB 之后/无标题）回 None，
+/// 不是错误——宿主回落「第 N 章」占位。
+const HEADING_PROBE_BYTES: usize = 64 * 1024;
+
+fn probe_heading_title(zip: &ZipArchive, href: &str) -> Option<String> {
+    let entry = zip.entry(href)?;
+    let head = zip.read_prefix(entry, HEADING_PROBE_BYTES).ok()?;
+    let s = String::from_utf8_lossy(&head);
+    let cleaned = clean_xhtml(&s);
+    let mut best: Option<(u8, String)> = None;
+    for b in &cleaned.blocks {
+        let Block::Heading { level, inlines } = b else { continue };
+        let mut text = String::new();
+        for i in inlines {
+            if let Inline::Text { range, .. } = i {
+                text.push_str(range.slice(&cleaned.text));
+            }
+        }
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((l, _)) => *level < *l,
+        };
+        if better {
+            best = Some((*level, text));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
 fn resolve_toc_tree(items: Vec<TocRaw>, base: &str) -> Vec<TocRaw> {
     items
         .into_iter()
@@ -1048,6 +1093,41 @@ mod tests {
     fn cover_none_when_no_image_anywhere() {
         let book = book_with(OPF_NO_COVER_META, CH1_NO_IMG, &[]);
         assert!(book.cover().unwrap().is_none());
+    }
+
+    // ---- issue #13：无 TOC 书用正文首个最小级标题回填章名 ----
+
+    #[test]
+    fn tocless_book_titles_from_smallest_heading() {
+        // 无 nav/NCX；ch1 先 h3 后 h1 → 取 level 最小的 h1
+        let ch = r#"<html><body><h3>小节</h3><h1>第一章 起点</h1><p>正文</p></body></html>"#;
+        let book = book_with(OPF_NO_COVER_META, ch, &[]);
+        assert!(book.toc_raw.is_empty(), "无 nav/NCX 应无目录树");
+        assert_eq!(
+            book.entries[0].title.as_deref(),
+            Some("第一章 起点"),
+            "应取 level 最小的标题"
+        );
+        // h1 仍在正文块序列里（v9 部件流按 type 过滤是宿主职责，内核不删块）
+        let content = book.load_chapter(0).unwrap();
+        assert!(content
+            .blocks
+            .iter()
+            .any(|b| matches!(b, Block::Heading { level: 1, .. })), "h1 应保留在块流");
+    }
+
+    #[test]
+    fn tocless_book_without_heading_keeps_none() {
+        let book = book_with(OPF_NO_COVER_META, CH1_NO_IMG, &[]);
+        assert_eq!(book.entries[0].title, None, "无标题应回 None（宿主回落占位）");
+    }
+
+    #[test]
+    fn toc_book_titles_unaffected_by_probe() {
+        // 有 nav 的书：标题仍来自目录回填，不被正文标题覆盖（backfill 只填空缺）
+        let nav = r#"<html><body><nav><ol><li><a href="text/ch1.xhtml">目录名</a></li></ol></nav></body></html>"#;
+        let book = book_with(OPF_NAV, CH1, &[("OEBPS/nav.xhtml", nav.as_bytes())]);
+        assert_eq!(book.entries[0].title.as_deref(), Some("目录名"));
     }
 
     // ---- #3 目录层级 + 章内锚点 ----

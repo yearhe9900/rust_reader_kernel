@@ -114,7 +114,8 @@ API 概览：`RrkEngine.init/openBook` → `meta()/toc()/chapters()/loadChapter(
 → `pagesOf()/pageAt()/hitTest()/prefetch()`（排版与进度）→ `renderPage()`（整页位图）
 → `search()/buildIndex()`（全书检索与 BM25 索引）→ `RrkImage.*`（尺寸头解析 / BGRA→PNG）
 → `configureContentCache()/contentCacheStatsJson()`（内容级缓存，见下）
-→ `progressOf()/locateByPercent()/mapOffsets()/sliceText()`（进度与坐标，见下）。
+→ `progressOf()/locateByPercent()/mapOffsets()/sliceText()`（进度与坐标，见下）
+→ `loadHeadings()`（章标题块，无 TOC 书的章名回填，issue #13）。
 
 C 接入方请直接用头文件 [`bindings/rrk.h`](bindings/rrk.h)；线程安全与调用约定见
 [`docs/FFI-调用约定与线程安全.md`](docs/FFI-调用约定与线程安全.md)。

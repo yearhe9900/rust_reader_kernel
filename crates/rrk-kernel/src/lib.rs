@@ -14,8 +14,8 @@ use rrk_epub::EpubAdapter;
 use rrk_format::{BookSource, ContentSource, FormatRegistry, PagedSource};
 use rrk_mobi::MobiAdapter;
 use rrk_model::{
-    flatten_blocks_spans, BookKind, ChapterContent, ChapterEntry, ChapterKind, RrkError, RrkResult,
-    TocNode,
+    flatten_blocks_spans, Block, BookKind, ChapterContent, ChapterEntry, ChapterKind, Inline,
+    RrkError, RrkResult, TocNode,
 };
 use rrk_pdf::PdfAdapter;
 use rrk_search::{search_text, Bm25, Bm25Builder, SearchOptions, SearchPage, SearchSession};
@@ -360,6 +360,31 @@ impl Kernel {
             std::mem::swap(&mut s, &mut e);
         }
         Ok(text[s..e].to_string())
+    }
+
+    /// 章标题块列表（issue #13 轻量出口）：`(level, 文本)`，走章内容级缓存
+    /// （命中免解析）；无标题/图片章返回空表。
+    pub fn chapter_headings(
+        &mut self,
+        handle: BookHandle,
+        chapter: u32,
+    ) -> RrkResult<Vec<(u8, String)>> {
+        let content = self.load_chapter_cached(handle, chapter)?;
+        let mut out = Vec::new();
+        for b in &content.blocks {
+            let Block::Heading { level, inlines } = b else { continue };
+            let mut t = String::new();
+            for i in inlines {
+                if let Inline::Text { range, .. } = i {
+                    t.push_str(range.slice(&content.text));
+                }
+            }
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                out.push((*level, t));
+            }
+        }
+        Ok(out)
     }
 
     /// 打开一本书（路径），返回句柄。
@@ -811,18 +836,32 @@ mod tests {
 
         let full = k.slice_text(h, 0, 0, u32::MAX).unwrap();
         assert_eq!(full, &*text, "全范围应返回整章");
-        let mid = k.slice_text(h, 0, b1, b2).unwrap();
+        let mid = k.slice_text(h, 0, b1 as u32, b2 as u32).unwrap();
         assert_eq!(mid, &text[b1..b2]);
         // 非边界起点（b1+1 落在多字节字符中间）→ 向下取整到 b1
-        let snapped = k.slice_text(h, 0, b1 + 1, b1 + 2).unwrap();
+        let snapped = k.slice_text(h, 0, (b1 + 1) as u32, (b1 + 2) as u32).unwrap();
         let mut s = (b1 + 1) as usize;
         while s > 0 && !text.is_char_boundary(s) { s -= 1; }
         let mut e = (b1 + 2) as usize;
         while e < text.len() && !text.is_char_boundary(e) { e += 1; }
         assert_eq!(snapped, &text[s..e]);
         // 反转区间自动交换
-        let swapped = k.slice_text(h, 0, b2, b1).unwrap();
+        let swapped = k.slice_text(h, 0, b2 as u32, b1 as u32).unwrap();
         assert_eq!(swapped, &text[b1..b2]);
+    }
+
+    /// issue #13：章标题块轻量出口（sample.epub 首章含 h1）。
+    #[test]
+    fn chapter_headings_returns_title_blocks() {
+        let mut k = Kernel::new();
+        let h = k.open_path("../../fixtures/sample.epub").unwrap();
+        let hs = k.chapter_headings(h, 0).unwrap();
+        assert!(!hs.is_empty(), "样例 EPUB 首章应有 h1");
+        assert_eq!(hs[0].0, 1, "首个应为 h1");
+        assert!(hs[0].1.contains("第一章"), "h1 文本: {}", hs[0].1);
+        // 图片章（CBZ）→ 空表
+        let h2 = k.open_path("../../fixtures/sample.cbz").unwrap();
+        assert!(k.chapter_headings(h2, 0).unwrap().is_empty());
     }
 
     /// 端到端：建索引 → 拉字节 → 从字节重载 → 查询结果一致。
