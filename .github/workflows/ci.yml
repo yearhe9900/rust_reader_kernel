@@ -44,7 +44,7 @@ jobs:
         run: |
           dart pub get
           dart analyze
-          dart run example/smoke.dart ../../../target/release/librrk_ffi.so ../../../../fixtures/sample.txt
+          dart run example/smoke.dart ../../../target/release/librrk_ffi.so ../../../fixtures/sample.txt
 
   flutter-test:
     runs-on: ubuntu-latest

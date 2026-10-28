@@ -181,6 +181,10 @@ pub fn tokenize(input: &str) -> Vec<Token<'_>> {
         let mut self_closing = false;
         let mut k = j;
         while k < bytes.len() {
+            // 防御畸形输入：任何未消费字符强制前进（如标签内出现左尖括号、
+            // 裸引号等非法字符，旧实现在此死循环——fuzz markup_clean 以 10 字节
+            // 输入 `<a <href="` 命中）
+            let k_before = k;
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                 k += 1;
             }
@@ -235,6 +239,15 @@ pub fn tokenize(input: &str) -> Vec<Token<'_>> {
             if !aname.is_empty() {
                 attrs.push((aname, decode_entities_cow(value)));
             }
+            if k == k_before {
+                // 无任何进展：跳过一个**完整字符**（含多字节），保证前进
+                // 且不把切片索引停在 UTF-8 字符中间
+                let mut nxt = k + 1;
+                while nxt < bytes.len() && (bytes[nxt] & 0xC0) == 0x80 {
+                    nxt += 1;
+                }
+                k = nxt;
+            }
         }
         flush_pieces(&mut pieces, input, &mut tokens);
         tokens.push(Token::Open { name, attrs, self_closing });
@@ -255,6 +268,7 @@ pub fn attr<'a>(attrs: &'a [(Cow<'a, str>, Cow<'a, str>)], name: &str) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clean::clean_xhtml;
 
     #[test]
     fn entities() {
@@ -303,6 +317,20 @@ mod tests {
         let toks = tokenize("<P>x</P>");
         assert!(matches!(&toks[0], Token::Open { name, .. } if name == "p"));
         assert!(matches!(&toks[2], Token::Close(name) if name == "p"));
+    }
+
+    /// fuzz 回归：标签内非法字节不得死循环（旧实现在属性名为空且字符非法时
+    /// k 不前进——`<a <href="` 恰好 10 字节即挂；libFuzzer timeout 报出）。
+    #[test]
+    fn malformed_tag_attrs_terminate() {
+        for s in ["<a <href=\"", "<a \"bare\"", "<p =\"\"", "<a\x00\x01>"] {
+            let _ = tokenize(s);
+            let _ = clean_xhtml(s);
+        }
+        // 畸形输入的清洗产物仍须自洽
+        let r = clean_xhtml("<a <href=\"x\">正文</a>");
+        let len = r.text.len() as u32;
+        assert!(r.links.iter().all(|l| l.range.end <= len));
     }
 
     /// CDATA 与普通文本混排时仍先并段再解码（拼接语义与旧实现一致）。
