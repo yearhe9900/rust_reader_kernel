@@ -88,23 +88,23 @@ jobs:
       - name: zip 中央目录 + 条目读取
         id: fuzz_zip
         continue-on-error: true
-        run: cargo fuzz run zip_parse -- -max_total_time=90 -timeout=10
+        run: cargo fuzz run zip_parse fuzz/seed-corpus/zip_parse -- -max_total_time=30 -timeout=10
       - name: 五格式适配器打开
         id: fuzz_format
         continue-on-error: true
-        run: cargo fuzz run format_open -- -max_total_time=90 -timeout=10
+        run: cargo fuzz run format_open fuzz/seed-corpus/format_open -- -max_total_time=30 -timeout=10
       - name: XHTML 清洗管线
         id: fuzz_markup
         continue-on-error: true
-        run: cargo fuzz run markup_clean -- -max_total_time=90 -timeout=10
+        run: cargo fuzz run markup_clean fuzz/seed-corpus/markup_clean -- -max_total_time=30 -timeout=10
       - name: 图片头解析/缩略图
         id: fuzz_image
         continue-on-error: true
-        run: cargo fuzz run image_probe -- -max_total_time=90 -timeout=10
+        run: cargo fuzz run image_probe fuzz/seed-corpus/image_probe -- -max_total_time=30 -timeout=10
       - name: PDF 解析/页视图/栅格化
         id: fuzz_pdf
         continue-on-error: true
-        run: cargo fuzz run pdf_open -- -max_total_time=90 -timeout=10
+        run: cargo fuzz run pdf_open fuzz/seed-corpus/pdf_open -- -max_total_time=30 -timeout=10
       - name: 汇总判定（任一目标失败则红；全部跑完不短路）
         run: |
           echo "zip=${{ steps.fuzz_zip.outcome }} format=${{ steps.fuzz_format.outcome }} markup=${{ steps.fuzz_markup.outcome }} image=${{ steps.fuzz_image.outcome }} pdf=${{ steps.fuzz_pdf.outcome }}"

@@ -1,0 +1,57 @@
+name: Fuzz Nightly
+
+# 每晚深挖（每目标 300s）：push 时 CI 里的 fuzz 只跑 30s/目标（快速回归），
+# 深度覆盖放这里——也支持手动触发（workflow_dispatch）用于发布前加压。
+
+on:
+  schedule:
+    - cron: '26 18 * * *'   # UTC 18:26 ≈ 北京时间次日 02:26（低峰时段）
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-deep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装 cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: zip 中央目录 + 条目读取
+        id: fuzz_zip
+        continue-on-error: true
+        run: cargo fuzz run zip_parse fuzz/seed-corpus/zip_parse -- -max_total_time=300 -timeout=10
+      - name: 五格式适配器打开
+        id: fuzz_format
+        continue-on-error: true
+        run: cargo fuzz run format_open fuzz/seed-corpus/format_open -- -max_total_time=300 -timeout=10
+      - name: XHTML 清洗管线
+        id: fuzz_markup
+        continue-on-error: true
+        run: cargo fuzz run markup_clean fuzz/seed-corpus/markup_clean -- -max_total_time=300 -timeout=10
+      - name: 图片头解析/缩略图
+        id: fuzz_image
+        continue-on-error: true
+        run: cargo fuzz run image_probe fuzz/seed-corpus/image_probe -- -max_total_time=300 -timeout=10
+      - name: PDF 解析/页视图/栅格化
+        id: fuzz_pdf
+        continue-on-error: true
+        run: cargo fuzz run pdf_open fuzz/seed-corpus/pdf_open -- -max_total_time=300 -timeout=10
+      - name: 汇总判定（任一目标失败则红）
+        run: |
+          echo "zip=${{ steps.fuzz_zip.outcome }} format=${{ steps.fuzz_format.outcome }} markup=${{ steps.fuzz_markup.outcome }} image=${{ steps.fuzz_image.outcome }} pdf=${{ steps.fuzz_pdf.outcome }}"
+          [ "${{ steps.fuzz_zip.outcome }}" = "success" ] || exit 1
+          [ "${{ steps.fuzz_format.outcome }}" = "success" ] || exit 1
+          [ "${{ steps.fuzz_markup.outcome }}" = "success" ] || exit 1
+          [ "${{ steps.fuzz_image.outcome }}" = "success" ] || exit 1
+          [ "${{ steps.fuzz_pdf.outcome }}" = "success" ] || exit 1
+      - name: 上传崩溃样例
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-nightly-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
