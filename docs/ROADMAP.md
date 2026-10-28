@@ -29,13 +29,14 @@
 
 | 项 | 说明 | 状态 |
 |----|------|------|
-| Fuzz CI | cargo-fuzz 目标（zip/清洗/PDF 对象/图片头）+ 每晚 workflow | 进行中（本批次落地目标与 workflow） |
-| Bench CI | 补 bench_markup/bench_search 盲区 + workflow 阈值护栏 | 进行中（本批次落地） |
-| 排版器池 | 多窗口并行排版（当前单排版器，吞吐不叠加）；属新语义，另行版本化 | 未开始 |
-| blocks JSON 只带偏移区间 | 正文跨 FFI 传两遍的带宽优化；**ABI 契约变更**，需 bump + 宿主配合 | 未开始 |
-| 章级/页级缓存持久化扩展 | open 期重建的索引（entries/pages/toc_raw）以内容 key 持久化 | 未开始（#12 已铺好地基） |
-| PDF 渲染深化 | XObject 解码缓存、`Stream.data` → `Arc`（免深拷贝）、裁剪 bbox | 未开始 |
-| CI 产物签名/发布自动化 | 现有三平台 artifact 人工发布，接 release 自动化 | 未开始 |
+| Fuzz CI | cargo-fuzz 目标（zip/清洗/PDF 对象/图片头）+ 每晚 workflow | ✅ 已落地（实跑由 CI 验证） |
+| Bench CI | 补 bench_markup/bench_search/bench_ffi 盲区 + workflow 阈值护栏 | ✅ 已落地 |
+| 排版器池 | 多窗口并行排版 | ✅ 已落地（ABI 9：min(并行度,4) 台轮转） |
+| blocks JSON 只带偏移区间 | 正文跨 FFI 传两遍的带宽优化；**ABI 契约变更** | ✅ 已落地（ABI 9 部件流） |
+| 章级/页级缓存持久化扩展 | open 期重建的索引（entries/pages/toc_raw）以内容 key 持久化 | 未开始（需架构决策：缓存句柄如何下沉到 adapter——建议新适配器方法带缓存入参，待设计定稿） |
+| PDF 渲染深化 | XObject 解码缓存、裁剪 bbox | ✅ 已落地（`Stream.data`→`Arc` 深拷贝优化让位于解码缓存，收益等价） |
+| cbindgen + 头文件校验 | 自动生成 C 头 + CI 漂移/语法校验 | ✅ 已落地 |
+| CI 产物签名/发布自动化 | tag → 三平台构建 + Release 附件 | ✅ 已落地（GPG 签 SHA256SUMS 已接；平台证书签名——Apple Developer / Azure Trusted Signing——待主体验证与证书托管） |
 
 ## 语义承诺（对接方可依赖）
 

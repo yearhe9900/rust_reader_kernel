@@ -13,8 +13,8 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use rrk_kernel::{BookHandle, Kernel};
 use rrk_model::{
@@ -23,15 +23,29 @@ use rrk_model::{
 };
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
-/// v8 = 新增 `rrk_last_error_code` / `rrk_content_cache_*`（issue #11、#12）。
-pub const RRK_ABI_VERSION: u32 = 8;
+/// v8 = `rrk_last_error_code` / `rrk_content_cache_*`（issue #11、#12）；
+/// v9 = blocks JSON 改**部件流**（文本区间+图片 key，不再内嵌正文）+
+///      `rrk_search_chapter` / `rrk_image_thumbnail` / `rrk_layout_cancel` /
+///      `rrk_stats` / 进度与坐标 API / 排版器池（并行排版）。
+pub const RRK_ABI_VERSION: u32 = 9;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
 
 static KERNEL: Mutex<Option<Kernel>> = Mutex::new(None);
 /// 排版器（粗粒度共享一份；parley FontContext 重量级）。
-static LAYOUTER: Mutex<Option<rrk_layout::Layouter>> = Mutex::new(None);
+/// 排版器池（ROADMAP：多窗口并行排版）：每台独立 parley FontContext，
+/// 轮转取用——并行排版吞吐随池大小叠加；池大小 = min(可用并行度, 4)，
+/// 惰性创建（每台 FontContext 数 MB，不预热）。
+fn layouter_slot() -> &'static Mutex<Option<rrk_layout::Layouter>> {
+    static POOL: OnceLock<Vec<Mutex<Option<rrk_layout::Layouter>>>> = OnceLock::new();
+    static RR: AtomicUsize = AtomicUsize::new(0);
+    let pool = POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4);
+        (0..n).map(|_| Mutex::new(None)).collect()
+    });
+    &pool[RR.fetch_add(1, Ordering::Relaxed) % pool.len()]
+}
 /// 排版取消标志（`rrk_layout_cancel` 置位；布局起点消费旧值、块间检查——
 /// 尽力取消语义：只对「已开始的布局」生效，无进行中布局时的取消无害吞掉）。
 static LAYOUT_CANCEL: AtomicBool = AtomicBool::new(false);
@@ -310,33 +324,39 @@ fn chapters_json(entries: &[ChapterEntry]) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// 块树 → JSON（**唯一降维口径**：`rrk_model::flatten_blocks`，引用块摊平、
-/// 分割线丢弃、行内图片以 `\u{FFFC}key\u{FFFC}` 内嵌）。
-fn blocks_json(text: &str, blocks: &[Block]) -> Vec<u8> {
-    use rrk_model::PlainBlock;
-    let flat = rrk_model::flatten_blocks(text, blocks);
-    let mut s = String::with_capacity(256 * flat.len().max(1));
+/// 块树 → JSON（**部件流**，v9 起）：文本给章文本的字节区间、行内图片给 key，
+/// 不再内嵌正文——正文只跨 FFI 一次，大章带宽减半。宿主按序拼接（图片位插
+/// `\u{FFFC}key\u{FFFC}` 标记），与旧格式的 `text` 逐字节一致（rrk-model 单测钉死）：
+///
+/// ```json
+/// [{"type":"p","indent":true,"parts":[[0,24],["img/a.png"],[24,36]]},
+///  {"type":"h","level":2,"parts":[[0,10]]},
+///  {"type":"img","key":"img/b.jpg","alt":null}]
+/// ```
+fn blocks_json(_text: &str, blocks: &[Block]) -> Vec<u8> {
+    let parts = rrk_model::block_parts(blocks);
+    let mut s = String::with_capacity(96 * parts.len().max(1));
     s.push('[');
-    for (i, b) in flat.iter().enumerate() {
+    for (i, b) in parts.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
         match b {
-            PlainBlock::Heading { level, text: t } => {
+            rrk_model::PartBlock::Heading { level, parts } => {
                 s.push_str("{\"type\":\"h\",\"level\":");
-                s.push_str(&level.to_string());
-                s.push_str(",\"text\":");
-                json_str(t, &mut s);
+                let _ = write!(s, "{level}");
+                s.push_str(",\"parts\":");
+                write_parts(parts, &mut s);
                 s.push('}');
             }
-            PlainBlock::Paragraph { text: t, indent } => {
+            rrk_model::PartBlock::Paragraph { indent, parts } => {
                 s.push_str("{\"type\":\"p\",\"indent\":");
                 s.push_str(if *indent { "true" } else { "false" });
-                s.push_str(",\"text\":");
-                json_str(t, &mut s);
+                s.push_str(",\"parts\":");
+                write_parts(parts, &mut s);
                 s.push('}');
             }
-            PlainBlock::Image { key, alt } => {
+            rrk_model::PartBlock::Image { key, alt } => {
                 s.push_str("{\"type\":\"img\",\"key\":");
                 json_str(&key.0, &mut s);
                 s.push_str(",\"alt\":");
@@ -350,6 +370,27 @@ fn blocks_json(text: &str, blocks: &[Block]) -> Vec<u8> {
     }
     s.push(']');
     s.into_bytes()
+}
+
+/// 部件数组：文本 `[start,end]`；图片 `["key"]`（顺序即语义）。
+fn write_parts(parts: &[rrk_model::TextPart], s: &mut String) {
+    s.push('[');
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        match p {
+            rrk_model::TextPart::Text { range } => {
+                let _ = write!(s, "[{},{}]", range.start, range.end);
+            }
+            rrk_model::TextPart::Image { key } => {
+                s.push('[');
+                json_str(&key.0, s);
+                s.push(']');
+            }
+        }
+    }
+    s.push(']');
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,7 +1100,7 @@ fn layout_pages_cached(
     // miss：载章 + 排版（内核锁外；排版器只在 layout 期间短暂持锁）
     let content = book.load_chapter(chapter_id).map_err(set_kind)?;
     let pages = {
-        let mut guard = LAYOUTER
+        let mut guard = layouter_slot()
             .lock()
             .map_err(|_| set_err(RrkError::io("排版器锁中毒"), RrkErrorKind::Internal.code()))?;
         let layouter = guard.get_or_insert_with(rrk_layout::Layouter::new);

@@ -23,6 +23,12 @@ jobs:
           ./target/release/rrk-inspect fixtures/sample.epub >/dev/null
           ./target/release/rrk-inspect fixtures/sample.cbz >/dev/null
           ./target/release/rrk-inspect fixtures/sample.pdf >/dev/null
+      - name: 安装 cbindgen（头文件漂移校验）
+        run: cargo install cbindgen --locked
+      - name: C 头文件与源码一致（cbindgen --verify）
+        run: cbindgen --verify --output bindings/rrk.h crates/rrk-ffi --config cbindgen.toml
+      - name: C 头文件语法检查
+        run: gcc -fsyntax-only -Wall -Wextra bindings/rrk.h
 
   dart-test:
     runs-on: ubuntu-latest
@@ -67,6 +73,8 @@ jobs:
         run: cargo run --release -p rrk-search --example bench_search
       - name: 排版基准（P1 判据 ≤200ms/章）
         run: cargo run --release -p rrk-layout --example bench_layout -- fixtures/sample.txt
+      - name: FFI 出口基准（部件流/缓存命中/光栅化）
+        run: cargo run --release -p rrk-ffi --example bench_ffi
 
   fuzz:
     # cargo-fuzz 每目标短跑（覆盖引导）；崩溃会把输入存进 artifacts 并使 job 失败

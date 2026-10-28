@@ -565,6 +565,9 @@ pub struct PdfDocument {
     virtuals: std::sync::Mutex<HashMap<u32, Object>>,
     /// 光栅字体缓存（raster 层填充：FontFile 解压/ToUnicode 解析跨页复用）。
     pub(crate) font_cache: std::sync::Mutex<HashMap<u32, Arc<crate::raster::RasterFont>>>,
+    /// 图像 XObject 解码缓存（raster 层填充：同一图像跨页/跨 Do 只 inflate+解码
+    /// 一次；有字节上限，超限整表清空重填）。
+    pub(crate) image_cache: std::sync::Mutex<crate::raster::RasterImageCache>,
 }
 
 impl PdfDocument {
@@ -598,6 +601,7 @@ impl PdfDocument {
             cache: std::sync::Mutex::new(HashMap::new()),
             virtuals: std::sync::Mutex::new(HashMap::new()),
             font_cache: std::sync::Mutex::new(HashMap::new()),
+            image_cache: std::sync::Mutex::new(crate::raster::RasterImageCache::default()),
         })
     }
 

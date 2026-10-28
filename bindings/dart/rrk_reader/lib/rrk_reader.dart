@@ -13,8 +13,9 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 /// ABI 版本（与 rrk-ffi 的 RRK_ABI_VERSION 对齐，启动校验）。
-/// v8 = 新增 rrk_last_error_code / rrk_content_cache_*（issue #11、#12）。
-const int kRrkAbiVersion = 8;
+/// v8 = rrk_last_error_code / rrk_content_cache_*（issue #11、#12）；
+/// v9 = blocks JSON 改部件流（文本区间+图片 key，不再内嵌正文）等接入面扩充。
+const int kRrkAbiVersion = 9;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -602,16 +603,42 @@ class ChapterEntry {
 class ChapterBlock {
   ChapterBlock._(this.type, this.text, this.level, this.indent, this.key, this.alt);
   final String type; // h / p / img / quote / hr
+
+  /// 块文本（v9：由部件流按序重建——文本切自章文本字节、图片插
+  /// `\u{FFFC}key\u{FFFC}` 标记，与旧格式内嵌 text 逐字节一致）。
   final String? text;
   final int? level;
   final bool? indent;
   final String? key;
   final String? alt;
 
-  static List<ChapterBlock> _listFromJson(List<dynamic> js) => js
-      .map((e) => ChapterBlock._(e['type'] as String, e['text'] as String?,
-          e['level'] as int?, e['indent'] as bool?, e['key'] as String?, e['alt'] as String?))
-      .toList();
+  /// [js] 为 blocks JSON 数组；[text] 为同源正文的 UTF-8 字节（部件按区间切）。
+  static List<ChapterBlock> _listFromJson(List<dynamic> js, Uint8List text) => js.map((e) {
+        final parts = e['parts'] as List?;
+        String? t;
+        if (parts != null) {
+          final sb = StringBuffer();
+          for (final p in parts) {
+            if (p is List && p.length == 2) {
+              final s = p[0] as int;
+              final en = p[1] as int;
+              if (en > s && s >= 0 && en <= text.length) {
+                sb.write(utf8.decode(text.sublist(s, en)));
+              }
+            } else if (p is List && p.length == 1 && p[0] is String) {
+              sb.write('\u{FFFC}${p[0]}\u{FFFC}');
+            }
+          }
+          t = sb.toString();
+        }
+        return ChapterBlock._(
+            e['type'] as String,
+            t,
+            e['level'] as int?,
+            e['indent'] as bool?,
+            e['key'] as String?,
+            e['alt'] as String?);
+      }).toList();
 
   @override
   String toString() => 'ChapterBlock($type ${text ?? key ?? ""})';
@@ -697,13 +724,17 @@ class PagedPage {
   final String? imageKey;
   final String? mime;
 
-  static PagedPage _fromJson(Map<String, dynamic> j) => PagedPage._(
-        j['kind'] as String,
-        j['text'] as String?,
-        ChapterBlock._listFromJson((j['blocks'] as List?) ?? const []),
-        j['key'] as String?,
-        j['mime'] as String?,
-      );
+  static PagedPage _fromJson(Map<String, dynamic> j) {
+    final text = j['text'] as String?;
+    return PagedPage._(
+      j['kind'] as String,
+      text,
+      ChapterBlock._listFromJson(
+          (j['blocks'] as List?) ?? const [], utf8.encode(text ?? '')),
+      j['key'] as String?,
+      j['mime'] as String?,
+    );
+  }
 }
 
 /// 检索命中：定位信息（章 + 章内偏移）与上下文片段。
@@ -935,13 +966,16 @@ class RrkBook {
       final code = b.loadChapter(
           _handle, chapterId, textPtr, textLen, blocksPtr, blocksLen, linksPtr, linksLen);
       if (code != 0) _throwCode(code);
-      final text = RrkEngine._takeBuffer(b, textPtr.value, textLen.value) ?? '';
+      // 正文保留原始 UTF-8 字节：blocks 部件流按字节区间切片（v9）
+      final textBytes =
+          RrkEngine._takeBytes(b, textPtr.value, textLen.value) ?? Uint8List(0);
+      final text = utf8.decode(textBytes);
       final blocksJson = RrkEngine._takeBuffer(b, blocksPtr.value, blocksLen.value) ?? '[]';
       final linksJson = RrkEngine._takeBuffer(b, linksPtr.value, linksLen.value) ?? '[]';
       return ChapterContent._(
           chapterId,
           text,
-          ChapterBlock._listFromJson(jsonDecode(blocksJson) as List<dynamic>),
+          ChapterBlock._listFromJson(jsonDecode(blocksJson) as List<dynamic>, textBytes),
           (jsonDecode(linksJson) as List<dynamic>)
               .map((e) => ChapterLink._(
                   e['start'] as int, e['end'] as int, e['href'] as String))

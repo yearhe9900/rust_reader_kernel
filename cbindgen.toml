@@ -1,0 +1,25 @@
+# cbindgen 配置（rrk-ffi → bindings/rrk.h）
+# 生成：cbindgen crates/rrk-ffi --config cbindgen.toml --output bindings/rrk.h
+# 校验漂移：cbindgen --verify（CI 用）
+language = "C"
+cpp_compat = true
+include_guard = "RRK_FFI_H"
+# 注意：输出路径与校验目标都走命令行 `--output`（--verify 不读配置）：
+#   生成：cbindgen crates/rrk-ffi --config cbindgen.toml --output bindings/rrk.h
+#   校验：cbindgen --verify --output bindings/rrk.h crates/rrk-ffi --config cbindgen.toml
+autogen_warning = "/* 自动生成：cbindgen crates/rrk-ffi --config cbindgen.toml；勿手改。 */"
+documentation = true
+documentation_style = "c99"
+style = "type"
+
+[export]
+include = [
+  "RRK_ABI_VERSION",
+  "ERR_PANIC",
+  "BookHandle",
+  "SearchId",
+  "IndexId",
+]
+
+[parse]
+parse_deps = false

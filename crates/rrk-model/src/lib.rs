@@ -448,6 +448,69 @@ pub fn flatten_blocks(text: &str, blocks: &[Block]) -> Vec<PlainBlock> {
 }
 
 // ---------------------------------------------------------------------------
+// 块 → 部件流（零文本拷贝口径；blocks JSON v9 起用）
+// ---------------------------------------------------------------------------
+
+/// 文本部件：原文区间，或行内图片 key。
+///
+/// 顺序即语义：宿主按序拼接——`Text` 切原文 `[start,end)`，`Image` 插入
+/// `\u{FFFC}key\u{FFFC}` 标记——重建结果与 [`flatten_blocks`] 的 plain 文本
+/// **逐字节一致**（一致性有单测钉死）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TextPart {
+    Text { range: TextRange },
+    Image { key: ResourceKey },
+}
+
+/// 块部件（与 `PlainBlock` 同构但**不含文本拷贝**，供跨 FFI 零冗余传输）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartBlock {
+    Heading { level: u8, parts: Vec<TextPart> },
+    Paragraph { indent: bool, parts: Vec<TextPart> },
+    Image { key: ResourceKey, alt: Option<String> },
+}
+
+/// 块树 → 部件流。降维口径与 [`flatten_blocks`] 完全一致：
+/// 引用块递归摊平、分割线丢弃、块级图片单列、空文本切片不产出部件。
+pub fn block_parts(blocks: &[Block]) -> Vec<PartBlock> {
+    fn walk(blocks: &[Block], out: &mut Vec<PartBlock>) {
+        for b in blocks {
+            match b {
+                Block::Paragraph { inlines, indent } => {
+                    out.push(PartBlock::Paragraph { indent: *indent, parts: parts_of(inlines) });
+                }
+                Block::Heading { level, inlines } => {
+                    out.push(PartBlock::Heading { level: *level, parts: parts_of(inlines) });
+                }
+                Block::Image { key, alt, .. } => {
+                    out.push(PartBlock::Image { key: key.clone(), alt: alt.clone() });
+                }
+                Block::Quote { blocks } => walk(blocks, out),
+                Block::Divider => {}
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(blocks.len());
+    walk(blocks, &mut out);
+    out
+}
+
+fn parts_of(inlines: &[Inline]) -> Vec<TextPart> {
+    let mut parts = Vec::with_capacity(inlines.len());
+    for i in inlines {
+        match i {
+            Inline::Text { range, .. } => {
+                if range.start < range.end {
+                    parts.push(TextPart::Text { range: *range });
+                }
+            }
+            Inline::Image { key } => parts.push(TextPart::Image { key: key.clone() }),
+        }
+    }
+    parts
+}
+
+// ---------------------------------------------------------------------------
 // 进度坐标
 // ---------------------------------------------------------------------------
 
@@ -613,6 +676,73 @@ pub fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 部件流口径与 flatten_blocks 逐字节一致（blocks JSON v9 的契约钉子）。
+    #[test]
+    fn block_parts_reconstruct_flatten_text() {
+        let text: Arc<str> =
+            "开头引用内文￼图1￼结尾第二段粗体。".into();
+        let img = |k: &str| Inline::Image { key: ResourceKey(k.to_string()) };
+        let txt = |s: u32, e: u32| Inline::Text {
+            range: TextRange::new(s, e),
+            style: StyleFlags(0),
+        };
+        let blocks = vec![
+            Block::Paragraph { inlines: vec![txt(0, 9), img("a.png"), txt(9, 15)], indent: false },
+            Block::Quote { blocks: vec![Block::Paragraph { inlines: vec![txt(0, 6)], indent: true }] },
+            Block::Divider,
+            Block::Heading { level: 2, inlines: vec![txt(9, 12)] },
+            Block::Image { key: ResourceKey("b.jpg".into()), alt: Some("图2".into()), size_hint: None },
+        ];
+        let plain = flatten_blocks(&text, &blocks);
+        let parts = block_parts(&blocks);
+        assert_eq!(parts.len(), plain.len(), "分割线丢弃后块数一致");
+        for (p, b) in parts.iter().zip(plain.iter()) {
+            let rebuilt = match (p, b) {
+                (
+                    PartBlock::Paragraph { indent: pi, parts: pp },
+                    PlainBlock::Paragraph { indent: bi, .. },
+                ) => {
+                    assert_eq!(pi, bi);
+                    rebuild(&text, pp)
+                }
+                (
+                    PartBlock::Heading { level: pl, parts: pp },
+                    PlainBlock::Heading { level: bl, .. },
+                ) => {
+                    assert_eq!(pl, bl);
+                    rebuild(&text, pp)
+                }
+                (PartBlock::Image { key: pk, alt: pa }, PlainBlock::Image { key: bk, alt: ba }) => {
+                    assert_eq!(pk, bk);
+                    assert_eq!(pa, ba);
+                    continue;
+                }
+                _ => panic!("块类型错位"),
+            };
+            match b {
+                PlainBlock::Paragraph { text: t, .. } | PlainBlock::Heading { text: t, .. } => {
+                    assert_eq!(rebuilt, *t, "部件重建不一致");
+                }
+                _ => {}
+            }
+        }
+
+        fn rebuild(text: &str, parts: &[TextPart]) -> String {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    TextPart::Text { range } => out.push_str(range.slice(text)),
+                    TextPart::Image { key } => {
+                        out.push(INLINE_IMAGE_MARKER);
+                        out.push_str(&key.0);
+                        out.push(INLINE_IMAGE_MARKER);
+                    }
+                }
+            }
+            out
+        }
+    }
 
     #[test]
     fn text_range_slice_is_zero_copy() {
