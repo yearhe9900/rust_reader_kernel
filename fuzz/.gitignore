@@ -2,3 +2,7 @@
 corpus/
 artifacts/
 target/
+# fuzz 运行会把变异产物写进语料目录（仓库只跟踪 seed.* 种子）
+seed-corpus/**
+!seed-corpus/**/
+!seed-corpus/**/seed.*

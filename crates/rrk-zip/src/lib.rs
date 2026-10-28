@@ -143,16 +143,33 @@ impl ZipArchive {
         Ok(&self.data[data_start..data_end])
     }
 
+    /// 单条目解压输出上限（防御：伪造 uncomp_size 直接当预分配大小 /
+    /// deflate 炸弹——fuzz zip_parse 以 1.7KB 输入诱导 OOM 实锤；
+    /// 真实电子书单条目远小于此）。
+    const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+
     /// 读取并按需 inflate 单个条目（`Vec` 所有权；deflate 路径零二次拷贝）。
     pub fn read_vec(&self, entry: &ZipEntry) -> RrkResult<Vec<u8>> {
         let raw = self.raw_of(entry)?;
         match entry.method {
             0 => Ok(raw.to_vec()),
             8 => {
-                let mut out = Vec::with_capacity(entry.uncomp_size as usize);
+                // 预分配按流大小推导（deflate 压缩比上界 ~1032:1），
+                // 不信头部虚报的 uncomp_size——否则 1KB 文件也能申请 512MB
+                let plausible = (entry.comp_size.saturating_mul(1032) + 64 * 1024)
+                    .min(Self::MAX_ENTRY_BYTES);
+                let mut out =
+                    Vec::with_capacity(entry.uncomp_size.min(plausible) as usize);
                 flate2::read::DeflateDecoder::new(raw)
+                    .take(Self::MAX_ENTRY_BYTES + 1)
                     .read_to_end(&mut out)
                     .map_err(|e| RrkError::corrupt(format!("zip: inflate 失败 {}", entry.name)).with_context(e.to_string()))?;
+                if out.len() as u64 > Self::MAX_ENTRY_BYTES {
+                    return Err(RrkError::unsupported(format!(
+                        "zip: 条目超限（>512MB）{}",
+                        entry.name
+                    )));
+                }
                 Ok(out)
             }
             m => Err(RrkError::unsupported(format!("zip: 压缩方法 {m} 不支持（{}）", entry.name))),
@@ -268,5 +285,28 @@ mod tests {
         assert_eq!(z.read(a).unwrap().as_ref(), b"hello zip");
         let b = z.entry("dir/b.bin").unwrap();
         assert_eq!(z.read(b).unwrap().as_ref(), &[1u8, 2, 3, 4]);
+    }
+
+    /// fuzz 回归（zip_parse OOM 实锤）：头部虚报 uncomp_size（3GB）不得
+    /// 付出分配代价——预分配按流大小推导，输出上限 512MB 兑底
+    ///（炸弹真解压时也拒绝）。
+    #[test]
+    fn lying_uncomp_size_does_not_overalloc() {
+        let mut zip_bytes = build_zip(&[("a.txt", b"hello zip")]);
+        // 局部头：comp_size @18、uncomp_size @22；中央目录（单条目）：uncomp @dir+24
+        let comp = u32::from_le_bytes(zip_bytes[18..22].try_into().unwrap());
+        let name_len = u16::from_le_bytes(zip_bytes[26..28].try_into().unwrap());
+        let dir = 30 + name_len as usize + comp as usize;
+        let fake = 3_000_000_000u32; // < 0xFFFF_FFFF（Zip64 拒收线）
+        zip_bytes[22..26].copy_from_slice(&fake.to_le_bytes());
+        zip_bytes[dir + 24..dir + 28].copy_from_slice(&fake.to_le_bytes());
+
+        let z = ZipArchive::parse(Arc::from(zip_bytes.into_boxed_slice())).unwrap();
+        let e = z.entry("a.txt").unwrap();
+        assert_eq!(e.uncomp_size, fake as u64, "头应保留虚报值");
+        let t = std::time::Instant::now();
+        let data = z.read(e).unwrap(); // 真实 9 字节：小内存快速成功
+        assert_eq!(data.as_ref(), b"hello zip");
+        assert!(t.elapsed().as_secs_f64() < 1.0, "不得为虚报尺寸付出分配/耗时代价");
     }
 }

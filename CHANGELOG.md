@@ -29,6 +29,13 @@
      节点访问量指数爆炸——深度上限不足以约束总访问量；walk_pages 三重限制
      （深度 64 / 总访问 100 万 / 页数 10 万，同 pdfium·mupdf 口径）；
      回归用例 fuzz_timeout_branching_cycle_tree_terminated（含 10s 时限断言）
+  7. **本地带种子 fuzz 收官（257 万次 ASAN 执行全净）**：
+     - walk_pages 加**已访问对象号 memo**（主防线）——循环树退化为 O(对象数)：
+       同类超时输入 79ms → 92µs，垃圾页 29682 → 2；预算收紧 20 万/5 万作兜底
+     - rrk-zip 解压炸弹：头部虚报 uncomp_size 不再当预分配大小（预分配按流
+       大小推导，deflate 比上界 1032:1）+ 解压输出 512MB 上限；1.7KB 输入
+       诱导 OOM → 73µs 拒绝；回归用例 lying_uncomp_size_does_not_overalloc
+     - 本地实测：五个 fuzz 目标 × 300s 全量种子扫描（257 万次 ASAN 执行）零命中
 
 ### Added
 

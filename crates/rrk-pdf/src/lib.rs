@@ -70,7 +70,8 @@ impl PdfBook {
                 Object::Ref(n, _) => *n,
                 _ => 0,
             };
-            walk_pages(&doc, num, &doc.resolve(&pref), None, None, &mut pages, 0, &mut 0u64);
+            let mut seen = std::collections::HashSet::new();
+            walk_pages(&doc, num, &doc.resolve(&pref), None, None, &mut pages, 0, &mut 0u64, &mut seen);
         }
         if pages.is_empty() {
             return Err(RrkError::corrupt("PDF: 页面树为空"));
@@ -240,12 +241,14 @@ fn find_catalog(doc: &PdfDocument) -> Option<Object> {
     None
 }
 
-/// 页面树防御上限（fuzz pdf_open 实锤：自指 Pages + 宽 Kids 数组的**分支循环树**
-/// 在 64 层深度内节点访问量指数爆炸——深度上限不足以约束总访问量）。
-/// 三重限制：深度 / 总节点访问量 / 页数（pdfium·mupdf 同为多重限制）。
+/// 页面树防御上限（fuzz 实锤系列：自指/分支循环树）。**主防线是已访问
+/// 对象号 memo**（同一间接引用节点只走一次，循环树退化为 O(对象数)，
+/// 合法书零影响）；三重上限为兑底（深度/总访问量/页数，pdfium 同为多重限制）。
+/// 预算经本地带种子 fuzz + ASAN 校准：访问量在插桩下线性放大，
+/// 20 万仍是真实文档量级的 10 倍以上且插桩后亚秒级。
 const MAX_PAGE_TREE_DEPTH: u32 = 64;
-const MAX_PAGE_TREE_NODES: u64 = 1_000_000;
-const MAX_PAGES: usize = 100_000;
+const MAX_PAGE_TREE_NODES: u64 = 200_000;
+const MAX_PAGES: usize = 50_000;
 
 fn walk_pages(
     doc: &PdfDocument,
@@ -256,10 +259,16 @@ fn walk_pages(
     out: &mut Vec<PageInfo>,
     depth: u32,
     visited: &mut u64,
+    seen: &mut std::collections::HashSet<u32>,
 ) {
     *visited += 1;
     if depth > MAX_PAGE_TREE_DEPTH || *visited > MAX_PAGE_TREE_NODES {
         return; // 循环/超深/超量：截断（不 panic 不挂死）
+    }
+    // memo：间接引用节点只走一次（循环/重复子树的主防线；内联节点
+    // obj_num=0 不入 memo，其树形由有限数据天然有界）
+    if obj_num != 0 && !seen.insert(obj_num) {
+        return;
     }
     let Some(d) = node.as_dict() else { return };
     let res = d.get("Resources").cloned().or(inh_res);
@@ -272,7 +281,7 @@ fn walk_pages(
                     Object::Ref(n, _) => *n,
                     _ => 0,
                 };
-                walk_pages(doc, num, &doc.resolve(kid), res.clone(), media.clone(), out, depth + 1, visited);
+                walk_pages(doc, num, &doc.resolve(kid), res.clone(), media.clone(), out, depth + 1, visited, seen);
             }
         }
         return;
