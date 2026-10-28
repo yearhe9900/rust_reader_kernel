@@ -16,7 +16,15 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use rrk_kernel::{BookHandle, Kernel};
+use rrk_kernel::Kernel;
+
+/// 书句柄（0 = 非法）。本地定义（与 `rrk_kernel::BookHandle` 透明等价）：
+/// cbindgen `parse_deps=false` 看不到依赖 crate 里的别名，必须在本 crate 可见。
+pub type BookHandle = u64;
+/// 检索会话句柄（0 = 非法）。
+pub type SearchId = u64;
+/// BM25 索引会话句柄（0 = 非法）。
+pub type IndexId = u64;
 use rrk_model::{
     Block, BookMeta, ChapterEntry, LinkRange, PagedContent, ResourceKey, RrkError, RrkErrorKind,
     TocNode,
@@ -1524,7 +1532,7 @@ pub unsafe extern "C" fn rrk_search_open(
 /// 能立刻置位并让本调用在下一个检查点返回 `Cancelled`（1005）。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_search_next(
-    search_id: rrk_kernel::SearchId,
+    search_id: SearchId,
     max_hits: u32,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
@@ -1548,7 +1556,7 @@ pub unsafe extern "C" fn rrk_search_next(
 
 /// 取消检索（置标志 + 摘除会话；内存随最后一个引用释放，**不留后台线程**）。
 #[no_mangle]
-pub extern "C" fn rrk_search_cancel(search_id: rrk_kernel::SearchId) -> u32 {
+pub extern "C" fn rrk_search_cancel(search_id: SearchId) -> u32 {
     guard(|| with_kernel(|k| k.search_cancel(search_id).map_err(set_kind)).map(|_| 0))
 }
 
@@ -1624,7 +1632,7 @@ pub unsafe extern "C" fn rrk_bm25_load(data_ptr: *const u8, data_len: usize) -> 
 /// 宿主反复调用直到 `done=true`，期间可随时停手/放弃（`rrk_bm25_close`）。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_bm25_step(
-    index_id: rrk_kernel::IndexId,
+    index_id: IndexId,
     max_chapters: u32,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
@@ -1649,7 +1657,7 @@ pub unsafe extern "C" fn rrk_bm25_step(
 /// `out_next` 回填下一个 offset（== 总长即取完）。**内核不写盘，落盘归宿主。**
 #[no_mangle]
 pub unsafe extern "C" fn rrk_bm25_pull(
-    index_id: rrk_kernel::IndexId,
+    index_id: IndexId,
     offset: u64,
     max_bytes: usize,
     out_ptr: *mut *mut u8,
@@ -1679,7 +1687,7 @@ pub unsafe extern "C" fn rrk_bm25_pull(
 /// BM25 查询：返回按得分降序的前 `top_k` 章 `[{"chapter","score"}]`。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_bm25_query(
-    index_id: rrk_kernel::IndexId,
+    index_id: IndexId,
     query_ptr: *const u8,
     query_len: usize,
     top_k: u32,
@@ -1708,6 +1716,6 @@ pub unsafe extern "C" fn rrk_bm25_query(
 
 /// 关闭索引会话（释放索引内存）。
 #[no_mangle]
-pub extern "C" fn rrk_bm25_close(index_id: rrk_kernel::IndexId) -> u32 {
+pub extern "C" fn rrk_bm25_close(index_id: IndexId) -> u32 {
     guard(|| with_kernel(|k| k.bm25_close(index_id).map_err(set_kind)).map(|_| 0))
 }

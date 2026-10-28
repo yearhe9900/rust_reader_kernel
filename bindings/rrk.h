@@ -20,6 +20,16 @@
 // panic 被捕获时的错误码。
 #define ERR_PANIC 2001
 
+// 书句柄（0 = 非法）。本地定义（与 `rrk_kernel::BookHandle` 透明等价）：
+// cbindgen `parse_deps=false` 看不到依赖 crate 里的别名，必须在本 crate 可见。
+typedef uint64_t BookHandle;
+
+// 检索会话句柄（0 = 非法）。
+typedef uint64_t SearchId;
+
+// BM25 索引会话句柄（0 = 非法）。
+typedef uint64_t IndexId;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
