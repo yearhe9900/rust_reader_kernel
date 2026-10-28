@@ -22,6 +22,9 @@
      末尾，dict 循环 `data[pos..]` 裸切片越界 panic（123 字节截断输入）——
      防御推进全部钳到 len + 四处裸切片改 `.get(..)` 安全访问；回归用例
      fuzz_crash_dict_slice_oob_terminated
+  5. **循环页面树栈溢出（CI 三轮命中）**：Page 节点自带自指 `/Kids` 时
+     walk_pages 无限递归——页面树深度上限 64 截断（真实文档树深≤十几层）；
+     回归用例 fuzz_stackoverflow_page_tree_cycle_terminated
 
 ### Added
 
