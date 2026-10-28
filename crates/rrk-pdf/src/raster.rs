@@ -308,6 +308,11 @@ pub struct Rasterizer<'a> {
     last_point: (f32, f32),
 }
 
+/// 光栅/图像像素上限（防御不可信尺寸字段：fuzz pdf_open 曾以 230 字节输入
+/// 诱导出 64×12582912×4 = 3GiB 的 pixmap 分配——宽被 target 钳住但高无界）。
+const MAX_PIXMAP_PIXELS: u64 = 100_000_000; // ~400MB RGBA
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+
 impl<'a> Rasterizer<'a> {
     /// 创建：page_w/page_h 为 pt；输出像素 = pt × scale；y 轴翻转到设备坐标。
     pub fn new(
@@ -319,6 +324,11 @@ impl<'a> Rasterizer<'a> {
     ) -> RrkResult<Self> {
         let w = (page_w * scale).round().max(1.0) as u32;
         let h = (page_h * scale).round().max(1.0) as u32;
+        // 像素上限前置检查：Pixmap::new 的失败兕底只在真分配失败时才触发，
+        // 大机器上 3GB 分配会“成功”然后耗尽内存——必须先拒
+        if w as u64 * h as u64 > MAX_PIXMAP_PIXELS {
+            return Err(RrkError::new(RrkErrorKind::ResourceLimit, format!("页面过大: {w}x{h}")));
+        }
         let mut pixmap = Pixmap::new(w, h).ok_or_else(|| {
             RrkError::new(RrkErrorKind::ResourceLimit, format!("页面过大: {w}x{h}"))
         })?;
@@ -938,6 +948,9 @@ impl<'a> Rasterizer<'a> {
             return;
         }
         let rgba = decode_image_rgba(dict, &data, w, h);
+        if rgba.is_empty() {
+            return; // 解码被尺寸防御拒绝（超限/为 0）：跳过该图，不 blit
+        }
         self.blit_image(&rgba, w, h);
         if let Some(n) = num {
             self.doc.image_cache.lock().unwrap().put(
@@ -1142,9 +1155,15 @@ fn decode_image_rgba(dict: &Dict, data: &[u8], w: u32, h: u32) -> Vec<u8> {
         .unwrap_or("DeviceRGB")
         .to_string();
     let ncomp = if cs.contains("Gray") { 1 } else if cs.contains("CMYK") { 4 } else { 3 };
-    let mut out = vec![0u8; (w * h * 4) as usize];
+    // 防御：w/h 来自流字典（不可信）——u32 乘法可溢出、尺寸可任意大
+    // （fuzz pdf_open OOM 实锤）；超限回空向量，调用方跳过该图
+    let npix = w as u64 * h as u64;
+    if npix == 0 || npix > MAX_IMAGE_PIXELS {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; (npix * 4) as usize];
     if bpc != 8 {
-        for i in 0..(w * h) as usize {
+        for i in 0..npix as usize {
             let byte = data.get(i / 8).copied().unwrap_or(0);
             let bit = (byte >> (7 - (i % 8))) & 1;
             if bit == 1 {
@@ -1153,7 +1172,7 @@ fn decode_image_rgba(dict: &Dict, data: &[u8], w: u32, h: u32) -> Vec<u8> {
         }
         return out;
     }
-    for i in 0..(w * h) as usize {
+    for i in 0..npix as usize {
         let base = i * ncomp as usize;
         let (r, g, b) = match ncomp {
             1 => {

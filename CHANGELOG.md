@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **fuzz pdf_open OOM 收官（CI 实锤，230 字节输入 → 24GiB realloc / 3GiB pixmap）**：
+  1. Parser 三层防死循环：数组分支与 dict key/value 分支在“解析未推进游标”时
+     强制前进一字节（根因：非法分隔符 `>` 处容错返回 Null 不报错不推进，
+     循环无限压入 → Vec 无限增长）；关键字分支空词同样前进
+  2. 光栅像素上限前置：Pixmap 尺寸（宽被 target 钳住但高 = page_h×scale 无界）
+     超 1 亿像素直接 ResourceLimit 拒绝——原兕底只在真分配失败时触发，
+     大内存机器上 3GB 分配会“成功”然后耗尽内存
+  3. decode_image_rgba 尺寸防御（u32 乘法溢出 + 上限），超限回空向量由调用方跳图
+  - 回归用例嵌入完整崩溃输入（fuzz_oom_huge_pixmap_rejected）
+
 ### Added
 
 - **issue #13（无 TOC 书的章标题）**：

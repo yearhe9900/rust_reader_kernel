@@ -136,7 +136,16 @@ impl<'a> Parser<'a> {
                     if self.peek().is_none() {
                         break;
                     }
-                    arr.push(self.parse_object()?);
+                    // 防御：子对象解析若未推进游标（如非法分隔符处容错返回
+                    // Null），跳过该字节——否则循环无限压入，Vec 无限增长
+                    // （fuzz pdf_open OOM 实锤：230 字节输入诱导 24GiB realloc）
+                    let before = self.pos;
+                    let o = self.parse_object()?;
+                    if self.pos == before {
+                        self.pos += 1;
+                        continue;
+                    }
+                    arr.push(o);
                 }
                 Ok(Object::Arr(arr))
             }
@@ -174,7 +183,14 @@ impl<'a> Parser<'a> {
                     b"true" => Object::Bool(true),
                     b"false" => Object::Bool(false),
                     b"null" => Object::Null,
-                    _ => Object::Null,
+                    _ => {
+                        // 防御：空词（游标停在非法分隔符上）必须前进，
+                        // 否则上层循环（数组/dict）会原地空转
+                        if word.is_empty() {
+                            self.pos += 1;
+                        }
+                        Object::Null
+                    }
                 })
             }
         }
@@ -318,11 +334,23 @@ impl<'a> Parser<'a> {
             if self.peek().is_none() {
                 break;
             }
+            // 防御：解析未推进游标时强制前进一字节（与数组分支同理，
+            // 防止 key/value 卡在非法分隔符上原地空转）
+            let kb = self.pos;
             let key = match self.parse_object()? {
                 Object::Name(n) => n,
-                _ => continue,
+                _ => {
+                    if self.pos == kb {
+                        self.pos += 1;
+                    }
+                    continue;
+                }
             };
+            let vb = self.pos;
             let value = self.parse_object()?;
+            if self.pos == vb {
+                self.pos += 1;
+            }
             dict.insert(key, value);
         }
         // stream？
