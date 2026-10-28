@@ -9,6 +9,27 @@
 
 ### Added
 
+- **清单剩余项批次（第三方接入面收尾）**：
+  1. **轻量单章搜索**：`SearchSession::open_chapter`（与全书会话同源的扫描/坐标/
+     snippet）+ `Kernel::search_chapter`（同步扫完不注册会话）+
+     `rrk_search_chapter` + Dart `searchChapter`（`maxHits=0` 默认上限 1000）。
+  2. **图片缩略图一条龙**：`rrk_image::thumbnail`（解码 → 等比缩 max_edge → RGBA；
+     AVIF/HEIC 明确 1002、损坏 1003）+ `rrk_image_thumbnail` + Dart
+     `RrkImage.thumbnail`；`image` 依赖转正式（与 workspace 同 feature 集）。
+  3. **排版可取消**：`Layouter::layout_cancellable`（块粒度检查，Cancelled=1005）+
+     `rrk_layout_cancel`（起点消费陈旧置位，无进行中布局时调用无副作用）+
+     Dart `RrkEngine.cancelLayout`（任意线程可调）。
+  4. **观测 API**：`rrk_stats`（open_books/searches/indexes/布局缓存 hits·misses/
+     内容缓存计数）+ Dart `RrkEngine.statsJson`。
+  5. **ROADMAP 文档**（docs/ROADMAP.md）：明确不做清单（DRM/PDF 表单签名/固定版式
+     EPUB/Media Overlays/TTS 分句/内核落盘/闭源依赖）及理由、待办、语义承诺。
+  6. **Bench 盲区补全 + CI 护栏**：`bench_markup`（1MB 合成 XHTML：tokenize 3.7ms /
+     clean 7.8ms 实测）与 `bench_search`（全书/单章搜索 + BM25 构建）两个基准
+     example，宽松预算断言；CI 新增 `bench` job（含 P1 排版判据）。
+  7. **Fuzz（cargo-fuzz）**：`fuzz/` 独立包、5 个目标（zip_parse / format_open /
+     markup_clean / image_probe / pdf_open，均带输入上界与契约断言）；CI 新增
+     `fuzz` job（nightly + cargo-fuzz，每目标 90s，崩溃样例上传 artifact）。
+
 - **第三方接入面批次（ABI 8 追加，符号只增）**：
   1. **进度 API**：`rrk_progress_of` / `rrk_locate`（kernel 同步提供）——按章权重的
      估算口径，供进度条与跨设备同步；Dart `progressOf/locateByPercent`。

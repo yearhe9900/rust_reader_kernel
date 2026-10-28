@@ -8,7 +8,6 @@ description = "Rust 阅读内核：纯字节级图像工具（头部尺寸解析
 [dependencies]
 rrk-model.workspace = true
 flate2.workspace = true
-
-[dev-dependencies]
-# 仅测试期用于往返校验（解码我们自己编出来的 PNG），不进发布二进制。
+# 运行期解码（缩略图 thumbnail）：与 workspace 同一 feature 集，白名单纯 Rust
 image.workspace = true
+

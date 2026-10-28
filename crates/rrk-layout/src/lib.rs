@@ -15,7 +15,7 @@ use std::borrow::Cow;
 
 use rrk_model::{
     Align, Block, ChapterContent, ChapterId, Inline, LayoutPage, LineEntry, PlacedImage,
-    SemanticPos, StyleSpec, TextRun, Viewport,
+    RrkError, RrkErrorKind, RrkResult, SemanticPos, StyleSpec, TextRun, Viewport,
 };
 
 use parley::{
@@ -49,17 +49,36 @@ impl Layouter {
         }
     }
 
-    /// 整章排版：Block 流 → 行序列 → 按视口分页。
+    /// 整章排版：Block 流 → 行序列 → 按视口分页（不可取消的便捷入口）。
     pub fn layout(
         &mut self,
         content: &ChapterContent,
         style: &StyleSpec,
         vp: &Viewport,
     ) -> Vec<LayoutPage> {
+        const NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        self.layout_cancellable(content, style, vp, &NEVER)
+            .expect("无取消标志时 layout_cancellable 不会失败")
+    }
+
+    /// 整章排版（**可取消**，第三方接入面）：块间检查取消标志；
+    /// 已取消 → `Err(Cancelled=1005)`，不留半成品页表。
+    ///
+    /// 取消粒度为块（百万字长章的一个段落内不响应），延迟上界 = 单块 shaping 时间。
+    pub fn layout_cancellable(
+        &mut self,
+        content: &ChapterContent,
+        style: &StyleSpec,
+        vp: &Viewport,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> RrkResult<Vec<LayoutPage>> {
         let width = vp.width.max(1.0);
         let mut flat: Vec<FlatLine> = Vec::new();
 
         for block in &content.blocks {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(RrkError::new(RrkErrorKind::Cancelled, "排版已取消"));
+            }
             match block {
                 Block::Paragraph { inlines, indent } => {
                     self.layout_inlines(content, inlines, style, false, *indent, width, 1.0, &mut flat);
@@ -99,7 +118,7 @@ impl Layouter {
             }
         }
 
-        paginate(flat, content.id, vp.height.max(1.0))
+        Ok(paginate(flat, content.id, vp.height.max(1.0)))
     }
 
     /// 一个块（段落/标题）→ 行序列。
@@ -429,6 +448,23 @@ mod tests {
         assert!(!pages[0].runs.is_empty());
         let idx = page_at(&pages, pages[1].start).unwrap();
         assert!(idx >= 1);
+    }
+
+    /// 可取消排版：预置标志 → Cancelled（1005）；清零后正常。
+    #[test]
+    fn layout_cancellable_trip_and_clear() {
+        let mut l = Layouter::new();
+        let c = chapter();
+        let style = StyleSpec::default();
+        let vp = Viewport { width: 390.0, height: 400.0, dpr: 3.0 };
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let err = l
+            .layout_cancellable(&c, &style, &vp, &cancel)
+            .expect_err("已置取消标志应报 Cancelled");
+        assert_eq!(err.kind, RrkErrorKind::Cancelled);
+        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        let pages = l.layout_cancellable(&c, &style, &vp, &cancel).unwrap();
+        assert!(!pages.is_empty(), "取消清除后应正常排版");
     }
 
     #[test]

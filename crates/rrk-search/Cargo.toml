@@ -8,3 +8,7 @@ description = "Rust 阅读内核：全书检索（拉模式分块 + 可取消）
 [dependencies]
 rrk-model.workspace = true
 rrk-format.workspace = true
+
+[dev-dependencies]
+# bench_search 示例用（打开样张 TXT）。
+rrk-txt.workspace = true

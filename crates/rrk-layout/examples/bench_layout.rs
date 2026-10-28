@@ -68,10 +68,16 @@ fn main() {
 
     // 目标判定（方案 §9.2：pagesOf 3MB 长章 ≤ 200ms）
     let target = 200.0;
+    let ok = layout_ms <= target;
     println!(
         "P1 目标判定（≤ {target:.0} ms）: {}",
-        if layout_ms <= target { "✅ 达标" } else { "⚠️ 超标" }
+        if ok { "✅ 达标" } else { "❌ 超标" }
     );
+    if !ok {
+        // CI 护栏：超判据即非零退出（本地调优同理：不达标不算通过）
+        eprintln!("P1 判据未达标：{layout_ms:.1} ms > {target:.0} ms");
+        std::process::exit(1);
+    }
 
     // 编码 + 落盘 + 命中
     let t3 = Instant::now();

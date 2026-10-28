@@ -225,11 +225,36 @@ impl SearchSession {
         query: &str,
         opts: SearchOptions,
     ) -> RrkResult<SearchSession> {
+        let chapters = book.chapters()?;
+        Self::with_chapters(book, chapters, query, opts)
+    }
+
+    /// 轻量单章路径（issue 无号，第三方接入面）：只扫指定章、**不注册会话**，
+    /// 供 `search_chapter` 同步用完即弃——扫描/坐标/snippet 逻辑与全书会话同源。
+    pub fn open_chapter(
+        book: Arc<dyn BookSource>,
+        chapter: rrk_model::ChapterId,
+        query: &str,
+        opts: SearchOptions,
+    ) -> RrkResult<SearchSession> {
+        let mut chapters = book.chapters()?;
+        chapters.retain(|e| e.id == chapter);
+        if chapters.is_empty() {
+            return Err(RrkError::invalid(format!("章 id 越界: {chapter}")));
+        }
+        Self::with_chapters(book, chapters, query, opts)
+    }
+
+    fn with_chapters(
+        book: Arc<dyn BookSource>,
+        chapters: Vec<ChapterEntry>,
+        query: &str,
+        opts: SearchOptions,
+    ) -> RrkResult<SearchSession> {
         let query = query.trim();
         if query.is_empty() {
             return Err(RrkError::invalid("检索词为空"));
         }
-        let chapters = book.chapters()?;
         let folded = if opts.case_sensitive {
             query.to_string()
         } else {

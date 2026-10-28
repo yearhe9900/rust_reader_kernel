@@ -54,6 +54,47 @@ jobs:
           flutter analyze
           flutter test
 
+  bench:
+    # 基准护栏（宽松阈值，只抓灾难性性能回归；精细调优本地测）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 清洗层基准（bench 盲区）
+        run: cargo run --release -p rrk-markup --example bench_markup
+      - name: 检索/索引基准（bench 盲区）
+        run: cargo run --release -p rrk-search --example bench_search
+      - name: 排版基准（P1 判据 ≤200ms/章）
+        run: cargo run --release -p rrk-layout --example bench_layout -- fixtures/sample.txt
+
+  fuzz:
+    # cargo-fuzz 每目标短跑（覆盖引导）；崩溃会把输入存进 artifacts 并使 job 失败
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装 cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: zip 中央目录 + 条目读取
+        run: cargo fuzz run zip_parse -- -max_total_time=90 -timeout=10
+      - name: 五格式适配器打开
+        run: cargo fuzz run format_open -- -max_total_time=90 -timeout=10
+      - name: XHTML 清洗管线
+        run: cargo fuzz run markup_clean -- -max_total_time=90 -timeout=10
+      - name: 图片头解析/缩略图
+        run: cargo fuzz run image_probe -- -max_total_time=90 -timeout=10
+      - name: PDF 解析/页视图/栅格化
+        run: cargo fuzz run pdf_open -- -max_total_time=90 -timeout=10
+      - name: 上传崩溃样例
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   build-ffi:
     strategy:
       matrix:

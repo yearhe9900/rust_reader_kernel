@@ -51,6 +51,14 @@ typedef _SliceNative = Uint32 Function(
     Uint64, Uint32, Uint32, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _SliceDart = int Function(
     int, int, int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _ThumbNative = Uint32 Function(Pointer<Uint8>, IntPtr, Uint32,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint32>, Pointer<Uint32>);
+typedef _ThumbDart = int Function(Pointer<Uint8>, int, int,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Uint32>, Pointer<Uint32>);
+typedef _SearchChapterNative = Uint32 Function(Uint64, Uint32, Pointer<Utf8>, IntPtr,
+    Uint32, Uint32, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _SearchChapterDart = int Function(int, int, Pointer<Utf8>, int, int, int, int,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _PagesNative = Uint32 Function(Uint64, Uint32, Pointer<Utf8>, IntPtr, Float, Float,
     Float, Uint32, Float, Float, Float, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _PagesDart = int Function(int, int, Pointer<Utf8>, int, double, double, double, int,
@@ -144,6 +152,13 @@ class _Bindings {
         mapOffsets =
             lib.lookupFunction<_MapOffsetsNative, _MapOffsetsDart>('rrk_map_offsets'),
         sliceText = lib.lookupFunction<_SliceNative, _SliceDart>('rrk_slice_text'),
+        imageThumbnail =
+            lib.lookupFunction<_ThumbNative, _ThumbDart>('rrk_image_thumbnail'),
+        searchChapter = lib.lookupFunction<_SearchChapterNative, _SearchChapterDart>(
+            'rrk_search_chapter'),
+        layoutCancel =
+            lib.lookupFunction<_ErrorCodeNative, _ErrorCodeDart>('rrk_layout_cancel'),
+        stats = lib.lookupFunction<_ErrorNative, _ErrorDart>('rrk_stats'),
         loadChapter =
             lib.lookupFunction<_LoadChapterNative, _LoadChapterDart>('rrk_load_chapter'),
         pagesJson = lib.lookupFunction<_PagesNative, _PagesDart>('rrk_pages_json'),
@@ -188,6 +203,10 @@ class _Bindings {
   final _LocateDart locate;
   final _MapOffsetsDart mapOffsets;
   final _SliceDart sliceText;
+  final _ThumbDart imageThumbnail;
+  final _SearchChapterDart searchChapter;
+  final _ErrorCodeDart layoutCancel;
+  final _ErrorDart stats;
   final _LoadChapterDart loadChapter;
   final _PagesDart pagesJson;
   final _PageAtDart pageAt;
@@ -261,6 +280,28 @@ class RrkEngine {
     if (Platform.isMacOS) return 'librrk_ffi.dylib';
     if (Platform.isWindows) return 'rrk_ffi.dll';
     return 'librrk_ffi.so';
+  }
+
+  /// 汇总观测统计（原始 JSON）：open_books / searches / indexes /
+  /// layout{hits,misses} / content{toc,chapter,outline}。埋点用。
+  static String statsJson() {
+    final b = _bindings;
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.stats(outPtr, outLen);
+      if (code != 0) throw _lastError(b);
+      return _takeBuffer(b, outPtr.value, outLen.value) ?? '{}';
+    } finally {
+      malloc.free(outPtr);
+      malloc.free(outLen);
+    }
+  }
+
+  /// 请求取消进行中的排版（尽力取消，块粒度）：正在跑的 `pagesOf` 以 1005
+  /// 返回；没有进行中布局时调用无副作用。可从任意线程调用。
+  static void cancelLayout() {
+    _bindings.layoutCancel();
   }
 
   /// 配置三要素缓存（目录 + 内存上限 MB）。
@@ -380,6 +421,38 @@ class RrkImageSize {
 ///
 /// 两者都不落盘（落盘归宿主）、都不解码/不做色彩管理，只做字节级工作。
 class RrkImage {
+  /// 解码整图并等比缩到 [maxEdge]（长边）以内 → `(rgba, width, height)`（RGBA8）。
+  ///
+  /// 原图已在限内则不缩仅解码；AVIF/HEIC 等内核不解像素的格式抛
+  /// 1002（宿主取原始字节自行解码），无法识别同样 1002、损坏 1003。
+  /// 书架/封面缩略图一条龙；页缩略图请用 `renderPage(targetWidth)`。
+  static (Uint8List, int, int) thumbnail(Uint8List bytes, {int maxEdge = 320}) {
+    if (bytes.isEmpty) throw RrkException(1004, '图片缓冲为空');
+    final b = _bindings;
+    final src = malloc<Uint8>(bytes.length);
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    final w = malloc<Uint32>();
+    final h = malloc<Uint32>();
+    try {
+      src.asTypedList(bytes.length).setAll(0, bytes);
+      final code =
+          b.imageThumbnail(src, bytes.length, maxEdge, outPtr, outLen, w, h);
+      if (code != 0) {
+        throw RrkException(code, RrkEngine._lastError(b).message);
+      }
+      final rgba =
+          RrkEngine._takeBytes(b, outPtr.value, outLen.value) ?? Uint8List(0);
+      return (rgba, w.value, h.value);
+    } finally {
+      malloc.free(src);
+      malloc.free(outPtr);
+      malloc.free(outLen);
+      malloc.free(w);
+      malloc.free(h);
+    }
+  }
+
   /// 只读图片头取尺寸；无法识别的格式/畸形字节返回 null。
   ///
   /// 只扫头部（PNG IHDR / JPEG SOFn / GIF / BMP / WebP chunk），不分配像素缓冲。
@@ -437,7 +510,7 @@ class RrkImage {
     }
   }
 
-  /// 同上，但源缓冲为调用方持有的原生内存（**零拷贝入参**，内核只读不接管所有权）。
+  /// 同上，直接读调用方持有的原生缓冲（**零拷贝入参**，内核只读不接管所有权）。
   static Uint8List encodePngFromBgraPtr(Pointer<Uint8> src, int srcLen,
       {required int width, required int height, int stride = 0}) {
     if (src == nullptr || srcLen == 0) {
@@ -1118,6 +1191,38 @@ class RrkBook {
       return RrkSearchSession._(id);
     } finally {
       malloc.free(q);
+    }
+  }
+
+  /// 轻量**单章**搜索：不建会话，同步扫完返回整页命中（坐标与全书搜索同源）。
+  /// [maxHits] = 0 取内核默认上限（1000）。
+  SearchBatch searchChapter(int chapterId, String query,
+      {bool caseSensitive = false, int contextChars = 30, int maxHits = 0}) {
+    _check();
+    final b = _bindings;
+    final q = query.toNativeUtf8();
+    final outPtr = malloc<Pointer<Uint8>>();
+    final outLen = malloc<IntPtr>();
+    try {
+      final code = b.searchChapter(_handle, chapterId, q, utf8.encode(query).length,
+          caseSensitive ? 1 : 0, contextChars, maxHits, outPtr, outLen);
+      if (code != 0) _throwCode(code);
+      final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '{}';
+      final m = jsonDecode(json) as Map<String, dynamic>;
+      final hits = ((m['hits'] as List?) ?? const [])
+          .map((e) => SearchHit._(
+              e['chapter'] as int,
+              e['offset'] as int,
+              e['len'] as int,
+              e['snippet'] as String,
+              e['snippetOffset'] as int))
+          .toList();
+      return SearchBatch._(
+          hits, m['scanned'] as int, m['total'] as int, m['done'] as bool);
+    } finally {
+      malloc.free(q);
+      malloc.free(outPtr);
+      malloc.free(outLen);
     }
   }
 

@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use rrk_kernel::{BookHandle, Kernel};
@@ -31,6 +32,12 @@ pub const ERR_PANIC: u32 = 2001;
 static KERNEL: Mutex<Option<Kernel>> = Mutex::new(None);
 /// 排版器（粗粒度共享一份；parley FontContext 重量级）。
 static LAYOUTER: Mutex<Option<rrk_layout::Layouter>> = Mutex::new(None);
+/// 排版取消标志（`rrk_layout_cancel` 置位；布局起点消费旧值、块间检查——
+/// 尽力取消语义：只对「已开始的布局」生效，无进行中布局时的取消无害吞掉）。
+static LAYOUT_CANCEL: AtomicBool = AtomicBool::new(false);
+/// 排版布局缓存命中/未命中计数（`rrk_stats` 可观测性用）。
+static LAYOUT_HITS: AtomicU64 = AtomicU64::new(0);
+static LAYOUT_MISSES: AtomicU64 = AtomicU64::new(0);
 /// 三要素缓存（C1 内存 LRU + C2 磁盘；`rrk_cache_configure` 后启用）。
 static CACHE: Mutex<Option<(rrk_cache::DiskStore, rrk_cache::MemoryCache)>> = Mutex::new(None);
 
@@ -847,6 +854,40 @@ pub unsafe extern "C" fn rrk_content_cache_stats(
     })
 }
 
+/// 汇总观测统计（第三方接入面）：
+/// `{"open_books","searches","indexes","layout":{"hits","misses"},"content":{…}}`。
+/// 排版计数为进程级累计（不随书关闭清零）；内容缓存计数见
+/// [`rrk_content_cache_stats`]（可清零）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_stats(
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        let (books, searches, indexes, content) = with_kernel(|k| {
+            Ok((k.open_count(), k.search_count(), k.index_count(), k.content_cache_stats()))
+        })?;
+        let mut out = String::with_capacity(320);
+        let _ = write!(
+            out,
+            "{{\"open_books\":{books},\"searches\":{searches},\"indexes\":{indexes},\"layout\":{{\"hits\":{},\"misses\":{}}},\"content\":{{\"toc\":{{\"hits\":{},\"misses\":{}}},\"chapter\":{{\"hits\":{},\"misses\":{}}},\"outline\":{{\"hits\":{},\"misses\":{}}}}}}}",
+            LAYOUT_HITS.load(Ordering::Relaxed),
+            LAYOUT_MISSES.load(Ordering::Relaxed),
+            content.toc_hits,
+            content.toc_misses,
+            content.chapter_hits,
+            content.chapter_misses,
+            content.outline_hits,
+            content.outline_misses,
+        );
+        write_buf(out.into_bytes(), out_ptr, out_len);
+        Ok(0)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 进度 / 坐标映射 / 选区取文（进度条、UTF-16 绑定、标注——第三方接入面）
 // ---------------------------------------------------------------------------
@@ -1010,8 +1051,10 @@ fn layout_pages_cached(
         }
     };
     if let Some(pages) = cached {
+        LAYOUT_HITS.fetch_add(1, Ordering::Relaxed);
         return Ok(pages);
     }
+    LAYOUT_MISSES.fetch_add(1, Ordering::Relaxed);
 
     // miss：载章 + 排版（内核锁外；排版器只在 layout 期间短暂持锁）
     let content = book.load_chapter(chapter_id).map_err(set_kind)?;
@@ -1020,7 +1063,11 @@ fn layout_pages_cached(
             .lock()
             .map_err(|_| set_err(RrkError::io("排版器锁中毒"), RrkErrorKind::Internal.code()))?;
         let layouter = guard.get_or_insert_with(rrk_layout::Layouter::new);
-        layouter.layout(&content, style, vp)
+        // 起点消费：丢掉「没有进行中布局」时置入的陈旧取消，避免误杀本次
+        LAYOUT_CANCEL.swap(false, Ordering::Relaxed);
+        layouter
+            .layout_cancellable(&content, style, vp, &LAYOUT_CANCEL)
+            .map_err(set_kind)?
     };
     let payload = rrk_model::encode_pages(&pages);
     if let Some((store, mem)) = CACHE
@@ -1161,6 +1208,14 @@ pub unsafe extern "C" fn rrk_hit_test(
     })
 }
 
+/// 请求取消进行中的排版（尽力取消，块粒度）：`rrk_pages_json` 在块间检查并以
+/// `Cancelled`（1005）返回；布局未开始时的置位会在下次布局起点被消费，无副作用。
+#[no_mangle]
+pub extern "C" fn rrk_layout_cancel() -> u32 {
+    LAYOUT_CANCEL.store(true, Ordering::Relaxed);
+    0
+}
+
 /// 远跳预取：预热本章布局 + 保护窗口（当前章 + 相邻章）。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_prefetch(
@@ -1255,6 +1310,36 @@ pub unsafe extern "C" fn rrk_encode_png_bgra(
         let pixels = std::slice::from_raw_parts(src, src_len);
         let png = rrk_image::encode_png_bgra(width, height, stride, pixels).map_err(set_kind)?;
         write_buf(png, out_ptr, out_len);
+        Ok(0)
+    })
+}
+
+/// 解码整图并等比缩到 `max_edge`（长边）→ RGBA 缓冲 + 尺寸（第三方接入面）。
+///
+/// 原图已在 `max_edge` 内则不缩仅解码；AVIF/HEIC 等内核不解像素的格式报
+/// `UnsupportedFormat`（1002，宿主取原始字节自行解码）。缓冲由 `rrk_buf_free` 释放。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_image_thumbnail(
+    data: *const u8,
+    len: usize,
+    max_edge: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    out_w: *mut u32,
+    out_h: *mut u32,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() || out_w.is_null() || out_h.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        if data.is_null() || len == 0 {
+            return Err(set_kind(RrkError::invalid("空输入")));
+        }
+        let bytes = std::slice::from_raw_parts(data, len);
+        let t = rrk_image::thumbnail(bytes, max_edge).map_err(set_kind)?;
+        *out_w = t.width;
+        *out_h = t.height;
+        write_buf(t.rgba, out_ptr, out_len);
         Ok(0)
     })
 }
@@ -1389,6 +1474,40 @@ pub unsafe extern "C" fn rrk_search_next(
 #[no_mangle]
 pub extern "C" fn rrk_search_cancel(search_id: rrk_kernel::SearchId) -> u32 {
     guard(|| with_kernel(|k| k.search_cancel(search_id).map_err(set_kind)).map(|_| 0))
+}
+
+/// 轻量**单章**搜索（第三方接入面）：不注册会话，同步扫完返回整页命中 JSON
+/// （结构与 `rrk_search_next` 的批次一致，坐标同源）。
+/// `max_hits = 0` 取内核默认上限（1000）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_search_chapter(
+    handle: BookHandle,
+    chapter: u32,
+    query_ptr: *const u8,
+    query_len: usize,
+    case_sensitive: u32,
+    context_chars: u32,
+    max_hits: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    guard(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Err(set_kind(RrkError::invalid("空指针")));
+        }
+        let query = read_utf8(query_ptr, query_len, "检索词")?;
+        let opts = rrk_search::SearchOptions {
+            case_sensitive: case_sensitive != 0,
+            context_chars: if context_chars == 0 { 30 } else { context_chars },
+        };
+        with_kernel(|k| {
+            let page = k
+                .search_chapter(handle, chapter, &query, opts, max_hits)
+                .map_err(set_kind)?;
+            write_buf(search_page_json(&page), out_ptr, out_len);
+            Ok(0)
+        })
+    })
 }
 
 /// 开一个 BM25 索引会话；成功返回 `index_id`（≥1），失败返回 0。

@@ -398,6 +398,57 @@ pub fn dimensions_strict(bytes: &[u8]) -> RrkResult<ImageSize> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// 缩略图（第三方接入面）：解码 → 等比缩到 max_edge 内 → RGBA
+// ---------------------------------------------------------------------------
+
+/// 缩略图结果：RGBA8 位图（宿主直接上屏或自行编码落盘）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thumbnail {
+    pub width: u32,
+    pub height: u32,
+    /// RGBA8，长度 = width * height * 4。
+    pub rgba: Vec<u8>,
+}
+
+/// 解码整图并等比缩到 `max_edge`（长边）以内，返回 RGBA 位图。
+///
+/// - 原图已在 `max_edge` 内则不缩放，仅解码；
+/// - AVIF/HEIC（内核不解像素）与无法识别的格式报 `UnsupportedFormat`（1002），
+///   宿主可取原始字节自行解码；已识别但损坏报 `CorruptData`（1003）；
+/// - 不写盘（落盘归宿主）。
+pub fn thumbnail(bytes: &[u8], max_edge: u32) -> RrkResult<Thumbnail> {
+    if let Some(s) = dimensions(bytes) {
+        if !s.format.decodable() {
+            return Err(RrkError::unsupported(format!(
+                "{} 内核不做像素解码，请取原始字节自行解码（或改用尺寸头）",
+                s.format.name()
+            )));
+        }
+    }
+    let img = image::load_from_memory(bytes).map_err(|e| {
+        if dimensions(bytes).is_some() {
+            RrkError::corrupt(format!("图片解码失败: {e}"))
+        } else {
+            RrkError::unsupported(format!(
+                "无法识别的图片格式（支持 PNG/JPEG/GIF/BMP/WebP/TIFF）: {e}"
+            ))
+        }
+    })?;
+    let (w, h) = (img.width(), img.height());
+    let max_edge = max_edge.max(1);
+    let img = if w <= max_edge && h <= max_edge {
+        img
+    } else {
+        let scale = max_edge as f32 / w.max(h) as f32;
+        let tw = ((w as f32 * scale).round() as u32).max(1);
+        let th = ((h as f32 * scale).round() as u32).max(1);
+        img.resize_exact(tw, th, image::imageops::FilterType::Triangle)
+    };
+    let (ow, oh) = (img.width(), img.height());
+    Ok(Thumbnail { width: ow, height: oh, rgba: img.to_rgba8().into_raw() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +686,63 @@ mod tests {
 
     fn size(w: u32, h: u32, format: ImageFormat) -> ImageSize {
         ImageSize { width: w, height: h, format }
+    }
+
+    /// 缩略图：等比缩放 + 超界不缩 + 畸形格式诚实报错（第三方接入面）。
+    #[test]
+    fn thumbnail_scales_and_fails_honest() {
+        // 用自研编码器造一张真 PNG（8x4 纯色）
+        let (w, h) = (8u32, 4u32);
+        let rgba: Vec<u8> = (0..w * h).flat_map(|i| [i as u8, 0, 0, 255]).collect();
+        let png = encode_png_bgra(w, h, (w * 4) as usize, &rgba).unwrap();
+
+        // max_edge 大于原图：不缩，仅解码
+        let t = thumbnail(&png, 100).unwrap();
+        assert_eq!((t.width, t.height), (8, 4));
+        assert_eq!(t.rgba.len(), (8 * 4 * 4) as usize);
+
+        // 长边缩到 4：8x4 → 4x2（等比）
+        let t2 = thumbnail(&png, 4).unwrap();
+        assert_eq!((t2.width, t2.height), (4, 2));
+        assert_eq!(t2.rgba.len(), (4 * 2 * 4) as usize);
+
+        // 无法识别 → UnsupportedFormat（宿主据 1002 回落）
+        let err = thumbnail(b"definitely not an image", 10).unwrap_err();
+        assert_eq!(err.kind, rrk_model::RrkErrorKind::UnsupportedFormat);
+        // AVIF 字节（可识别但内核不解像素）→ UnsupportedFormat
+        let mut avif = bmff_avif_header();
+        avif.extend_from_slice(&[0u8; 64]); // 无真实码流：头可识别即可
+        let err2 = thumbnail(&avif, 10).unwrap_err();
+        assert_eq!(err2.kind, rrk_model::RrkErrorKind::UnsupportedFormat);
+    }
+
+    /// 造最小 avif ftyp+meta 头（复用 heif 探测所需的盒链）。
+    fn bmff_avif_header() -> Vec<u8> {
+        let mut v = Vec::new();
+        let ftyp_body = [b"avif".as_slice(), &0u32.to_be_bytes(), b"mif1avif"].concat();
+        v.extend_from_slice(&((ftyp_body.len() + 8) as u32).to_be_bytes());
+        v.extend_from_slice(b"ftyp");
+        v.extend_from_slice(&ftyp_body);
+        let mut ispe = Vec::new();
+        ispe.extend_from_slice(&16u32.to_be_bytes());
+        ispe.extend_from_slice(b"ispe");
+        ispe.extend_from_slice(&0u32.to_be_bytes());
+        ispe.extend_from_slice(&8u32.to_be_bytes());
+        ispe.extend_from_slice(&8u32.to_be_bytes());
+        let mut ipco = Vec::new();
+        ipco.extend_from_slice(&((ispe.len() + 8) as u32).to_be_bytes());
+        ipco.extend_from_slice(b"ipco");
+        ipco.extend_from_slice(&ispe);
+        let mut iprp = Vec::new();
+        iprp.extend_from_slice(&((ipco.len() + 8) as u32).to_be_bytes());
+        iprp.extend_from_slice(b"iprp");
+        iprp.extend_from_slice(&ipco);
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&((iprp.len() + 12) as u32).to_be_bytes());
+        meta.extend_from_slice(b"meta");
+        meta.extend_from_slice(&0u32.to_be_bytes());
+        meta.extend_from_slice(&iprp);
+        v.extend_from_slice(&meta);
+        v
     }
 }

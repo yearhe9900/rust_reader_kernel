@@ -835,6 +835,7 @@ version = "0.1.2"
 dependencies = [
  "rrk-format",
  "rrk-model",
+ "rrk-txt",
 ]
 
 [[package]]

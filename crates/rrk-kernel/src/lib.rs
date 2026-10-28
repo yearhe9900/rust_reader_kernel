@@ -18,7 +18,7 @@ use rrk_model::{
     TocNode,
 };
 use rrk_pdf::PdfAdapter;
-use rrk_search::{search_text, Bm25, Bm25Builder, SearchOptions, SearchSession};
+use rrk_search::{search_text, Bm25, Bm25Builder, SearchOptions, SearchPage, SearchSession};
 use rrk_txt::TxtAdapter;
 
 mod codec;
@@ -465,6 +465,36 @@ impl Kernel {
             .ok_or_else(|| RrkError::invalid(format!("检索会话不存在或已取消: {id}")))?;
         cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    /// 轻量**单章**搜索（第三方接入面）：不注册会话、同步扫完即弃，
+    /// 扫描/坐标/snippet 与全书会话同源（`SearchSession::open_chapter`）。
+    ///
+    /// `max_hits = 0` 取默认上限 1000；命中坐标与全书搜索一致
+    /// （章文本字节偏移 + `source_anchor` 源映射）。
+    pub fn search_chapter(
+        &mut self,
+        handle: BookHandle,
+        chapter: u32,
+        query: &str,
+        opts: SearchOptions,
+        max_hits: u32,
+    ) -> RrkResult<SearchPage> {
+        let book = self.book_arc(handle)?;
+        let mut session = SearchSession::open_chapter(book, chapter, query, opts)?;
+        let cap = if max_hits == 0 { 1000 } else { max_hits as usize };
+        let mut out = SearchPage::default();
+        while out.hits.len() < cap {
+            let page = session.next((cap - out.hits.len()) as u32)?;
+            out.hits.extend(page.hits);
+            out.scanned = page.scanned;
+            out.total = page.total;
+            if page.done {
+                break;
+            }
+        }
+        out.hits.truncate(cap);
+        Ok(out)
     }
 
     /// 当前存活的检索会话数（生命周期自检/测试用）。

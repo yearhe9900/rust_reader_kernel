@@ -1,0 +1,4 @@
+# cargo-fuzz 产物（语料/崩溃样例本地保留，CI 每晚从零跑）
+corpus/
+artifacts/
+target/
