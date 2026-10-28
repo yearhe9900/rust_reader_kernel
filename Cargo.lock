@@ -699,14 +699,14 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rrk-cache"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rrk-model",
 ]
 
 [[package]]
 name = "rrk-cbz"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "image",
  "rrk-format",
@@ -717,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "rrk-epub"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rrk-format",
  "rrk-markup",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "rrk-ffi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rrk-cache",
  "rrk-image",
@@ -739,14 +739,14 @@ dependencies = [
 
 [[package]]
 name = "rrk-format"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rrk-model",
 ]
 
 [[package]]
 name = "rrk-image"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "image",
@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "rrk-inspect"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "image",
  "rrk-cbz",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "rrk-kernel"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rrk-cache",
  "rrk-cbz",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "rrk-layout"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cosmic-text",
  "parley",
@@ -797,14 +797,14 @@ dependencies = [
 
 [[package]]
 name = "rrk-markup"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rrk-model",
 ]
 
 [[package]]
 name = "rrk-mobi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "encoding_rs",
  "rrk-format",
@@ -815,11 +815,11 @@ dependencies = [
 
 [[package]]
 name = "rrk-model"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "rrk-pdf"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "image",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "rrk-search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rrk-format",
  "rrk-model",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "rrk-txt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "rrk-zip"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "encoding_rs",
  "flate2",

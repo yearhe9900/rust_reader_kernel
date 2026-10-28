@@ -5,7 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.3.0] - 2026-10-28
+
+**ABI 8 → 10**：v8 = 稳定错误码/内容级缓存（issue #11、#12）；v9 = blocks
+部件流等接入面扩充；v10 = `rrk_load_headings`（issue #13）。Dart 封装
+（`kRrkAbiVersion = 10`）与预编译原生库必须同步升级。另含：fuzz 六轮实锤
+的解析器防御加固系列（txt/markup/pdf/zip）、CI 基建（bench/fuzz/cbindgen/
+GPG 签名 Release）与本地 fuzz 工具链落地。
 
 ### Fixed
 
