@@ -554,7 +554,9 @@ impl FormatAdapter for TxtAdapter {
         if MAGIC_REJECT.iter().any(|m| head.starts_with(m)) {
             return 0;
         }
-        if head.len() >= 60 {
+        // Palm DB 魔数在偏移 60（修复：原写 `>= 60` 却切 [60..68]——长度
+        // 60~67 的输入必切片越界 panic；fuzz 目标 format_open 首轮即命中）
+        if head.len() >= 68 {
             let palm = &head[60..68];
             if palm == b"BOOKMOBI" || palm == b"TEXtREAd" {
                 return 0; // MOBI/AZW3
@@ -644,6 +646,20 @@ impl BookSource for TxtBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fuzz 回归（format_open 首轮命中）：长度 60~67 的输入触发
+    /// `head[60..68]` 切片越界 panic——Palm 魔数检查必须以 >=68 为门。
+    #[test]
+    fn sniff_palm_magic_boundary_no_panic() {
+        for len in 58..=70usize {
+            let head = vec![b'A'; len];
+            let _ = TxtAdapter.sniff(&head, Some("x.txt")); // 不 panic 即过
+        }
+        // 真魔数在 68 边界后仍被正确识别
+        let mut mobi = vec![0u8; 68];
+        mobi[60..68].copy_from_slice(b"BOOKMOBI");
+        assert_eq!(TxtAdapter.sniff(&mobi, None), 0, "MOBI 应让位");
+    }
 
     #[test]
     fn heading_patterns() {

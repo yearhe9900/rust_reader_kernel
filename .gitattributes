@@ -1,0 +1,3 @@
+# 统一 LF（关键：fixtures 的字节偏移在测试与 bench 中被断言——
+# Windows autocrlf 转 CRLF 会让同一测试在本机与 CI 上算出不同偏移）
+* text=auto eol=lf

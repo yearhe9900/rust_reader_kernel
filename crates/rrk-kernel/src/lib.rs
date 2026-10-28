@@ -796,22 +796,33 @@ mod tests {
         assert_eq!(u[2], u16s[1]);
     }
 
-    /// 选区取文：越界夹取 + 字符边界对齐。
+    /// 选区取文：越界夹取 + 字符边界对齐（边界从实际文本推导，不硬编码——
+    /// fixtures 在不同平台 checkout 可能是 LF/CRLF，硬编码偏移在 CI 上会切在
+    /// 汉字中间——这正是首次 CI 失败的原因）。
     #[test]
     fn slice_text_clamps() {
         let mut k = Kernel::new();
         let h = k.open_path("../../fixtures/sample.txt").unwrap();
-        let full = k.slice_text(h, 0, 0, u32::MAX).unwrap();
         let text = { let c = k.load_chapter_cached(h, 0).unwrap(); c.text };
+        // 取第 2、5 个字符的起始字节（对行尾/偏移不敏感）
+        let b1 = text.char_indices().nth(1).map(|(b, _)| b).unwrap();
+        let b2 = text.char_indices().nth(5).map(|(b, _)| b).unwrap();
+        assert!(b1 < b2 && text.is_char_boundary(b1) && text.is_char_boundary(b2));
+
+        let full = k.slice_text(h, 0, 0, u32::MAX).unwrap();
         assert_eq!(full, &*text, "全范围应返回整章");
-        let mid = k.slice_text(h, 0, 3, 9).unwrap();
-        assert_eq!(mid, &text[3..9]);
-        // 非边界起点（4 落在 CJK 字中间）→ 向下取整到 3
-        let snapped = k.slice_text(h, 0, 4, 5).unwrap();
-        assert_eq!(snapped, &text[3..6.min(text.len())]);
+        let mid = k.slice_text(h, 0, b1, b2).unwrap();
+        assert_eq!(mid, &text[b1..b2]);
+        // 非边界起点（b1+1 落在多字节字符中间）→ 向下取整到 b1
+        let snapped = k.slice_text(h, 0, b1 + 1, b1 + 2).unwrap();
+        let mut s = (b1 + 1) as usize;
+        while s > 0 && !text.is_char_boundary(s) { s -= 1; }
+        let mut e = (b1 + 2) as usize;
+        while e < text.len() && !text.is_char_boundary(e) { e += 1; }
+        assert_eq!(snapped, &text[s..e]);
         // 反转区间自动交换
-        let swapped = k.slice_text(h, 0, 9, 3).unwrap();
-        assert_eq!(swapped, &text[3..9]);
+        let swapped = k.slice_text(h, 0, b2, b1).unwrap();
+        assert_eq!(swapped, &text[b1..b2]);
     }
 
     /// 端到端：建索引 → 拉字节 → 从字节重载 → 查询结果一致。
