@@ -25,6 +25,10 @@
   5. **循环页面树栈溢出（CI 三轮命中）**：Page 节点自带自指 `/Kids` 时
      walk_pages 无限递归——页面树深度上限 64 截断（真实文档树深≤十几层）；
      回归用例 fuzz_stackoverflow_page_tree_cycle_terminated
+  6. **分支循环树超时（CI 四轮命中）**：自指 Pages + 宽 Kids 数组在 64 层深度内
+     节点访问量指数爆炸——深度上限不足以约束总访问量；walk_pages 三重限制
+     （深度 64 / 总访问 100 万 / 页数 10 万，同 pdfium·mupdf 口径）；
+     回归用例 fuzz_timeout_branching_cycle_tree_terminated（含 10s 时限断言）
 
 ### Added
 
