@@ -1,0 +1,69 @@
+name: Release
+
+# 打 tag（v*）自动：三平台构建 rrk_ffi 产物 + SHA256SUMS + GPG 分离签名
+# + 附加到 GitHub Release。
+#
+# GPG 签名（可选，缺密钥自动跳过）：仓库 Settings → Secrets and variables → Actions
+# 添加 `GPG_PRIVATE_KEY`（`gpg --armor --export-secret-keys YOUR_ID` 的输出）与
+# `GPG_PASSPHRASE`；可选 `GPG_KEY_ID`（多把密钥时指定签名钥）。公钥请发布到
+# keyserver 或 GitHub Profile，宿主验证见 README「Release 产物与验证」。
+# 平台证书签名（Apple Developer / Azure Trusted Signing）另见 docs/ROADMAP.md。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 构建 rrk_ffi（release）
+        run: cargo build --release -p rrk-ffi
+      - name: 组装产物目录
+        shell: bash
+        run: |
+          mkdir -p dist-out
+          cp target/release/rrk_ffi.dll dist-out/ 2>/dev/null || true
+          cp target/release/librrk_ffi.so dist-out/ 2>/dev/null || true
+          cp target/release/librrk_ffi.dylib dist-out/ 2>/dev/null || true
+          cp bindings/rrk.h dist-out/
+          cd dist-out && sha256sum * > SHA256SUMS.txt || shasum -a 256 * > SHA256SUMS.txt
+      - name: 导入 GPG 签名密钥
+        if: env.GPG_PRIVATE_KEY != ''
+        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import 2>&1 | tail -2
+      - name: GPG 分离签名校验和
+        if: env.GPG_PRIVATE_KEY != ''
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        shell: bash
+        run: |
+          cd dist-out
+          if [ -n "$GPG_KEY_ID" ]; then U="-u $GPG_KEY_ID"; else U=""; fi
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              $U --detach-sign --armor SHA256SUMS.txt
+          gpg --verify SHA256SUMS.txt.sig SHA256SUMS.txt
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: rrk_ffi-${{ matrix.os }}
+          path: dist-out/
+      - name: 附加到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-out/*
+          generate_release_notes: true

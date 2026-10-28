@@ -67,6 +67,30 @@ SKIP_ANDROID=1 bash scripts/package-release.sh   # 只打 Windows
 gh release create v0.1.2 dist/rrk_reader-0.1.2.zip --generate-notes
 ```
 
+### Release 产物与验证
+
+打 tag（`v*`）后 GitHub Actions（`.github/workflows/release.yml`）自动构建三平台
+`rrk_ffi` 动态库，Release 附件包含：
+
+- `rrk_ffi.dll` / `librrk_ffi.so` / `librrk_ffi.dylib`（release 构建）
+- `rrk.h`（cbindgen 生成的 C 头文件，与源码同 commit）
+- `SHA256SUMS.txt`（各产物 SHA-256）
+- `SHA256SUMS.txt.sig`（GPG 分离签名，**未配置密钥时自动跳过**）
+
+宿主侧验证完整性：
+
+```sh
+sha256sum -c SHA256SUMS.txt                    # 1. 校验产物未被篡改
+gpg --import docs/keys/hzp9900-maintainer.asc  # 2. 导入维护者公钥（仓库内，一次性）
+gpg --verify SHA256SUMS.txt.sig SHA256SUMS.txt # 3. 验证校验和可信
+```
+
+维护者配置（一次性）：生成 GPG 密钥后，将 `gpg --armor --export-secret-keys
+YOUR_ID` 的输出存入仓库 Settings → Secrets 的 `GPG_PRIVATE_KEY`，口令存
+`GPG_PASSPHRASE`（多把密钥时用 `GPG_KEY_ID` 指定签名钥）；公钥发布到 keyserver
+或 GitHub Profile 供宿主导入。平台证书签名（Apple Developer / Azure Trusted
+Signing）的选型与成本见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
 ### 命令行工具（rrk-inspect）
 
 解析诊断工具：书目 / 章索引 / 目录 / 章内容 / 页渲染。

@@ -5,9 +5,37 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.2.0] - 2026-10-28
+
+**ABI 7 → 9**：本版含两轮破坏性变更（v8 = 稳定错误码/内容级缓存，v9 = blocks
+部件流），Dart 封装（`kRrkAbiVersion = 9`）与预编译原生库必须同步升级。
+
+### Changed
+
+- **ABI 8 → 9（宿主必须同步升级原生库与 Dart 封装）**：
+  1. **blocks JSON 改部件流**：`rrk_load_chapter` / `rrk_load_page_json` 的
+     blocks 不再内嵌正文——文本给章文本的字节区间 `[start,end]`、行内图片给
+     `["key"]`，宿主按序拼接（图片位插 `\u{FFFC}key\u{FFFC}`），与旧格式
+     逐字节一致（rrk-model `block_parts_reconstruct_flatten_text` 单测钉死）；
+     大章跨 FFI 带宽减半（实测样张 blocks 46B）；Dart 绑定已按字节区间重建。
+  2. **排版器池**：`min(可用并行度, 4)` 台 parley FontContext 轮转取用，
+     并行排版吞吐随池叠加（线程安全矩阵已更新）。
 
 ### Added
+
+- **PDF 渲染深化**：图像 XObject 文档级解码缓存（同一图跨页/跨 Do 只
+  inflate+解码一次，96MB 上限整表回收）；裁剪相交限定在路径包围盒内
+  （免全页逐字节 min）。
+- **cbindgen 接入**：`cbindgen.toml` + `bindings/rrk.h` 改为生成产物
+  （文档注释从 Rust 源带入）；CI 新增 `cbindgen --verify` 漂移校验与
+  `gcc -fsyntax-only` 头文件语法检查。
+- **Release 自动化**：`.github/workflows/release.yml`——打 tag（v*）自动
+  三平台构建 + SHA256SUMS + 附加到 GitHub Release（签名仍需证书托管，见 ROADMAP）。
+- **FFI 出口基准 bench_ffi**（bench 盲区）：经 C ABI 实测载章/部件流体量/
+  缓存命中/PDF 光栅化/stats，已挂 CI bench job。
+- **Release GPG 签名**：release.yml 支持对 `SHA256SUMS.txt` 做 GPG 分离签名
+  （仓库 Secrets 配 `GPG_PRIVATE_KEY`/`GPG_PASSPHRASE`，可选 `GPG_KEY_ID`；
+  未配置自动跳过）；README 新增「Release 产物与验证」（宿主验证三步）。
 
 - **清单剩余项批次（第三方接入面收尾）**：
   1. **轻量单章搜索**：`SearchSession::open_chapter`（与全书会话同源的扫描/坐标/
