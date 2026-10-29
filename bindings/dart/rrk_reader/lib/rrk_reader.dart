@@ -1258,7 +1258,8 @@ class RrkBook {
   }
 
   /// 轻量**单章**搜索：不建会话，同步扫完返回整页命中（坐标与全书搜索同源）。
-  /// [maxHits] = 0 取内核默认上限（1000）。
+  /// [maxHits] = 0 取内核默认上限（1000）；命中被截断时 `SearchBatch.done`
+  /// 为 false（结果不完整，可增大 maxHits 重调），真正扫完为 true（issue #14）。
   SearchBatch searchChapter(int chapterId, String query,
       {bool caseSensitive = false, int contextChars = 30, int maxHits = 0}) {
     _check();

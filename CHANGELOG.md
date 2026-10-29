@@ -29,6 +29,28 @@
   验证：cargo test --workspace 全绿（新增五格式缓存命中/损坏重建回环 +
   跨内核实例磁盘命中端到端测试）。
 
+- **FFI 红线机器门禁**：`rrk-ffi` 生产代码 clippy 级禁用 `unwrap`/`expect`/
+  `panic!`（`cfg_attr(not(test), deny(...))`）+ CI clippy 红线步；源码扫描回归
+  测试 `every_ffi_export_is_guarded` 逐出口校验 catch_unwind 兜底——新增出口
+  漏兜底即红；`guard_catches_panic_to_2001` 固化 panic → 2001 语义。
+
+- **排版金样（golden）测试**：`rrk-layout` 新增确定性排版回归面——
+  `Layouter::with_font_context`（注入 `FontContext`，可禁系统字体）+ 仓内
+  金样字体 `tests/fonts/RRKGoldenSans.otf`（Noto Sans SC 子集 + OFL 改名，
+  73 KB）；6 组用例（中文主排/中西文混排/边界样张 × 样式/视口）以人类可读
+  文本金样固化断行、分页、游程坐标，升级 parley/调断行参数时 diff 即排版
+  真相变化；`RRK_GOLDEN_BLESS=1` 再生成；用例内含纯函数口径对拍（同输入
+  两次排版必须全等）。
+
+### Fixed
+
+- **FFI 红线加固（panic 不穿 C ABI）**：4 个未兜底出口（`rrk_abi_version` /
+  `rrk_last_error_code` / `rrk_book_kind` / `rrk_layout_cancel`）统一接
+  `guard`/`guard_val` 兜底；4 处内联 `catch_unwind`（`rrk_open` /
+  `rrk_search_open` / `rrk_bm25_open` / `rrk_bm25_load`）收敛到同一
+  `guard_val`；panic 记录路径自身再套 `catch_unwind`（线程退出期 TLS 二次
+  panic 不得穿 ABI）。
+
 ## [0.3.0] - 2026-10-28
 
 **ABI 8 → 10**：v8 = 稳定错误码/内容级缓存（issue #11、#12）；v9 = blocks

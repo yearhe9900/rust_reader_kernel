@@ -558,16 +558,22 @@ impl Kernel {
         let mut session = SearchSession::open_chapter(book, chapter, query, opts)?;
         let cap = if max_hits == 0 { 1000 } else { max_hits as usize };
         let mut out = SearchPage::default();
+        // done = 扫描确实完成（issue #14）：命中被 cap 截断时保持 false，
+        // 调用方据「契约字段」得知结果不完整、可增大 maxHits 重调；
+        // 真正扫完才置 true（同步 API 空结果场景同样为 true）。
+        let mut finished = false;
         while out.hits.len() < cap {
             let page = session.next((cap - out.hits.len()) as u32)?;
             out.hits.extend(page.hits);
             out.scanned = page.scanned;
             out.total = page.total;
             if page.done {
+                finished = true;
                 break;
             }
         }
         out.hits.truncate(cap);
+        out.done = finished;
         Ok(out)
     }
 
@@ -929,6 +935,26 @@ mod tests {
         // 反转区间自动交换
         let swapped = k.slice_text(h, 0, b2 as u32, b1 as u32).unwrap();
         assert_eq!(swapped, &text[b1..b2]);
+    }
+
+    /// issue #14：search_chapter 的 done 语义——真正扫完为 true，
+    /// 命中被 maxHits 截断时保持 false（调用方据此增大上限重调）。
+    #[test]
+    fn search_chapter_done_semantics() {
+        use rrk_search::SearchOptions;
+        let mut k = Kernel::new();
+        let h = k.open_path("../../fixtures/sample.txt").unwrap();
+        // “rust_reader_kernel” 含多个 e：不限上限 → 扫完 = done true
+        let page = k.search_chapter(h, 0, "e", SearchOptions::default(), 0).unwrap();
+        assert!(page.hits.len() >= 2, "样例首章应多处命中: {}", page.hits.len());
+        assert!(page.done, "不限上限应扫完");
+        // maxHits=1 截断 → done=false（结果不完整的信号）
+        let page1 = k.search_chapter(h, 0, "e", SearchOptions::default(), 1).unwrap();
+        assert_eq!(page1.hits.len(), 1, "应被截断到 1 条");
+        assert!(!page1.done, "截断时 done 应为 false");
+        // 无命中章同样扫完 = true
+        let empty = k.search_chapter(h, 1, "绝对不存在的词xyz", SearchOptions::default(), 0).unwrap();
+        assert!(empty.hits.is_empty() && empty.done, "无命中应扫完");
     }
 
     /// issue #13：章标题块轻量出口（sample.epub 首章含 h1）。
