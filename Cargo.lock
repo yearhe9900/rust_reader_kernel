@@ -709,6 +709,7 @@ name = "rrk-cbz"
 version = "0.3.0"
 dependencies = [
  "image",
+ "rrk-cache",
  "rrk-format",
  "rrk-image",
  "rrk-model",
@@ -719,6 +720,7 @@ dependencies = [
 name = "rrk-epub"
 version = "0.3.0"
 dependencies = [
+ "rrk-cache",
  "rrk-format",
  "rrk-markup",
  "rrk-model",
@@ -741,6 +743,7 @@ dependencies = [
 name = "rrk-format"
 version = "0.3.0"
 dependencies = [
+ "rrk-cache",
  "rrk-model",
 ]
 
@@ -807,6 +810,7 @@ name = "rrk-mobi"
 version = "0.3.0"
 dependencies = [
  "encoding_rs",
+ "rrk-cache",
  "rrk-format",
  "rrk-markup",
  "rrk-model",
@@ -823,6 +827,7 @@ version = "0.3.0"
 dependencies = [
  "flate2",
  "image",
+ "rrk-cache",
  "rrk-format",
  "rrk-model",
  "swash 0.2.10",
@@ -844,6 +849,7 @@ version = "0.3.0"
 dependencies = [
  "chardetng",
  "encoding_rs",
+ "rrk-cache",
  "rrk-format",
  "rrk-model",
 ]

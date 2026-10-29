@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rrk_cache::CacheKey;
 use rrk_model::{
     BookMeta, ChapterContent, ChapterEntry, ChapterId, FormatId, PageEntry, PagedContent, Resource,
     ResourceKey, RrkError, RrkResult, TocNode,
@@ -78,6 +79,85 @@ impl From<&Path> for ContentSource {
 }
 
 // ---------------------------------------------------------------------------
+// open 索引缓存（缓存句柄下沉 adapter）
+// ---------------------------------------------------------------------------
+
+/// open 期索引缓存：缓存句柄下沉到 adapter 的入参契约
+/// （ROADMAP「章级/页级缓存持久化扩展」）。
+///
+/// 适配器把重建代价高的 open 索引（entries / pages / toc_raw …）按内容 key
+/// （[`CacheKey::content`]）交由此缓存持久化；重开命中即载入免重建。
+/// 载荷编解码归各适配器（自带 magic + schema，损坏/升级自动丢弃重算）；
+/// `save` 失败不致命（降级为无缓存解析，调用方不感知）。
+pub trait IndexCache: Send + Sync {
+    /// 载入 open 索引字节；未命中 / 损坏返回 `None`。
+    fn load(&self, key: &CacheKey) -> Option<Vec<u8>>;
+
+    /// 写入 open 索引字节（失败静默降级）。
+    fn save(&self, key: &CacheKey, payload: &[u8]);
+}
+
+/// 空缓存（Null Object）：未配置缓存时的零成本替身，load 恒未命中、save 丢弃。
+pub struct NullIndexCache;
+
+impl IndexCache for NullIndexCache {
+    fn load(&self, _key: &CacheKey) -> Option<Vec<u8>> {
+        None
+    }
+    fn save(&self, _key: &CacheKey, _payload: &[u8]) {}
+}
+
+/// 内存索引缓存（进程内字节表 + 命中/未命中计数）。
+///
+/// 供嵌入方无磁盘缓存场景与测试使用；生产落盘实现见内核的磁盘版。
+pub struct MemIndexCache {
+    map: std::sync::Mutex<std::collections::HashMap<CacheKey, Vec<u8>>>,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+}
+
+impl MemIndexCache {
+    pub fn new() -> Self {
+        Self {
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// 命中次数（测试/观测用）。
+    pub fn hits(&self) -> u64 {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 未命中次数（测试/观测用）。
+    pub fn misses(&self) -> u64 {
+        self.misses.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for MemIndexCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IndexCache for MemIndexCache {
+    fn load(&self, key: &CacheKey) -> Option<Vec<u8>> {
+        let got = self.map.lock().unwrap().get(key).cloned();
+        if got.is_some() {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        got
+    }
+    fn save(&self, key: &CacheKey, payload: &[u8]) {
+        self.map.lock().unwrap().insert(*key, payload.to_vec());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 适配器与书源契约
 // ---------------------------------------------------------------------------
 
@@ -90,6 +170,19 @@ pub trait FormatAdapter: Send + Sync {
 
     /// 打开为统一书源。
     fn open(&self, src: &ContentSource) -> RrkResult<Box<dyn BookSource>>;
+
+    /// 打开为统一书源（带 open 索引缓存；默认回退无缓存 [`Self::open`]）。
+    ///
+    /// 支持缓存的适配器覆写此方法：重建代价高的 open 索引按内容 key 持久化，
+    /// 重开命中即载入免重建（open 期免重建，秒开书链路的地基）。
+    fn open_cached(
+        &self,
+        src: &ContentSource,
+        cache: &dyn IndexCache,
+    ) -> RrkResult<Box<dyn BookSource>> {
+        let _ = cache;
+        self.open(src)
+    }
 }
 
 /// 统一书源：所有格式的输出契约（吸收 foliate-js `sections.load/unload/size` 思想）。
@@ -183,14 +276,23 @@ impl FormatRegistry {
         best.map(|(_, a)| a)
     }
 
-    /// 打开一本书：嗅探 → 适配器 → 统一书源。
+    /// 打开一本书：嗅探 → 适配器 → 统一书源（无缓存）。
     pub fn open(&self, src: &ContentSource) -> RrkResult<Box<dyn BookSource>> {
+        self.open_cached(src, &NullIndexCache)
+    }
+
+    /// 打开一本书（带 open 索引缓存）：嗅探 → 适配器 → 统一书源。
+    pub fn open_cached(
+        &self,
+        src: &ContentSource,
+        cache: &dyn IndexCache,
+    ) -> RrkResult<Box<dyn BookSource>> {
         let head = src.read_head(4096)?;
         let adapter = self.detect(&head, src.name()).ok_or_else(|| {
             let name = src.name().unwrap_or("<memory>").to_string();
             RrkError::unsupported(format!("无法识别的格式: {name}"))
         })?;
-        adapter.open(src)
+        adapter.open_cached(src, cache)
     }
 }
 

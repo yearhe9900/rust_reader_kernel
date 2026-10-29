@@ -118,8 +118,10 @@ uint32_t rrk_content_cache_configure(const uint8_t *dir_ptr,
                                      uintptr_t mem_bytes);
 
 // 内容级缓存命中统计 JSON（issue #12：可观测性）：
-// `{"toc":{"hits","misses"},"chapter":{...},"outline":{...}}`。
-uint32_t rrk_content_cache_stats(uint8_t **out_ptr, uintptr_t *out_len);
+// `{"toc":{"hits","misses"},"chapter":{…},"outline":{…},"open":{…}}`。
+// `open` = open 索引（entries/pages/toc_raw）持久化命中（ROADMAP 章级/页级缓存持久化）。
+uint32_t rrk_content_cache_stats(uint8_t **out_ptr,
+                                 uintptr_t *out_len);
 
 // 汇总观测统计（第三方接入面）：
 // `{"open_books","searches","indexes","layout":{"hits","misses"},"content":{…}}`。

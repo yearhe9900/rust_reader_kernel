@@ -8,6 +8,7 @@ description = "Rust 阅读内核：PDF 适配器（自研解析 + L1 文本抽�
 [dependencies]
 rrk-model.workspace = true
 rrk-format.workspace = true
+rrk-cache.workspace = true
 flate2.workspace = true
 tiny-skia = "0.11"
 swash = "0.2"

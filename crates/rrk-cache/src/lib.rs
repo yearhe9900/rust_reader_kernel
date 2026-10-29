@@ -37,6 +37,17 @@ pub enum CacheKind {
     ChapterText,
     /// 章大纲（`chapters()` 条目表；内容级；以 TXT 大纲为主，其它格式顺带）。
     TxtOutline,
+    /// open 索引（EPUB：entries + toc_raw；ROADMAP 章级/页级缓存持久化，
+    /// key 为内容级 [`CacheKey::content`]，命中免 open 期重建）。
+    OpenEpub,
+    /// open 索引（MOBI/AZW3：spans + entries + toc）。
+    OpenMobi,
+    /// open 索引（CBZ：页表 + 尺寸表）。
+    OpenCbz,
+    /// open 索引（PDF：页面表 + 章表 + 目录）。
+    OpenPdf,
+    /// open 索引（TXT：章表）。
+    OpenTxt,
 }
 
 impl CacheKind {
@@ -49,6 +60,11 @@ impl CacheKind {
             CacheKind::Toc => 5,
             CacheKind::ChapterText => 6,
             CacheKind::TxtOutline => 7,
+            CacheKind::OpenEpub => 8,
+            CacheKind::OpenMobi => 9,
+            CacheKind::OpenCbz => 10,
+            CacheKind::OpenPdf => 11,
+            CacheKind::OpenTxt => 12,
         }
     }
 }

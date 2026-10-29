@@ -8,5 +8,6 @@ description = "Rust 阅读内核：TXT 适配器（编码三级检测 + 流式�
 [dependencies]
 rrk-model.workspace = true
 rrk-format.workspace = true
+rrk-cache.workspace = true
 encoding_rs.workspace = true
 chardetng.workspace = true

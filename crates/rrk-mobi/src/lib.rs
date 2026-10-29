@@ -8,6 +8,7 @@
 //! - **目录**：扫描 `<a filepos=...>` 锚点（MOBI6 目录页形态），filepos → 章映射；
 //! - **清洗**：复用 rrk-markup 的 XHTML→Block 管线（与 EPUB 同一套）。
 
+mod codec;
 mod huffcdic;
 mod palmdoc;
 mod parse;
@@ -18,7 +19,8 @@ use huffcdic::HuffCdic;
 use palmdoc::{decompress_palmdoc, remove_trailing_entries};
 use parse::{MobiContainer, COMPRESSION_HUFF_CDIC, COMPRESSION_NONE, COMPRESSION_PALMDOC};
 
-use rrk_format::{BookSource, ContentSource, FormatAdapter};
+use rrk_cache::{CacheKey, CacheKind};
+use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache};
 use rrk_markup::{clean_xhtml, CleanResult};
 use rrk_model::{
     fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
@@ -281,66 +283,117 @@ fn scan_filepos_anchors(text: &[u8]) -> Vec<(usize, String)> {
     out
 }
 
+/// 缓存 open 索引可信校验：spans 有序不重叠且在文本内、章表与 spans 对齐、
+/// 目录章号在范围内（防错配/损坏载荷）。
+fn index_ok(
+    spans: &[(usize, usize)],
+    entries: &[ChapterEntry],
+    toc: &[TocNode],
+    raw_len: usize,
+) -> bool {
+    !spans.is_empty()
+        && spans.iter().enumerate().all(|(i, &(s, e))| {
+            s <= e && e <= raw_len && (i == 0 || spans[i - 1].1 <= s)
+        })
+        && entries.len() == spans.len()
+        && entries.iter().enumerate().all(|(i, en)| {
+            en.id == i as u32 && en.byte_range == (spans[i].0 as u64, spans[i].1 as u64)
+        })
+        && toc_ok(toc, entries.len())
+}
+
+fn toc_ok(nodes: &[TocNode], n_chapters: usize) -> bool {
+    nodes.iter().all(|n| {
+        (n.chapter as usize) < n_chapters && toc_ok(&n.children, n_chapters)
+    })
+}
+
 impl MobiBook {
     pub fn parse(src: &ContentSource) -> RrkResult<Self> {
+        Self::parse_with_cache(src, &NullIndexCache)
+    }
+
+    /// open 索引（spans + entries + toc）按内容 key 持久化——重开命中免
+    /// 分段扫描、逐章清洗推导标题与 filepos 锚点扫描（open 期免重建；正文
+    /// 装配 inflate 仍需逐次做，章内容切片依赖文本本体）。
+    pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
         let bytes = src.read_all()?;
         let container = parse::parse(bytes)?;
         let raw = assemble_text(&container)?;
-
-        let spans = split_spans(&raw);
         let raw_arc: Arc<[u8]> = Arc::from(raw);
+        let content_hash = fnv1a64(&raw_arc[..raw_arc.len().min(1024 * 1024)]);
 
-        // 章索引 + 清洗缓存需求（标题推导在构建期做一次）；空段（html 壳/空 pagebreak）过滤
-        let mut entries = Vec::new();
-        let mut titles: Vec<Option<String>> = Vec::new();
-        let mut kept_spans: Vec<(usize, usize)> = Vec::new();
-        for &(start, end) in &spans {
-            let seg = &raw_arc[start..end];
-            let seg_str = parse::decode_text(seg, container.text_encoding);
-            let cleaned = clean_xhtml(&seg_str);
-            let has_text = cleaned.blocks.iter().any(|b| match b {
-                Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => {
-                    !inlines.is_empty()
+        let key = CacheKey::content(content_hash, CacheKind::OpenMobi);
+        let (spans, entries, toc) = match cache
+            .load(&key)
+            .and_then(|b| codec::decode(&b))
+            .filter(|(spans, entries, toc)| index_ok(spans, entries, toc, raw_arc.len()))
+        {
+            Some(x) => x,
+            None => {
+                let spans = split_spans(&raw_arc);
+
+                // 章索引 + 清洗缓存需求（标题推导在构建期做一次）；空段（html 壳/空 pagebreak）过滤
+                let mut entries = Vec::new();
+                let mut titles: Vec<Option<String>> = Vec::new();
+                let mut kept_spans: Vec<(usize, usize)> = Vec::new();
+                for &(start, end) in &spans {
+                    let seg = &raw_arc[start..end];
+                    let seg_str = parse::decode_text(seg, container.text_encoding);
+                    let cleaned = clean_xhtml(&seg_str);
+                    let has_text = cleaned.blocks.iter().any(|b| match b {
+                        Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => {
+                            !inlines.is_empty()
+                        }
+                        Block::Image { .. } | Block::Divider => true,
+                        Block::Quote { blocks } => !blocks.is_empty(),
+                    });
+                    if !has_text && spans.len() > 1 {
+                        continue;
+                    }
+                    kept_spans.push((start, end));
+                    titles.push(derive_title(&cleaned));
+                    let id = entries.len() as ChapterId;
+                    entries.push(ChapterEntry {
+                        id,
+                        title: None, // 稍后回填
+                        href: format!("mobi:{id}"),
+                        byte_range: (start as u64, end as u64),
+                        char_len: seg_str.chars().count() as u32,
+                        kind: ChapterKind::Text,
+                        part: 0,
+                    });
                 }
-                Block::Image { .. } | Block::Divider => true,
-                Block::Quote { blocks } => !blocks.is_empty(),
-            });
-            if !has_text && spans.len() > 1 {
-                continue;
-            }
-            kept_spans.push((start, end));
-            titles.push(derive_title(&cleaned));
-            let id = entries.len() as ChapterId;
-            entries.push(ChapterEntry {
-                id,
-                title: None, // 稍后回填
-                href: format!("mobi:{id}"),
-                byte_range: (start as u64, end as u64),
-                char_len: seg_str.chars().count() as u32,
-                kind: ChapterKind::Text,
-                part: 0,
-            });
-        }
-        let spans = kept_spans;
+                let spans = kept_spans;
 
-        // 目录：filepos 锚点 → 章 id；并回填章标题
-        let anchors = scan_filepos_anchors(&raw_arc);
-        let mut toc = Vec::new();
-        for (filepos, title) in anchors {
-            let Some(idx) = spans.iter().position(|&(s, e)| filepos >= s && filepos < e) else {
-                continue;
-            };
-            if entries[idx].title.is_none() {
-                entries[idx].title = Some(title.clone());
+                // 目录：filepos 锚点 → 章 id；并回填章标题
+                let anchors = scan_filepos_anchors(&raw_arc);
+                let mut toc = Vec::new();
+                for (filepos, title) in anchors {
+                    let Some(idx) = spans.iter().position(|&(s, e)| filepos >= s && filepos < e) else {
+                        continue;
+                    };
+                    if entries[idx].title.is_none() {
+                        entries[idx].title = Some(title.clone());
+                    }
+                    toc.push(TocNode {
+                        title,
+                        chapter: idx as ChapterId,
+                        anchor: None,
+                        children: Vec::new(),
+                    });
+                }
+                // 目录没覆盖到的章：用推导标题回填
+                for (entry, title) in entries.iter_mut().zip(titles) {
+                    if entry.title.is_none() {
+                        entry.title = title;
+                    }
+                }
+
+                cache.save(&key, &codec::encode(&spans, &entries, &toc));
+                (spans, entries, toc)
             }
-            toc.push(TocNode { title, chapter: idx as ChapterId, anchor: None, children: Vec::new() });
-        }
-        // 目录没覆盖到的章：用推导标题回填
-        for (entry, title) in entries.iter_mut().zip(titles) {
-            if entry.title.is_none() {
-                entry.title = title;
-            }
-        }
+        };
 
         let name = src.name().unwrap_or("未命名");
         let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name).to_string();
@@ -373,7 +426,7 @@ impl MobiBook {
                 .map(|s| clean_multiline(&s))
                 .filter(|s| !s.is_empty()),
             format,
-            content_hash: fnv1a64(&raw_arc[..raw_arc.len().min(1024 * 1024)]),
+            content_hash,
             cover: container.cover_record.map(|r| ResourceKey(format!("rec:{}", r))),
         };
 
@@ -445,6 +498,14 @@ impl FormatAdapter for MobiAdapter {
 
     fn open(&self, src: &ContentSource) -> RrkResult<Box<dyn BookSource>> {
         Ok(Box::new(MobiBook::parse(src)?))
+    }
+
+    fn open_cached(
+        &self,
+        src: &ContentSource,
+        cache: &dyn IndexCache,
+    ) -> RrkResult<Box<dyn BookSource>> {
+        Ok(Box::new(MobiBook::parse_with_cache(src, cache)?))
     }
 }
 
@@ -559,5 +620,56 @@ mod tests {
     fn derive_title_from_heading() {
         let cleaned = clean_xhtml("<h2>第二章 测试</h2><p>正文</p>");
         assert_eq!(derive_title(&cleaned).as_deref(), Some("第二章 测试"));
+    }
+
+    /// open 索引载荷编解码回环（spans + 章表 + 目录）+ 损坏丢弃。
+    #[test]
+    fn open_index_codec_roundtrip() {
+        let spans = vec![(0usize, 10usize), (10, 25)];
+        let entries = vec![
+            ChapterEntry {
+                id: 0,
+                title: Some("章一".into()),
+                href: "mobi:0".into(),
+                byte_range: (0, 10),
+                char_len: 4,
+                kind: ChapterKind::Text,
+                part: 0,
+            },
+            ChapterEntry {
+                id: 1,
+                title: None,
+                href: "mobi:1".into(),
+                byte_range: (10, 25),
+                char_len: 6,
+                kind: ChapterKind::Text,
+                part: 0,
+            },
+        ];
+        let toc = vec![TocNode {
+            title: "章二".into(),
+            chapter: 1,
+            anchor: None,
+            children: vec![],
+        }];
+        let d = codec::encode(&spans, &entries, &toc);
+        let (s2, e2, t2) = codec::decode(&d).unwrap();
+        assert_eq!(s2, spans);
+        assert_eq!(e2, entries);
+        assert_eq!(t2, toc);
+        assert!(codec::decode(b"garbage-not-a-payload").is_none());
+
+        // 可信校验：对齐 → 过；越界 / 错位 → 拒
+        assert!(index_ok(&spans, &entries, &toc, 25));
+        assert!(!index_ok(&spans, &entries, &toc, 24), "越界应拒");
+        let mut bad = entries.clone();
+        bad[1].byte_range = (0, 9);
+        assert!(!index_ok(&spans, &bad, &toc, 25), "章表与 spans 错位应拒");
+        assert!(!index_ok(&spans, &entries, &[TocNode {
+            title: "x".into(),
+            chapter: 9,
+            anchor: None,
+            children: vec![],
+        }], 25), "目录章号越界应拒");
     }
 }

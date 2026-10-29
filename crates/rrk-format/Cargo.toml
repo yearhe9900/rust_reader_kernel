@@ -7,3 +7,4 @@ description = "Rust 阅读内核：格式适配接口（FormatAdapter/BookSource
 
 [dependencies]
 rrk-model.workspace = true
+rrk-cache.workspace = true

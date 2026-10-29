@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use rrk_cache::{CacheKey, CacheKind, DiskStore, MemoryCache};
 use rrk_cbz::CbzAdapter;
 use rrk_epub::EpubAdapter;
-use rrk_format::{BookSource, ContentSource, FormatRegistry, PagedSource};
+use rrk_format::{BookSource, ContentSource, FormatRegistry, IndexCache, PagedSource};
 use rrk_mobi::MobiAdapter;
 use rrk_model::{
     flatten_blocks_spans, Block, BookKind, ChapterContent, ChapterEntry, ChapterKind, Inline,
@@ -35,6 +35,51 @@ pub struct ContentCacheStats {
     /// 章大纲命中/未命中次数。
     pub outline_hits: u64,
     pub outline_misses: u64,
+    /// open 索引（entries/pages/toc_raw）命中/未命中次数
+    /// （ROADMAP 章级/页级缓存持久化：open 期免重建）。
+    pub open_hits: u64,
+    pub open_misses: u64,
+}
+
+/// open 索引缓存句柄（缓存句柄下沉 adapter，ROADMAP 章级/页级缓存持久化）。
+///
+/// 只走 C2 磁盘层：open 索引一次性使用，不进 C1 内存 LRU 抢容量；
+/// 读写失败不致命（未命中/丢弃由 adapter 重建）。未配置缓存时不计数。
+struct OpenIndexStore<'a> {
+    store: Option<&'a DiskStore>,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+}
+
+impl<'a> OpenIndexStore<'a> {
+    fn new(store: Option<&'a DiskStore>) -> Self {
+        use std::sync::atomic::AtomicU64;
+        Self {
+            store,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+}
+
+impl IndexCache for OpenIndexStore<'_> {
+    fn load(&self, key: &CacheKey) -> Option<Vec<u8>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let store = self.store?;
+        let got = store.load(key);
+        if got.is_some() {
+            self.hits.fetch_add(1, Relaxed);
+        } else {
+            self.misses.fetch_add(1, Relaxed);
+        }
+        got
+    }
+
+    fn save(&self, key: &CacheKey, payload: &[u8]) {
+        if let Some(s) = self.store {
+            let _ = s.save(key, payload);
+        }
+    }
 }
 
 /// 书句柄（0 = 非法）。FFI 边界只传句柄，不传引用。
@@ -392,9 +437,13 @@ impl Kernel {
         self.open(&ContentSource::from_path(path))
     }
 
-    /// 打开一本书（任意内容源）。
+    /// 打开一本书（任意内容源）。open 索引（entries/pages/toc_raw）走内容级
+    /// 缓存持久化（ROADMAP 章级/页级缓存持久化：重开命中免重建）。
     pub fn open(&mut self, src: &ContentSource) -> RrkResult<BookHandle> {
-        let book: Arc<dyn BookSource> = Arc::from(self.registry.open(src)?);
+        let idx = OpenIndexStore::new(self.content_cache.as_ref().map(|(s, _)| s));
+        let book: Arc<dyn BookSource> = Arc::from(self.registry.open_cached(src, &idx)?);
+        self.content_stats.open_hits += idx.hits.load(std::sync::atomic::Ordering::Relaxed);
+        self.content_stats.open_misses += idx.misses.load(std::sync::atomic::Ordering::Relaxed);
         // 复用空槽；句柄 = 槽位 + 1（0 永远非法）
         if let Some(pos) = self.books.iter().position(|s| s.is_none()) {
             self.books[pos] = Some(book);
@@ -762,6 +811,38 @@ mod tests {
             assert!(!toc.is_empty());
             let s = k.content_cache_stats();
             assert_eq!((s.toc_hits, s.toc_misses), (1, 0), "重开应磁盘命中");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ROADMAP 章级/页级缓存持久化：open 索引（entries/pages/toc_raw）内容级
+    /// 持久化端到端——首次 open miss 重建并落盘，新内核实例（模拟重启）重开
+    /// 命中磁盘缓存，免 open 期重建。
+    #[test]
+    fn open_index_cache_hit_across_reopen() {
+        let dir = std::env::temp_dir()
+            .join(format!("rrk-open-index-{}-{:x}", std::process::id(), fastrand()));
+        let dir_str = dir.to_string_lossy().into_owned();
+
+        // 第一次开：miss 重建 + 落盘
+        {
+            let mut k = Kernel::new();
+            k.configure_content_cache(&dir_str, 8 * 1024 * 1024).unwrap();
+            let _ = k.open_path("../../fixtures/sample.epub").unwrap();
+            let s = k.content_cache_stats();
+            assert_eq!((s.open_hits, s.open_misses), (0, 1), "首次 open 应 miss 并落盘");
+        }
+
+        // 新内核实例（模拟重启）：重开命中磁盘 open 索引，目录/章表照常可用
+        {
+            let mut k = Kernel::new();
+            k.configure_content_cache(&dir_str, 8 * 1024 * 1024).unwrap();
+            let h = k.open_path("../../fixtures/sample.epub").unwrap();
+            assert!(!k.toc_cached(h).unwrap().is_empty(), "目录应可用");
+            assert!(!k.chapters_cached(h).unwrap().is_empty(), "章表应可用");
+            let s = k.content_cache_stats();
+            assert_eq!((s.open_hits, s.open_misses), (1, 0), "重开应 open 索引磁盘命中");
         }
 
         let _ = std::fs::remove_dir_all(&dir);

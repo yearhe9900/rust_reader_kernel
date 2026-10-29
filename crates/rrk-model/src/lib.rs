@@ -12,6 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 
 pub mod layout;
+pub mod payload;
 pub use layout::{
     decode_pages, encode_pages, style_hash, viewport_hash, Align, LayoutPage, LineEntry,
     PlacedImage, RenderResult, StyleSpec, TextRun, Viewport,

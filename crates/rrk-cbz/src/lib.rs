@@ -8,12 +8,15 @@
 
 use std::sync::Arc;
 
-use rrk_format::{BookSource, ContentSource, FormatAdapter, PagedSource};
+use rrk_cache::{CacheKey, CacheKind};
+use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache, PagedSource};
 use rrk_model::{
     fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     PageEntry, PageKind, PagedContent, Resource, ResourceKey, RrkError, RrkResult, TocNode,
 };
 use rrk_zip::{ZipArchive, ZipEntry};
+
+mod codec;
 
 /// 图片扩展名白名单（与宿主基线 `CbzSource` 对齐，见 issue #10）。
 ///
@@ -157,6 +160,28 @@ fn collect_pages(entries: &[ZipEntry]) -> Vec<PageRef> {
     pages
 }
 
+/// 逐页尺寸探测：只限流读条目前缀（64KB 内不解全图；头内定不出尺寸的
+/// 如超长 EXIF JPEG 才退全量解压）——开书不再逐页整图 inflate。
+fn probe_sizes(zip: &ZipArchive, pages: &[PageRef]) -> Vec<Option<(u32, u32)>> {
+    const SIZE_PROBE: usize = 64 * 1024;
+    let mut sizes = Vec::with_capacity(pages.len());
+    for p in pages {
+        let size = zip.entry(&p.zip_name).and_then(|entry| {
+            let head = zip.read_prefix(entry, SIZE_PROBE).ok()?;
+            image_size(&head).or_else(|| zip.read(entry).ok().and_then(|d| image_size(&d)))
+        });
+        sizes.push(size);
+    }
+    sizes
+}
+
+/// 缓存页表可信校验：非空 + 表长一致 + 每页 zip 条目仍在（防错配/损坏载荷）。
+fn pages_ok(pages: &[PageRef], sizes: &[Option<(u32, u32)>], zip: &ZipArchive) -> bool {
+    !pages.is_empty()
+        && sizes.len() == pages.len()
+        && pages.iter().all(|p| zip.entry(&p.zip_name).is_some())
+}
+
 /// 图片头解析尺寸（**已下沉**到 `rrk_image::dimensions`，此处仅保留 `(w, h)` 便捷壳）。
 ///
 /// 唯一口径在内核 `rrk-image`：CBZ 页尺寸表与宿主正文插图测量共用同一份实现，
@@ -166,7 +191,7 @@ pub fn image_size(data: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// 页条目：`zip_name` 用于取数据，`name` 是归一化名（过滤/排序/href 口径）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct PageRef {
     zip_name: String,
     name: String,
@@ -191,27 +216,33 @@ const RENDER_CACHE_SLOTS: usize = 2;
 
 impl CbzBook {
     pub fn parse(src: &ContentSource) -> RrkResult<Self> {
+        Self::parse_with_cache(src, &NullIndexCache)
+    }
+
+    /// 页表（open 索引：页序 + 尺寸表）按内容 key 持久化——重开命中免
+    /// `collect_pages`（归一化/去重/自然序）与逐页尺寸头探测（限流 inflate）。
+    pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
         let bytes = src.read_all()?;
         let content_hash = fnv1a64(&bytes[..bytes.len().min(1024 * 1024)]);
         let zip = Arc::new(ZipArchive::parse(bytes)?);
 
-        let pages = collect_pages(zip.entries());
-        if pages.is_empty() {
-            return Err(RrkError::corrupt("CBZ: 无图片条目"));
-        }
-
-        // 尺寸只限流读条目前缀（64KB 内不解全图；头内定不出尺寸的
-        // 如超长 EXIF JPEG 才退全量解压）——开书不再逐页整图 inflate。
-        const SIZE_PROBE: usize = 64 * 1024;
-        let mut sizes = Vec::with_capacity(pages.len());
-        for p in &pages {
-            let size = zip.entry(&p.zip_name).and_then(|entry| {
-                let head = zip.read_prefix(entry, SIZE_PROBE).ok()?;
-                image_size(&head)
-                    .or_else(|| zip.read(entry).ok().and_then(|d| image_size(&d)))
-            });
-            sizes.push(size);
-        }
+        let key = CacheKey::content(content_hash, CacheKind::OpenCbz);
+        let (pages, sizes) = match cache
+            .load(&key)
+            .and_then(|b| codec::decode(&b))
+            .filter(|(pages, sizes)| pages_ok(pages, sizes, &zip))
+        {
+            Some(x) => x,
+            None => {
+                let pages = collect_pages(zip.entries());
+                if pages.is_empty() {
+                    return Err(RrkError::corrupt("CBZ: 无图片条目"));
+                }
+                let sizes = probe_sizes(&zip, &pages);
+                cache.save(&key, &codec::encode(&pages, &sizes));
+                (pages, sizes)
+            }
+        };
 
         let stem = src
             .name()
@@ -275,6 +306,14 @@ impl FormatAdapter for CbzAdapter {
 
     fn open(&self, src: &ContentSource) -> RrkResult<Box<dyn BookSource>> {
         Ok(Box::new(CbzBook::parse(src)?))
+    }
+
+    fn open_cached(
+        &self,
+        src: &ContentSource,
+        cache: &dyn IndexCache,
+    ) -> RrkResult<Box<dyn BookSource>> {
+        Ok(Box::new(CbzBook::parse_with_cache(src, cache)?))
     }
 }
 
@@ -648,5 +687,26 @@ mod tests {
         gif.extend_from_slice(&20u16.to_le_bytes());
         gif.extend_from_slice(&[0; 4]);
         assert_eq!(image_size(&gif), Some((10, 20)));
+    }
+
+    /// ROADMAP 章级/页级缓存持久化：页表（页序 + 尺寸表）内容级持久化——
+    /// 重开命中免 collect_pages（归一化/去重/自然序）与逐页尺寸头探测，
+    /// 结果与冷构建一致。
+    #[test]
+    fn open_index_cache_hit_across_reopen() {
+        use rrk_format::MemIndexCache;
+        let bytes = build_cbz(&["pages/page10.png", "pages/page2.png", "pages/page1.png"]);
+        let src = ContentSource::from_bytes(Some("t.cbz".to_string()), bytes);
+        let cache = MemIndexCache::new();
+        let a = CbzBook::parse_with_cache(&src, &cache).unwrap();
+        assert_eq!((cache.hits(), cache.misses()), (0, 1), "首次应 miss 并写缓存");
+        let b = CbzBook::parse_with_cache(&src, &cache).unwrap();
+        assert_eq!((cache.hits(), cache.misses()), (1, 1), "重开应命中");
+        assert_eq!(a.pages, b.pages, "页表应与冷构建一致");
+        assert_eq!(a.sizes, b.sizes, "尺寸表应与冷构建一致");
+        // 自然序保持：page1 < page2 < page10
+        let names: Vec<&str> = b.pages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["pages/page1.png", "pages/page2.png", "pages/page10.png"]);
+        assert_eq!(a.sizes[0], Some((8, 8)), "PNG 尺寸应缓存复用");
     }
 }

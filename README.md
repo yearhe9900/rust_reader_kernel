@@ -147,16 +147,24 @@ C 接入方请直接用头文件 [`bindings/rrk.h`](bindings/rrk.h)；线程安�
 | 2001 | （`ERR_PANIC` 常量） | 边界 panic 被拦截 |
 | 0 | — | 本线程尚无错误记录 |
 
-#### 内容级缓存（issue #12）
+#### 内容级缓存（issue #12 + open 索引持久化）
 
 与布局缓存（`rrk_cache_configure`，三要素 key）并行的另一层：**内容级 key**
-（只含 `content_hash`，kind = toc / chapter_text / txt_outline），命中即免
-重新解析（免 inflate + 清洗 + 分块）：
+（只含 `content_hash`），命中即免重新解析：
+
+- **访问器口径（issue #12）**：kind = toc / chapter_text / txt_outline，命中免
+  inflate + 清洗 + 分块；
+- **open 索引口径（ROADMAP 章级/页级缓存持久化）**：kind = open_epub / open_mobi /
+  open_cbz / open_pdf / open_txt，open 期重建的索引（entries / pages / toc_raw）
+  持久化，重开命中免重建（免分章扫描、nav/NCX 解析、页面树遍历、逐页尺寸探测等）。
+
+接入面：
 
 - C ABI：`rrk_content_cache_configure(dir, mem_bytes)`（空目录 = 关闭）；
-  `rrk_content_cache_stats()` → `{"toc","chapter","outline"}` 各 `{hits,misses}`。
+  `rrk_content_cache_stats()` → `{"toc","chapter","outline","open"}` 各 `{hits,misses}`。
 - Dart：`RrkEngine.configureContentCache(dir)` / `contentCacheStatsJson()`。
-- `rrk_toc_json` / `rrk_chapters_json` / `rrk_load_chapter` 自动走该缓存。
+- `rrk_open`（自动走 open 索引缓存）与 `rrk_toc_json` / `rrk_chapters_json` /
+  `rrk_load_chapter`（访问器缓存）自动生效，无需额外调用。
 - **失效口径**：内容 hash 变了整本失效（与宿主原 Dart 缓存的「副本 mtime/size
   判据」等价）；payload 自带 schema 号，内核升级/损坏自动丢弃重算。
 

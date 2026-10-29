@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
-use rrk_format::{BookSource, ContentSource, FormatAdapter};
+use rrk_cache::{CacheKey, CacheKind};
+use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache};
+
+mod codec;
 use rrk_model::{
     fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     Inline, Resource, ResourceKey, RrkError, RrkResult, StyleFlags, TextRange, TocNode,
@@ -310,6 +313,12 @@ fn count_chars(text: &str) -> u32 {
 impl TxtBook {
     /// 解码 + 分章 + 逻辑块切分（导入期一次完成，之后打开零扫描）。
     pub fn parse(src: &ContentSource) -> RrkResult<Self> {
+        Self::parse_with_cache(src, &NullIndexCache)
+    }
+
+    /// 解码 + 分章 + 逻辑块切分；章表（open 索引）按内容 key 持久化——
+    /// 重开命中免 scan_lines 全书扫描与逻辑块切分（open 期免重建）。
+    pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
         let bytes = src.read_all()?;
         if bytes.len() > 512 * 1024 * 1024 {
             return Err(RrkError::new(
@@ -326,7 +335,19 @@ impl TxtBook {
             .map(|n| n.rsplit_once('.').map(|(s, _)| s).unwrap_or(n).to_string())
             .unwrap_or_else(|| "未命名".to_string());
 
-        let entries = build_entries(&text);
+        let content_hash = fnv1a64(&bytes[..bytes.len().min(1024 * 1024)]);
+        let entries = {
+            let key = CacheKey::content(content_hash, CacheKind::OpenTxt);
+            cache
+                .load(&key)
+                .and_then(|b| codec::decode(&b))
+                .filter(|es| entries_ok(es, text.len()))
+                .unwrap_or_else(|| {
+                    let entries = build_entries(&text);
+                    cache.save(&key, &codec::encode(&entries));
+                    entries
+                })
+        };
 
         let meta = BookMeta {
             title,
@@ -334,7 +355,7 @@ impl TxtBook {
             language: None,
             description: None,
             format: FormatId::Txt,
-            content_hash: fnv1a64(&bytes[..bytes.len().min(1024 * 1024)]),
+            content_hash,
             cover: None,
         };
 
@@ -346,6 +367,16 @@ impl TxtBook {
         let (s, e) = entry.byte_range;
         &self.text[s as usize..e as usize]
     }
+}
+
+/// 缓存章表可信校验：id 连续 + 字节范围在文本内且有序（防错配/损坏载荷）。
+fn entries_ok(entries: &[ChapterEntry], text_len: usize) -> bool {
+    !entries.is_empty()
+        && entries.iter().enumerate().all(|(i, e)| {
+            e.id == i as u32
+                && e.byte_range.0 <= e.byte_range.1
+                && e.byte_range.1 <= text_len as u64
+        })
 }
 
 /// 由扫描结果构建章索引（含巨章逻辑块切分）。
@@ -591,6 +622,14 @@ impl FormatAdapter for TxtAdapter {
     fn open(&self, src: &ContentSource) -> RrkResult<Box<dyn BookSource>> {
         Ok(Box::new(TxtBook::parse(src)?))
     }
+
+    fn open_cached(
+        &self,
+        src: &ContentSource,
+        cache: &dyn IndexCache,
+    ) -> RrkResult<Box<dyn BookSource>> {
+        Ok(Box::new(TxtBook::parse_with_cache(src, cache)?))
+    }
 }
 
 impl BookSource for TxtBook {
@@ -786,5 +825,40 @@ mod tests {
         let c0 = book.load_chapter(0).unwrap();
         let paras = c0.blocks.iter().filter(|b| matches!(b, Block::Paragraph { .. })).count();
         assert_eq!(paras, 1);
+    }
+
+    /// ROADMAP 章级/页级缓存持久化：章表内容级持久化——首次 miss 构建写缓存，
+    /// 重开命中免 scan_lines 全书扫描与逻辑块切分，且与冷构建逐字段一致。
+    #[test]
+    fn open_index_cache_hit_across_reopen() {
+        use rrk_format::MemIndexCache;
+        let src = ContentSource::from_bytes(
+            Some("t.txt".into()),
+            Arc::<[u8]>::from("序言内容\n\n第一章 开始\n\n正文一\n\n第二章 继续\n\n正文二\n".as_bytes()),
+        );
+        let cache = MemIndexCache::new();
+        let a = TxtBook::parse_with_cache(&src, &cache).unwrap();
+        assert_eq!((cache.hits(), cache.misses()), (0, 1), "首次应 miss 并写缓存");
+        let b = TxtBook::parse_with_cache(&src, &cache).unwrap();
+        assert_eq!((cache.hits(), cache.misses()), (1, 1), "重开应命中");
+        assert!(!a.entries.is_empty());
+        assert_eq!(a.entries, b.entries, "命中结果应与冷构建一致");
+    }
+
+    /// 损坏缓存载荷自动丢弃重算（不 panic、结果与冷构建一致）。
+    #[test]
+    fn corrupt_open_index_rebuilds() {
+        use rrk_cache::{CacheKey, CacheKind};
+        use rrk_format::MemIndexCache;
+        let src = ContentSource::from_bytes(
+            Some("t.txt".into()),
+            Arc::<[u8]>::from("第一章\n\n正文\n".as_bytes()),
+        );
+        let cache = MemIndexCache::new();
+        let bytes = src.read_all().unwrap();
+        let key = CacheKey::content(fnv1a64(&bytes), CacheKind::OpenTxt);
+        cache.save(&key, b"garbage-not-a-payload");
+        let book = TxtBook::parse_with_cache(&src, &cache).unwrap();
+        assert!(!book.entries.is_empty(), "损坏载荷应丢弃重算");
     }
 }

@@ -883,7 +883,8 @@ pub unsafe extern "C" fn rrk_content_cache_configure(
 }
 
 /// 内容级缓存命中统计 JSON（issue #12：可观测性）：
-/// `{"toc":{"hits","misses"},"chapter":{...},"outline":{...}}`。
+/// `{"toc":{"hits","misses"},"chapter":{…},"outline":{…},"open":{…}}`。
+/// `open` = open 索引（entries/pages/toc_raw）持久化命中（ROADMAP 章级/页级缓存持久化）。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_content_cache_stats(
     out_ptr: *mut *mut u8,
@@ -894,11 +895,12 @@ pub unsafe extern "C" fn rrk_content_cache_stats(
             return Err(set_kind(RrkError::invalid("空指针")));
         }
         let s = with_kernel(|k| Ok(k.content_cache_stats()))?;
-        let mut out = String::with_capacity(160);
+        let mut out = String::with_capacity(220);
         let _ = write!(
             out,
-            "{{\"toc\":{{\"hits\":{},\"misses\":{}}},\"chapter\":{{\"hits\":{},\"misses\":{}}},\"outline\":{{\"hits\":{},\"misses\":{}}}}}",
-            s.toc_hits, s.toc_misses, s.chapter_hits, s.chapter_misses, s.outline_hits, s.outline_misses
+            "{{\"toc\":{{\"hits\":{},\"misses\":{}}},\"chapter\":{{\"hits\":{},\"misses\":{}}},\"outline\":{{\"hits\":{},\"misses\":{}}},\"open\":{{\"hits\":{},\"misses\":{}}}}}",
+            s.toc_hits, s.toc_misses, s.chapter_hits, s.chapter_misses, s.outline_hits, s.outline_misses,
+            s.open_hits, s.open_misses
         );
         write_buf(out.into_bytes(), out_ptr, out_len);
         Ok(0)
@@ -924,7 +926,7 @@ pub unsafe extern "C" fn rrk_stats(
         let mut out = String::with_capacity(320);
         let _ = write!(
             out,
-            "{{\"open_books\":{books},\"searches\":{searches},\"indexes\":{indexes},\"layout\":{{\"hits\":{},\"misses\":{}}},\"content\":{{\"toc\":{{\"hits\":{},\"misses\":{}}},\"chapter\":{{\"hits\":{},\"misses\":{}}},\"outline\":{{\"hits\":{},\"misses\":{}}}}}}}",
+            "{{\"open_books\":{books},\"searches\":{searches},\"indexes\":{indexes},\"layout\":{{\"hits\":{},\"misses\":{}}},\"content\":{{\"toc\":{{\"hits\":{},\"misses\":{}}},\"chapter\":{{\"hits\":{},\"misses\":{}}},\"outline\":{{\"hits\":{},\"misses\":{}}},\"open\":{{\"hits\":{},\"misses\":{}}}}}}}",
             LAYOUT_HITS.load(Ordering::Relaxed),
             LAYOUT_MISSES.load(Ordering::Relaxed),
             content.toc_hits,
@@ -933,6 +935,8 @@ pub unsafe extern "C" fn rrk_stats(
             content.chapter_misses,
             content.outline_hits,
             content.outline_misses,
+            content.open_hits,
+            content.open_misses,
         );
         write_buf(out.into_bytes(), out_ptr, out_len);
         Ok(0)

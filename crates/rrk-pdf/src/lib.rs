@@ -9,6 +9,7 @@
 //! - 扫描版 PDF（纯图页）文本为空——预期行为，L2 光栅后可读图；
 //! - L2 光栅（原版页位图）不在 L1 范围。
 
+mod codec;
 mod content;
 mod objects;
 mod raster;
@@ -20,7 +21,8 @@ use std::sync::Arc;
 use content::extract_text;
 use objects::{Object, PdfDocument};
 
-use rrk_format::{BookSource, ContentSource, FormatAdapter, PagedSource};
+use rrk_cache::{CacheKey, CacheKind};
+use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache, PagedSource};
 use rrk_model::{
     fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     Inline, PageEntry, PageKind, PagedContent, RenderResult, Resource, RrkError, RrkResult,
@@ -28,6 +30,7 @@ use rrk_model::{
 };
 
 /// 页面信息（结构层，O(结构) 可得）。
+#[derive(Debug, Clone, PartialEq)]
 struct PageInfo {
     content_refs: Vec<Object>,
     media: (f32, f32),
@@ -50,14 +53,92 @@ pub struct PdfBook {
     toc: Vec<TocNode>,
 }
 
+/// 缓存 open 索引可信校验：页面源对象须在当前文档解出字典（防错配书），
+/// 章表与页区间对齐、区间在页数内、目录章号在范围内。
+fn index_ok(idx: &codec::PdfIndex, doc: &PdfDocument) -> bool {
+    let codec::PdfIndex { pages, chapters, chapter_pages, toc, merged: _ } = idx;
+    if pages.is_empty() || chapters.is_empty() || chapters.len() != chapter_pages.len() {
+        return false;
+    }
+    let n = pages.len() as u32;
+    if !chapter_pages.iter().all(|&(s, e)| s < e && e <= n) {
+        return false;
+    }
+    // inline 页（obj_num = 0）跳过对象校验
+    if !pages.iter().filter(|p| p.obj_num != 0).all(|p| {
+        matches!(doc.resolve(&Object::Ref(p.obj_num, 0)), Object::Dict(_))
+    }) {
+        return false;
+    }
+    chapters.iter().enumerate().all(|(i, c)| {
+        c.id == i as u32 && c.byte_range == (chapter_pages[i].0 as u64, chapter_pages[i].1 as u64)
+    }) && toc_ok(toc, chapters.len())
+}
+
+fn toc_ok(nodes: &[TocNode], n_chapters: usize) -> bool {
+    nodes
+        .iter()
+        .all(|n| (n.chapter as usize) < n_chapters && toc_ok(&n.children, n_chapters))
+}
+
+/// 书目元数据（缓存命中/重建两条路径共用）。
+fn build_meta(toc: &[TocNode], content_hash: u64, src: &ContentSource) -> BookMeta {
+    let title = toc
+        .first()
+        .map(|n| n.title.clone())
+        .filter(|t| !t.starts_with("第 "))
+        .or_else(|| {
+            src.name().map(|n| n.rsplit_once('.').map(|(s, _)| s).unwrap_or(n).to_string())
+        })
+        .unwrap_or_else(|| "未命名".to_string());
+
+    BookMeta {
+        title,
+        authors: Vec::new(),
+        language: None,
+        description: None,
+        format: FormatId::Pdf,
+        content_hash,
+        cover: None,
+    }
+}
+
 impl PdfBook {
     pub fn parse(src: &ContentSource) -> RrkResult<Self> {
+        Self::parse_with_cache(src, &NullIndexCache)
+    }
+
+    /// open 索引（页面表 + 章表 + 目录）按内容 key 持久化——重开命中免
+    /// Catalog 扫描、页面树遍历、逐页权重解引用与 outline 构建（open 期免重建）。
+    pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
         let bytes = src.read_all()?;
         let content_hash = fnv1a64(&bytes[..bytes.len().min(1024 * 1024)]);
         let doc = PdfDocument::open(bytes)?;
 
+        // open 索引缓存（校验：页面源对象须在当前文档解出字典）
+        let key = CacheKey::content(content_hash, CacheKind::OpenPdf);
+        if let Some(idx) =
+            cache.load(&key).and_then(|b| codec::decode(&b)).filter(|idx| index_ok(idx, &doc))
+        {
+            if idx.merged {
+                doc.merge_objstms();
+            }
+            let meta = build_meta(&idx.toc, content_hash, src);
+            return Ok(Self {
+                meta,
+                doc,
+                pages: idx.pages,
+                page_texts: Mutex::new(HashMap::new()),
+                chapters: idx.chapters,
+                chapter_pages: idx.chapter_pages,
+                toc: idx.toc,
+            });
+        }
+
         // 目录对象：扫对象表找 /Type/Catalog；找不到则合并 ObjStm 再找
+        let mut merged = false;
         let catalog = find_catalog(&doc).or_else(|| {
+            merged = true;
             doc.merge_objstms();
             find_catalog(&doc)
         });
@@ -109,24 +190,10 @@ impl PdfBook {
             });
         }
 
-        let title = toc
-            .first()
-            .map(|n| n.title.clone())
-            .filter(|t| !t.starts_with("第 "))
-            .or_else(|| {
-                src.name().map(|n| n.rsplit_once('.').map(|(s, _)| s).unwrap_or(n).to_string())
-            })
-            .unwrap_or_else(|| "未命名".to_string());
-
-        let meta = BookMeta {
-            title,
-            authors: Vec::new(),
-            language: None,
-            description: None,
-            format: FormatId::Pdf,
-            content_hash,
-            cover: None,
-        };
+        let meta = build_meta(&toc, content_hash, src);
+        if let Some(payload) = codec::encode(&pages, &chapters, &chapter_pages, &toc, merged) {
+            cache.save(&key, &payload);
+        }
 
         Ok(Self {
             meta,
@@ -443,6 +510,14 @@ impl FormatAdapter for PdfAdapter {
     fn open(&self, src: &ContentSource) -> RrkResult<Box<dyn BookSource>> {
         Ok(Box::new(PdfBook::parse(src)?))
     }
+
+    fn open_cached(
+        &self,
+        src: &ContentSource,
+        cache: &dyn IndexCache,
+    ) -> RrkResult<Box<dyn BookSource>> {
+        Ok(Box::new(PdfBook::parse_with_cache(src, cache)?))
+    }
 }
 
 impl BookSource for PdfBook {
@@ -737,5 +812,73 @@ endobj
         // 应有非白像素（黑矩形/红彩状态至少其一）
         let non_white = rgba.chunks(4).filter(|p| p[0] < 250 || p[1] < 250 || p[2] < 250).count();
         assert!(non_white > 500, "应画出矩形，非白像素={non_white}");
+    }
+
+    /// open 索引载荷编解码回环（含 Object 子树）+ 损坏丢弃。
+    #[test]
+    fn open_index_codec_roundtrip() {
+        use std::collections::BTreeMap;
+        let mut dict = BTreeMap::new();
+        dict.insert(
+            "X".to_string(),
+            Object::Arr(vec![
+                Object::Int(7),
+                Object::Real(1.5),
+                Object::Name("N".into()),
+                Object::Str(b"hi".to_vec()),
+                Object::Bool(true),
+                Object::Null,
+                Object::Ref(3, 1),
+            ]),
+        );
+        dict.insert("Z".to_string(), Object::Stream { dict: BTreeMap::new(), data: vec![1, 2, 3] });
+        let pages = vec![PageInfo {
+            content_refs: vec![Object::Ref(4, 0), Object::Arr(vec![])],
+            media: (200.0, 200.0),
+            resources: Some(Object::Dict(dict)),
+            weight: 44,
+            obj_num: 3,
+        }];
+        let chapters = vec![ChapterEntry {
+            id: 0,
+            title: Some("章".into()),
+            href: "pdf:0".into(),
+            byte_range: (0, 1),
+            char_len: 22,
+            kind: ChapterKind::Text,
+            part: 0,
+        }];
+        let chapter_pages = vec![(0, 1)];
+        let toc = vec![TocNode { title: "t".into(), chapter: 0, anchor: None, children: vec![] }];
+        let d = codec::encode(&pages, &chapters, &chapter_pages, &toc, true).unwrap();
+        let idx = codec::decode(&d).unwrap();
+        assert!(idx.merged);
+        assert_eq!(idx.pages, pages);
+        assert_eq!(idx.chapters, chapters);
+        assert_eq!(idx.chapter_pages, chapter_pages);
+        assert_eq!(idx.toc, toc);
+        assert!(codec::decode(b"nope-not-a-payload").is_none());
+    }
+
+    /// ROADMAP 章级/页级缓存持久化：PDF open 索引持久化——重开命中免
+    /// Catalog 扫描、页面树遍历与 outline 构建，页表/章表/目录与冷构建一致。
+    #[test]
+    fn open_index_cache_hit_across_reopen() {
+        use rrk_format::MemIndexCache;
+        let src = ContentSource::from_bytes(
+            Some("t.pdf".to_string()),
+            Arc::<[u8]>::from(
+                &b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 44 >>\nstream\n0 0 0 rg 20 20 100 50 re f 1 0 0 rg\nendstream\nendobj\n"[..],
+            ),
+        );
+        let cache = MemIndexCache::new();
+        let a = PdfBook::parse_with_cache(&src, &cache).unwrap();
+        assert_eq!((cache.hits(), cache.misses()), (0, 1), "首次应 miss 并写缓存");
+        let b = PdfBook::parse_with_cache(&src, &cache).unwrap();
+        assert_eq!((cache.hits(), cache.misses()), (1, 1), "重开应命中");
+        assert_eq!(a.pages, b.pages, "页面表应与冷构建一致");
+        assert_eq!(a.chapters, b.chapters, "章表应与冷构建一致");
+        assert_eq!(a.chapter_pages, b.chapter_pages);
+        assert_eq!(a.toc, b.toc);
     }
 }

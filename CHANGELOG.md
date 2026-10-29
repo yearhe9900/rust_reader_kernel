@@ -5,6 +5,30 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- **章级/页级缓存持久化扩展（ROADMAP）**：open 索引按内容 key 持久化——
+  open 期重建的索引（EPUB entries+toc_raw / MOBI spans+章表+目录 / CBZ 页表+
+  尺寸表 / PDF 页面表+章表+目录 / TXT 章表）落盘，重开命中免重建（免分章扫描、
+  nav/NCX 解析、标题回填/正文前缀探测、页面树遍历、逐页尺寸头探测）：
+  1. `rrk-format`：`IndexCache` 缓存句柄契约（缓存句柄下沉 adapter）+
+     `FormatAdapter::open_cached`（新适配器方法带缓存入参，默认回退无缓存
+     `open`）+ `NullIndexCache` / `MemIndexCache`（嵌入方/测试用）；
+  2. `rrk-cache`：`CacheKind` 新增 `OpenEpub/OpenMobi/OpenCbz/OpenPdf/OpenTxt`；
+  3. 五格式适配器各自 open 索引编解码（`rrk_model::payload` 共用写端/读端，
+     自带 magic+schema，损坏/升级自动丢弃重算；载入前可信校验：EPUB 对拍
+     spine href 序、CBZ 对拍 zip 条目存在性、PDF 对拍页源对象解析、MOBI/TXT
+     对拍范围与文本/ spans 对齐）；
+  4. `rrk-kernel`：`open` 自动走 C2 磁盘层（open 索引一次性使用，不占 C1 内存
+     LRU）；`ContentCacheStats` 新增 `open_hits/open_misses`；
+  5. `rrk-ffi`：`rrk_content_cache_stats` / `rrk_stats` JSON 增 `"open"` 命中段
+     （additive，ABI 不变）。
+
+  验证：cargo test --workspace 全绿（新增五格式缓存命中/损坏重建回环 +
+  跨内核实例磁盘命中端到端测试）。
+
 ## [0.3.0] - 2026-10-28
 
 **ABI 8 → 10**：v8 = 稳定错误码/内容级缓存（issue #11、#12）；v9 = blocks

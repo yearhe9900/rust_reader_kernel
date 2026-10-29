@@ -8,13 +8,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use rrk_format::{BookSource, ContentSource, FormatAdapter};
+use rrk_cache::{CacheKey, CacheKind};
+use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache};
 use rrk_markup::{attr, clean_xhtml, local_name, tokenize, Token};
 use rrk_model::{
     fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     Inline, Resource, ResourceKey, RrkError, RrkResult, TocNode,
 };
 use rrk_zip::{ZipArchive, ZipEntry};
+
+mod codec;
 
 const XHTML_TYPES: &[&str] = &["application/xhtml+xml", "text/html", "text/xml", "application/x-dtbook+xml"];
 
@@ -130,6 +133,12 @@ fn resolve_image_keys(blocks: &mut [Block], base_dir: &str) {
 
 impl EpubBook {
     pub fn parse(src: &ContentSource) -> RrkResult<Self> {
+        Self::parse_with_cache(src, &NullIndexCache)
+    }
+
+    /// open 索引（entries + toc_raw）按内容 key 持久化——重开命中免
+    /// nav/NCX 解析、标题回填与正文前缀探测（open 期免重建）。
+    pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
         let bytes = src.read_all()?;
         let zip = Arc::new(ZipArchive::parse(bytes)?);
 
@@ -158,47 +167,73 @@ impl EpubBook {
         };
 
         let opf = parse_opf(&opf_xml);
+        let content_hash = fnv1a64(&opf_xml.as_bytes()[..opf_xml.len().min(64 * 1024)]);
 
-        // 章索引：spine 中的可重排文档（建索引不搬内容，权重用条目尺寸估算）
-        let mut entries = Vec::new();
-        let mut href_to_chapter = HashMap::new();
+        // spine 章 href 序（建索引不搬内容；同时是缓存章表的校验基线）
+        let mut spine_hrefs = Vec::new();
         for idref in &opf.spine {
             let Some(item) = opf.manifest.get(idref) else { continue };
             if !XHTML_TYPES.contains(&item.media_type.as_str()) {
                 continue;
             }
-            let href = resolve_href(&opf_dir, &item.href);
-            let uncomp = zip.entry(&href).map(|e| e.uncomp_size).unwrap_or(0);
-            let id = entries.len() as ChapterId;
-            href_to_chapter.insert(href.clone(), id);
-            entries.push(ChapterEntry {
-                id,
-                title: None,
-                href,
-                byte_range: (0, uncomp),
-                char_len: (uncomp / 2) as u32, // CJK 估算
-                kind: ChapterKind::Text,
-                part: 0,
-            });
+            spine_hrefs.push(resolve_href(&opf_dir, &item.href));
         }
-        if entries.is_empty() {
+        if spine_hrefs.is_empty() {
             return Err(RrkError::corrupt("EPUB: spine 无可渲染文档"));
         }
 
-        // 目录：nav 优先，NCX 回退；用目录标题回填章标题（锚点惰性解析，见 toc()）
-        let toc_raw = build_toc_raw(&zip, &opf, &opf_dir);
-        backfill_titles(&toc_raw, &href_to_chapter, &mut entries);
-
-        // issue #13：无 nav/NCX 的书，用正文首个最小级标题回填章名——
-        // 限流读前缀（64KB）+ 同一条清洗管线（清洗器对截断输入容错），
-        // 不全量 inflate；前缀内无标题则保持 None（宿主回落占位）。
-        if toc_raw.is_empty() {
-            for e in entries.iter_mut().filter(|e| e.title.is_none()) {
-                if let Some(t) = probe_heading_title(&zip, &e.href) {
-                    e.title = Some(t);
+        // open 索引缓存：校验 = 缓存章表须与当前 spine 的 href 序逐项一致
+        // （id = 下标），防错配/损坏载荷。
+        let key = CacheKey::content(content_hash, CacheKind::OpenEpub);
+        let (entries, toc_raw) = match cache
+            .load(&key)
+            .and_then(|b| codec::decode(&b))
+            .filter(|(entries, _)| {
+                entries.len() == spine_hrefs.len()
+                    && entries.iter().zip(&spine_hrefs).all(|(e, h)| e.href == *h)
+            }) {
+            Some(x) => x,
+            None => {
+                // 章索引：spine 中的可重排文档（权重用条目尺寸估算）
+                let mut entries = Vec::new();
+                let mut href_to_chapter = HashMap::new();
+                for (id, href) in spine_hrefs.iter().enumerate() {
+                    let uncomp = zip.entry(href).map(|e| e.uncomp_size).unwrap_or(0);
+                    let id = id as ChapterId;
+                    href_to_chapter.insert(href.clone(), id);
+                    entries.push(ChapterEntry {
+                        id,
+                        title: None,
+                        href: href.clone(),
+                        byte_range: (0, uncomp),
+                        char_len: (uncomp / 2) as u32, // CJK 估算
+                        kind: ChapterKind::Text,
+                        part: 0,
+                    });
                 }
+
+                // 目录：nav 优先，NCX 回退；用目录标题回填章标题（锚点惰性解析，见 toc()）
+                let toc_raw = build_toc_raw(&zip, &opf, &opf_dir);
+                backfill_titles(&toc_raw, &href_to_chapter, &mut entries);
+
+                // issue #13：无 nav/NCX 的书，用正文首个最小级标题回填章名——
+                // 限流读前缀（64KB）+ 同一条清洗管线（清洗器对截断输入容错），
+                // 不全量 inflate；前缀内无标题则保持 None（宿主回落占位）。
+                if toc_raw.is_empty() {
+                    for e in entries.iter_mut().filter(|e| e.title.is_none()) {
+                        if let Some(t) = probe_heading_title(&zip, &e.href) {
+                            e.title = Some(t);
+                        }
+                    }
+                }
+                cache.save(&key, &codec::encode(&entries, &toc_raw));
+                (entries, toc_raw)
             }
-        }
+        };
+
+        // href → 章 id 反查表（O(章数) 重建，便宜）
+        let href_to_chapter: HashMap<String, ChapterId> =
+            entries.iter().map(|e| (e.href.clone(), e.id)).collect();
 
         let title = opf
             .title
@@ -220,7 +255,7 @@ impl EpubBook {
             language: opf.language.clone(),
             description: opf.description.clone(),
             format: FormatId::Epub,
-            content_hash: fnv1a64(&opf_xml.as_bytes()[..opf_xml.len().min(64 * 1024)]),
+            content_hash,
             // cover 字段存的是 manifest **href**（包内绝对路径），不是 manifest id：
             // `cover()` 直接走 `load_resource`，id 是查表键不是资源键。
             cover: opf
@@ -494,7 +529,7 @@ fn parse_opf(opf_xml: &str) -> OpfData {
 
 /// 目录原始项（title, **zip 根相对路径**）；nav 优先，NCX 回退。
 /// 目录原始树（解析期；href 已归一化为包内绝对路径、保留 fragment）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct TocRaw {
     title: String,
     href: String,
@@ -756,6 +791,14 @@ impl FormatAdapter for EpubAdapter {
 
     fn open(&self, src: &ContentSource) -> RrkResult<Box<dyn BookSource>> {
         Ok(Box::new(EpubBook::parse(src)?))
+    }
+
+    fn open_cached(
+        &self,
+        src: &ContentSource,
+        cache: &dyn IndexCache,
+    ) -> RrkResult<Box<dyn BookSource>> {
+        Ok(Box::new(EpubBook::parse_with_cache(src, cache)?))
     }
 }
 
@@ -1181,5 +1224,33 @@ mod tests {
         let toc = book.toc().unwrap();
         assert_eq!(toc.len(), 1);
         assert!(toc[0].anchor.is_none());
+    }
+
+    /// ROADMAP 章级/页级缓存持久化：open 索引（entries + toc_raw）内容级持久化——
+    /// 重开命中免 nav/NCX 解析、标题回填与正文前缀探测，结果与冷构建一致。
+    #[test]
+    fn open_index_cache_hit_across_reopen() {
+        use rrk_format::MemIndexCache;
+        let nav = r#"<html><body><nav><ol><li><a href="text/ch1.xhtml#s1">带锚</a></li></ol></nav></body></html>"#;
+        let files: Vec<(&str, &[u8])> = vec![
+            ("META-INF/container.xml", CONTAINER.as_bytes()),
+            ("OEBPS/content.opf", OPF_NAV.as_bytes()),
+            ("OEBPS/text/ch1.xhtml", CH1_WITH_IDS.as_bytes()),
+            ("OEBPS/nav.xhtml", nav.as_bytes()),
+        ];
+        let zip = build_zip(&files);
+        let src = ContentSource::from_bytes(
+            Some("t.epub".to_string()),
+            Arc::<[u8]>::from(zip.into_boxed_slice()),
+        );
+        let cache = MemIndexCache::new();
+        let a = EpubBook::parse_with_cache(&src, &cache).unwrap();
+        assert_eq!((cache.hits(), cache.misses()), (0, 1), "首次应 miss 并写缓存");
+        let b = EpubBook::parse_with_cache(&src, &cache).unwrap();
+        assert_eq!((cache.hits(), cache.misses()), (1, 1), "重开应命中");
+        assert_eq!(a.entries, b.entries, "章表应与冷构建一致");
+        assert_eq!(a.toc_raw, b.toc_raw, "目录原始树应与冷构建一致");
+        assert_eq!(a.href_to_chapter, b.href_to_chapter);
+        assert!(!b.toc_raw.is_empty(), "目录原始树应缓存复用");
     }
 }

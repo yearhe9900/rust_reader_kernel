@@ -340,7 +340,8 @@ class RrkEngine {
     }
   }
 
-  /// 内容级缓存命中统计（原始 JSON：toc/chapter/outline 各 hits/misses）。issue #12。
+  /// 内容级缓存命中统计（原始 JSON：toc/chapter/outline/open 各 hits/misses）。
+  /// issue #12 + open 索引持久化（ROADMAP 章级/页级缓存持久化）。
   static String contentCacheStatsJson() {
     final b = _bindings;
     final outPtr = malloc<Pointer<Uint8>>();

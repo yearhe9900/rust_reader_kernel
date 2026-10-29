@@ -8,6 +8,7 @@ description = "Rust 阅读内核：CBZ 页级图库（数字自然序页索引 +
 [dependencies]
 rrk-model.workspace = true
 rrk-format.workspace = true
+rrk-cache.workspace = true
 rrk-zip.workspace = true
 rrk-image.workspace = true
 image.workspace = true
