@@ -44,6 +44,12 @@
 
 ### Fixed
 
+- **issue #14（bug）**：`Kernel::search_chapter` 的 `SearchPage.done` 恒 false
+  （聚合循环未拷出内层 done）。修复采用 issue 备选方案 2（优于推荐方案 1）：
+  `done = 扫描确实完成`——真正扫完为 true（含无命中章），命中被 maxHits
+  截断时保持 false（契约字段如实告知结果不完整，调用方可增大上限重调——
+  同步 API 下这不是死路）；三种语义均有自测钉住；Dart 文档同步。
+
 - **FFI 红线加固（panic 不穿 C ABI）**：4 个未兜底出口（`rrk_abi_version` /
   `rrk_last_error_code` / `rrk_book_kind` / `rrk_layout_cancel`）统一接
   `guard`/`guard_val` 兜底；4 处内联 `catch_unwind`（`rrk_open` /
