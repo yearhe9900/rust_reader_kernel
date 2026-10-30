@@ -252,6 +252,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> with WidgetsBindingObse
         : ReadingPage(
             pages: _pages,
             chapterText: _chapterText,
+            fontFamily: _fontFamily,
             controller: _controller,
             onPageChanged: (i) {
               setState(() => _pageIndex = i);

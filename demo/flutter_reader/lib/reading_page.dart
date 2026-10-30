@@ -9,6 +9,7 @@ class ReadingPage extends StatelessWidget {
     super.key,
     required this.pages,
     required this.chapterText,
+    required this.fontFamily,
     required this.controller,
     required this.onPageChanged,
     required this.onTapPrev,
@@ -17,6 +18,9 @@ class ReadingPage extends StatelessWidget {
 
   final List<PageData> pages;
   final String chapterText;
+  /// 与排版同款字体：绘制字体必须与断行字体一致，否则切字体后行宽错位
+  /// （排版按 fontFamily 断行、绘制用默认字体 → 字形宽度对不上）。
+  final String fontFamily;
   final PageController controller;
   final ValueChanged<int> onPageChanged;
   final VoidCallback onTapPrev;
@@ -35,7 +39,7 @@ class ReadingPage extends StatelessWidget {
             container: true,
             label: pages[i].runs.map((r) => runText(chapterText, r)).join(),
             child: CustomPaint(
-              painter: _PagePainter(pages[i], chapterText),
+              painter: _PagePainter(pages[i], chapterText, fontFamily),
               size: Size.infinite,
             ),
           ),
@@ -68,10 +72,11 @@ class ReadingPage extends StatelessWidget {
 }
 
 class _PagePainter extends CustomPainter {
-  _PagePainter(this.page, this.chapterText);
+  _PagePainter(this.page, this.chapterText, this.fontFamily);
 
   final PageData page;
   final String chapterText;
+  final String fontFamily;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -82,6 +87,7 @@ class _PagePainter extends CustomPainter {
         text: TextSpan(
           text: text,
           style: TextStyle(
+            fontFamily: fontFamily.isEmpty ? null : fontFamily,
             fontSize: run.fontSize,
             fontWeight: run.bold ? FontWeight.bold : FontWeight.normal,
             fontStyle: run.italic ? FontStyle.italic : FontStyle.normal,
@@ -96,5 +102,7 @@ class _PagePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_PagePainter old) =>
-      old.page != page || old.chapterText != chapterText;
+      old.page != page ||
+      old.chapterText != chapterText ||
+      old.fontFamily != fontFamily;
 }

@@ -216,6 +216,8 @@ impl Layouter {
                     // 宿主「range → x」才能画在缩进后的位置（否则缩进在几何模式下丢失）。
                     let at_para_head = indent_px > 0.0 && text_range.start == 0 && range.start == 0;
                     let x = if at_para_head { gr.offset() + indent_px } else { gr.offset() };
+                    let (bold_mask, italic_mask) =
+                        FlatRun::style_masks(range.start, range.end, spans_buf);
                     runs.push(FlatRun {
                         x,
                         // parley 的 metrics.baseline 是布局坐标系（累计）——
@@ -224,6 +226,9 @@ impl Layouter {
                         font_size: run.font_size(),
                         start: base_offset + (range.start as u32).saturating_sub(shift),
                         end: base_offset + (range.end as u32).saturating_sub(shift),
+                        width: run.advance(),
+                        bold_mask,
+                        italic_mask,
                     });
                 }
             }
@@ -302,6 +307,39 @@ struct FlatRun {
     font_size: f32,
     start: u32,
     end: u32,
+    /// run 像素宽度（parley advance），供 hit_test 按比例定位光标。
+    width: f32,
+    /// 逐字节样式覆盖：真值当且仅当该字节落在某个粗体/斜体 span 内
+    /// （span 输入已知；parley 的 Run 不暴露样式，故用覆盖而非读回）。
+    bold_mask: Vec<bool>,
+    italic_mask: Vec<bool>,
+}
+
+impl FlatRun {
+    /// 按 builder 坐标下的 run 文本范围，从 span 表构造逐字节样式覆盖。
+    /// 掩码与 run 字节序列一一对应；run 落在 span 边界内时取覆盖，
+    /// 跨界部分按相交字节判定（UTF-8 多字节字符只要被 span 覆盖到即算）。
+    fn style_masks(
+        run_start: usize,
+        run_end: usize,
+        spans: &[(usize, usize, bool, bool)],
+    ) -> (Vec<bool>, Vec<bool>) {
+        let len = run_end.saturating_sub(run_start);
+        let mut bold = vec![false; len];
+        let mut italic = vec![false; len];
+        for &(s, e, b, i) in spans {
+            let lo = s.max(run_start);
+            let hi = e.min(run_end);
+            if lo >= hi {
+                continue;
+            }
+            for k in (lo - run_start)..(hi - run_start) {
+                bold[k] |= b;
+                italic[k] |= i;
+            }
+        }
+        (bold, italic)
+    }
 }
 
 /// 扁平行流 → 页（视口高切割）。
@@ -340,14 +378,19 @@ fn paginate(flat: Vec<FlatLine>, chapter: ChapterId, page_height: f32) -> Vec<La
                     para_start,
                 });
                 for r in runs {
+                    // 掩码与 run 字节序列同长；整 run 任一字节带样式即标记
+                    // （parley 通常按样式边界切 run，run 内混样式极少见）。
+                    let bold = r.bold_mask.iter().any(|&b| b);
+                    let italic = r.italic_mask.iter().any(|&i| i);
                     cur.runs.push(TextRun {
                         line: line_idx,
                         x: r.x,
                         baseline: y + r.baseline,
                         font_size: r.font_size,
-                        bold: false,
-                        italic: false,
+                        bold,
+                        italic,
                         range: (r.start, r.end),
+                        width: r.width,
                     });
                 }
                 cur.end = SemanticPos { chapter, char_offset: end };
@@ -448,6 +491,44 @@ mod tests {
         assert!(!pages[0].runs.is_empty());
         let idx = page_at(&pages, pages[1].start).unwrap();
         assert!(idx >= 1);
+    }
+
+    /// 回归（深审 §三）：Bold/Italic 样式必须从 FlatRun 传导到导出的 TextRun，
+    /// 否则宿主按 flag 渲染字重失效，且与 parley 按 bold 计量不一致 → 字宽错位。
+    #[test]
+    fn runs_propagate_bold_italic() {
+        let mut l = Layouter::new();
+        let text: std::sync::Arc<str> = "普通 bold 体 italic 体 收尾".into();
+        // 偏移必须落在 UTF-8 char 边界上
+        let b0 = "普通 ".len(); // 粗体段起点
+        let b1 = b0 + "bold 体 ".len(); // 粗体段终点 / 斜体段起点
+        let i1 = b1 + "italic 体 ".len(); // 斜体段终点
+        assert!(text.is_char_boundary(b0) && text.is_char_boundary(b1) && text.is_char_boundary(i1));
+        let blocks = vec![Block::Paragraph {
+            inlines: vec![
+                Inline::Text { range: TextRange::new(0, b0 as u32), style: StyleFlags::default() },
+                Inline::Text {
+                    range: TextRange::new(b0 as u32, b1 as u32),
+                    style: StyleFlags(StyleFlags::BOLD),
+                },
+                Inline::Text {
+                    range: TextRange::new(b1 as u32, i1 as u32),
+                    style: StyleFlags(StyleFlags::ITALIC),
+                },
+                Inline::Text { range: TextRange::new(i1 as u32, text.len() as u32), style: StyleFlags::default() },
+            ],
+            indent: false,
+        }];
+        let c = ChapterContent { id: 0, text, blocks, link_ranges: Vec::new() };
+        let vp = Viewport { width: 390.0, height: 400.0, dpr: 3.0 };
+        let pages = l.layout(&c, &StyleSpec::default(), &vp);
+        let runs: Vec<_> = pages.iter().flat_map(|p| p.runs.iter()).collect();
+        assert!(runs.iter().any(|r| r.bold), "应存在粗体 run");
+        assert!(runs.iter().any(|r| r.italic), "应存在斜体 run");
+        assert!(runs.iter().any(|r| !r.bold && !r.italic), "应存在正文 run");
+        // 每个 run 宽度非负；非空 run 应有正宽（供 hit_test 定位）
+        assert!(runs.iter().all(|r| r.width >= 0.0));
+        assert!(runs.iter().any(|r| r.width > 0.0));
     }
 
     /// 可取消排版：预置标志 → Cancelled（1005）；清零后正常。

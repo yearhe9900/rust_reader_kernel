@@ -44,6 +44,29 @@
 
 ### Fixed
 
+- **渲染/排版正确性第三批（深审报告 §三）：用户每天看得见的问题**：
+  1. **bold/italic 恒 false**（`rrk-layout`）：排版产物 `TextRun.bold/italic`
+     原本硬编码 false——宿主按 flag 渲染字重失效，且与 parley 按 bold 计量
+     不一致→字宽错位；现从排版 span 表逐字节覆盖回填（parley 的 Run 不暴露
+     样式，用已知输入 span 判定，确定无歧义）；
+  2. **`<meta>/<link>` 未闭合 → 整章静默丢弃**（`rrk-markup`）：非自闭合
+     `<meta …>`（真实 EPUB/MOBI 常见写法）会永久开启 skip 栈，后续正文全丢
+     （用户看到空章）——meta/link 是空元素，不再进 skip 栈；
+  3. **行内标签边界空格丢失**（`rrk-markup`）：`Hello <em>world</em>` →
+     "Helloworld" 英文书粘词——跨标签的段中空白归一为单个空格保留（段首
+     仍不产生前导空格，CJK 无影响）；
+  4. **ruby 注音混入正文**（`rrk-markup`）：`<ruby>漢<rt>かん</rt></ruby>`
+     → "漢かん" 日文书硬伤——rt/rp 进 skip 栈只丢注音、保留基字；
+  5. **hit_test 硬编码字宽**（`rrk-ffi`）：20px/字 + 3 字节/字——西文与非
+     默认字号下选区落点全错；`TextRun` 新增 `width`（parley advance，
+     RLAY schema 1→2，v1 旧缓存自动丢弃重算），定位改按真实 run 宽比例
+     插值（纯函数抽取 + 单测钉住）；y 越界从静默返回 (0,0) 改为钳到末行、
+     x 越右缘钳到行末；
+  6. **demo 绘制字体不一致**（`flutter_reader`）：排版按所选字体断行、
+     绘制用默认字体→切字体后行宽错位——fontFamily 贯通到绘制层。
+
+  验证：新增 7 个回归测试（三红转绿口径），cargo test --workspace 全绿。
+
 - **FFI 并发契约加固第二批（深审报告 §二）**：四处「App 一开多线程/多窗口
   就踩」的雷全部拆除，每个修复都先有确定性复现测试（红）后转回归（绿）：
   1. **panic → 锁中毒 → 引擎永久瘫痪**：内核锁/缓存锁/排版器锁/检索与 BM25

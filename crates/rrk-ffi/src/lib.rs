@@ -728,6 +728,29 @@ mod tests {
         assert!(!b.token.load(Ordering::Relaxed), "cancel_book(11) 不得误杀他书布局");
     }
 
+    /// 回归 §三（hit_test 精度）：定位数学纯函数——按真实 run 宽比例插值，
+    /// 越界钳制正确（旧实现硬编码 20px/字、3 字节/字，西文/其它字号全错）。
+    #[test]
+    fn hit_test_run_offset_interpolates_by_width() {
+        use rrk_model::TextRun;
+        let runs = vec![
+            TextRun { line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 100.0, range: (0, 30) },
+            TextRun { line: 0, x: 100.0, baseline: 0.0, font_size: 16.0, bold: true, italic: false, width: 50.0, range: (30, 60) },
+            TextRun { line: 1, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 100.0, range: (60, 90) },
+        ];
+        let line0 = (0, 60);
+        // run 内中点 → 区间中点（100px 宽 / 30 字节 → 半宽 15 字节）
+        assert_eq!(run_offset_at(50.0, &runs, 0, line0), 15);
+        // 跨 run：x=125 在第二 run 中点 → 30 + 15 = 45
+        assert_eq!(run_offset_at(125.0, &runs, 0, line0), 45);
+        // x 在行首前 → 行首；x 超最右 run → 行末
+        assert_eq!(run_offset_at(-5.0, &runs, 0, line0), 0);
+        assert_eq!(run_offset_at(9999.0, &runs, 0, line0), 60);
+        // 无宽度（v1 旧缓存）：退化为 run 起点，不 panic 不越界
+        let w0 = vec![TextRun { line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 0.0, range: (0, 30) }];
+        assert_eq!(run_offset_at(15.0, &w0, 0, (0, 30)), 0);
+    }
+
     /// 回归 §二.3：布局结束（drop）后从登记表移除，不泄漏。
     #[test]
     fn layout_run_unregisters_on_drop() {
@@ -1429,6 +1452,43 @@ pub unsafe extern "C" fn rrk_page_at(
     })
 }
 
+/// 页内 x → 字节偏移（纯函数，供 `rrk_hit_test` 与单测共用）。
+///
+/// 按 run 真实像素宽 `width` 比例插值到字节区间（旧实现硬编码 20px/字 +
+/// 3 字节/字——西文与非默认字号下选区落点全错）。越界钳制：
+/// x 在行首前 → 行首；x 在最右 run 之后 → 行末；y 越界由调用方钳行后传入。
+fn run_offset_at(
+    x: f32,
+    runs: &[rrk_model::TextRun],
+    hit_line: u32,
+    hit_range: (u32, u32),
+) -> u32 {
+    let mut best = hit_range.0;
+    let mut right_edge = f32::NEG_INFINITY;
+    for r in runs.iter() {
+        if r.line != hit_line {
+            continue;
+        }
+        // 未知宽度（v1 旧缓存）无法判右缘：视为延伸到无穷，避免误钄行末
+        let edge = if r.width > 0.0 { r.x + r.width } else { f32::INFINITY };
+        right_edge = right_edge.max(edge);
+        if x >= r.x {
+            let len = r.range.1.saturating_sub(r.range.0);
+            let off = if r.width > 0.0 {
+                let ratio = ((x - r.x) / r.width).clamp(0.0, 1.0);
+                (ratio * len as f32) as u32
+            } else {
+                0 // v1 旧缓存无宽度：退化为 run 起点
+            };
+            best = (r.range.0 + off.min(len)).min(hit_range.1);
+        }
+    }
+    if x > right_edge {
+        return hit_range.1; // x 在本行最右 run 之后 → 行末
+    }
+    best
+}
+
 /// 页内命中测试：(页内 x, y) → 语义偏移（run 级粒度 + run 内比例）。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_hit_test(
@@ -1460,29 +1520,21 @@ pub unsafe extern "C" fn rrk_hit_test(
             .get(page_index as usize)
             .ok_or_else(|| set_kind(RrkError::invalid("页越界")))?;
 
-        // 找目标页的行（按累计行高定位 y）与 run（按 x 与比例推 offset）
+        // 找目标页的行（按累计行高定位 y）：落到行间即归上一行，
+        // 超出末行钳到最后一行（旧实现 y 越界静默返回 offset 0/line 0）。
         let mut y_cursor = 0.0f32;
-        let mut hit_line = 0u32;
+        let mut hit_line = (page.lines.len().saturating_sub(1)) as u32;
         let mut hit_range = (0u32, 0u32);
         for (i, l) in page.lines.iter().enumerate() {
-            if y < y_cursor + l.height {
+            if y < y_cursor + l.height || i + 1 == page.lines.len() {
                 hit_line = i as u32;
                 hit_range = (l.start, l.end);
                 break;
             }
             y_cursor += l.height;
         }
-        // run 内比例（x 与 run 起点，按平均字宽外推；钳制在 run 范围内）
-        let mut best = hit_range.0;
-        for r in page.runs.iter() {
-            if r.line != hit_line {
-                continue;
-            }
-            if x >= r.x {
-                best = r.range.0
-                    + (((x - r.x) as u32 / 20) * 3).min(r.range.1.saturating_sub(r.range.0));
-            }
-        }
+        // run 内比例（纯函数抽取，单测钉住；见 run_offset_at 文档）
+        let best = run_offset_at(x, &page.runs, hit_line, hit_range);
         let mut out = String::with_capacity(64);
         out.push_str(&format!(
             "{{\"offset\":{},\"line\":{},\"range\":[{},{}]}}",

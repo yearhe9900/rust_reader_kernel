@@ -81,6 +81,8 @@ pub struct TextRun {
     pub font_size: f32,
     pub bold: bool,
     pub italic: bool,
+    /// run 像素宽度（hit_test 按比例定位用）。
+    pub width: f32,
     /// 文本范围（章文本 UTF-8 字节偏移）。
     pub range: (u32, u32),
 }
@@ -122,7 +124,7 @@ pub enum RenderResult {
 // ---------------------------------------------------------------------------
 
 const RLAY_MAGIC: &[u8; 4] = b"RLAY";
-const RLAY_SCHEMA: u32 = 1;
+const RLAY_SCHEMA: u32 = 2; // v2: 新增 TextRun.width（v1 解码器不认 → 丢弃重算，安全）
 
 struct W(Vec<u8>);
 impl W {
@@ -190,6 +192,7 @@ pub fn encode_pages(pages: &[LayoutPage]) -> Vec<u8> {
             w.u8(((r.bold as u8) << 1) | r.italic as u8);
             w.u32(r.range.0);
             w.u32(r.range.1);
+            w.f32(r.width);
         }
         w.u32(p.images.len() as u32);
         for im in &p.images {
@@ -211,7 +214,8 @@ pub fn decode_pages(data: &[u8]) -> Option<Vec<LayoutPage>> {
         return None;
     }
     r.p = 4;
-    if r.u32()? != RLAY_SCHEMA {
+    let schema = r.u32()?;
+    if schema != 1 && schema != RLAY_SCHEMA {
         return None;
     }
     let n = r.u32()? as usize;
@@ -249,6 +253,9 @@ pub fn decode_pages(data: &[u8]) -> Option<Vec<LayoutPage>> {
             let baseline = r.f32()?;
             let font_size = r.f32()?;
             let flags = r.u8()?;
+            let range = (r.u32()?, r.u32()?);
+            // v2 新增字段；v1 缺省为 0（调用方需容错）
+            let width = if schema >= 2 { r.f32()? } else { 0.0 };
             runs.push(TextRun {
                 line,
                 x,
@@ -256,7 +263,8 @@ pub fn decode_pages(data: &[u8]) -> Option<Vec<LayoutPage>> {
                 font_size,
                 bold: flags & 2 != 0,
                 italic: flags & 1 != 0,
-                range: (r.u32()?, r.u32()?),
+                width,
+                range,
             });
         }
         let ni = r.u32()? as usize;
@@ -343,6 +351,7 @@ mod tests {
                 bold: true,
                 italic: false,
                 range: (10, 50),
+                width: 40.0,
             }],
             images: vec![PlacedImage {
                 key: ResourceKey("img/1.png".into()),

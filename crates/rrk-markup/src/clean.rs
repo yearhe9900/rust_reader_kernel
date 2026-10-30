@@ -52,6 +52,8 @@ struct Cleaner {
     skip_depth: u32,
     /// 段内是否已有非空白内容。
     has_content: bool,
+    /// 段内已产出文本的末字符是否为空白（用于跨标签边界的空格归一）。
+    last_was_ws: bool,
     /// 未闭合 `<a href>` 栈：(href, 起始字节偏移)。
     link_stack: Vec<(String, u32)>,
 }
@@ -75,19 +77,33 @@ impl Cleaner {
         let t = collapse_ws(raw);
         let t = t.as_ref();
         if t.is_empty() {
+            // 纯空白文本节点（如 `Hello <em>world</em>` 中 `Hello` 与 `<em>`
+            // 之间、或标签独占一行的缩进空白）：置「待补空格」标记。下一段非空
+            // 文本若非段首，则补一个空格——否则英文书按标签边界粘词
+            // （旧实现直接丢弃，产出 "Helloworld"）。段首空白不补（无前导空格）。
+            if self.has_content {
+                self.last_was_ws = true;
+            }
             return;
         }
         if t.trim().is_empty() && !self.has_content {
             return;
         }
         let start = self.out.text.len() as u32;
-        self.out.text.push_str(&t);
+        // 跨标签边界的空格归一：段中且前一节点以空白收尾（或本节点自带前导空白）
+        let need_space = self.has_content && (self.last_was_ws || raw.starts_with(char::is_whitespace));
+        if need_space {
+            self.out.text.push(' ');
+        }
+        self.out.text.push_str(t);
         let end = self.out.text.len() as u32;
         self.pending.push(Inline::Text { range: TextRange::new(start, end), style: self.style() });
         self.has_content = true;
+        self.last_was_ws = raw.ends_with(char::is_whitespace);
     }
 
     fn flush(&mut self) {
+        self.last_was_ws = false;
         if self.pending.is_empty() {
             self.has_content = false;
             return;
@@ -126,6 +142,7 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
         italic_depth: 0,
         skip_depth: 0,
         has_content: false,
+        last_was_ws: false,
         link_stack: Vec::new(),
     };
 
@@ -152,11 +169,24 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
                 // 标签名借用匹配（免 to_string 分配）
                 let n = local_name(&name);
                 match n {
-                    "head" | "script" | "style" | "title" | "meta" | "link" => {
+                    // head/script/style/title：空元素，跳过其内容直到对应闭合标签。
+                    // meta/link/ruby/rt/rp：**空元素或纯注音**，绝不进 skip 栈——
+                    // 真实 EPUB/MOBI 常写成「<meta …>」（无闭合、非自闭合），
+                    // 旧实现对非自闭合 meta/link 无条件 skip_depth += 1，闭合分支
+                    // 又不减，导致整章后续正文被永久丢弃（用户看到空章）。
+                    "head" | "script" | "style" | "title" => {
                         if !self_closing {
                             c.skip_depth += 1;
                         }
                     }
+                    // ruby 注音（<ruby>漢<rt>かん</rt></ruby>）：只保留 ruby 基字，
+                    // 丢 rt/rp 注音文本（日文书硬伤：旧实现把注音混入正文成「漢かん」）。
+                    "rt" | "rp" => {
+                        if !self_closing {
+                            c.skip_depth += 1;
+                        }
+                    }
+                    "meta" | "link" => {}
                     "br" => c.flush(),
                     "hr" => {
                         c.flush();
@@ -213,8 +243,8 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
                     _ => {}
                 }
                 if self_closing {
-                    // 自闭合回滚 skip 计数
-                    if matches!(n, "head" | "script" | "style" | "title" | "meta" | "link")
+                    // 自闭合回滚 skip 计数（meta/link 不再进栈，无需回滚）
+                    if matches!(n, "head" | "script" | "style" | "title" | "rt" | "rp")
                         && c.skip_depth > 0
                     {
                         c.skip_depth -= 1;
@@ -224,7 +254,7 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
             Token::Close(name) => {
                 let n = local_name(&name);
                 match n {
-                    "head" | "script" | "style" | "title" => {
+                    "head" | "script" | "style" | "title" | "rt" | "rp" => {
                         if c.skip_depth > 0 {
                             c.skip_depth -= 1;
                         }
@@ -346,5 +376,36 @@ mod tests {
         let html = r#"<a name="top"></a><script><a href="x">坏</a></script><p><a>纯锚</a></p>"#;
         let r = clean_xhtml(html);
         assert!(r.links.is_empty(), "不应捕获：{:?}", r.links);
+    }
+
+    /// 回归（深审 §三）：未闭合的 `<meta>`/`<link>`（非自闭合，真实 EPUB/MOBI
+    /// 常见写法）不得永久开启 skip 栈，导致整章正文被静默丢弃（用户看到空章）。
+    #[test]
+    fn unclosed_meta_link_keeps_body() {
+        let html = "<html><head><meta charset=\"utf-8\"><link rel=\"stylesheet\" href=\"a.css\"></head>\
+                    <body><p>正文第一段</p><p>第二段</p></body></html>";
+        let r = clean_xhtml(html);
+        let texts = para_texts(&r);
+        assert!(texts.iter().any(|t| t.contains("正文第一段")), "meta 未闭合不应丢正文: {texts:?}");
+        assert!(texts.iter().any(|t| t.contains("第二段")), "link 未闭合不应丢正文: {texts:?}");
+    }
+
+    /// 回归（深审 §三）：行内标签边界的空格不得丢失，否则英文书按标签粘词
+    /// （`Hello <em>world</em>` → "Helloworld"）。
+    #[test]
+    fn inline_boundary_space_preserved() {
+        let r = clean_xhtml("<p>Hello <em>world</em> and <strong>big bold</strong> end</p>");
+        let texts = para_texts(&r);
+        assert_eq!(texts[0], "Hello world and big bold end");
+        // CJK 不受影响（本就无空格）；段首不产生前导空格
+        let cjk = clean_xhtml("<p>前文 <em>强调</em> 后文</p>");
+        assert_eq!(para_texts(&cjk)[0], "前文 强调 后文");
+    }
+
+    /// 回归（深审 §三）：ruby 注音文本不得混入正文（日文书硬伤）。
+    #[test]
+    fn ruby_annotation_not_in_body() {
+        let r = clean_xhtml("<p><ruby>漢<rt>かん</rt></ruby>字</p>");
+        assert_eq!(r.text.trim(), "漢字", "注音不得混入正文: {:?}", r.text);
     }
 }

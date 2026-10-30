@@ -21,6 +21,7 @@ fn layout_payload_survives_disk_cache() {
             font_size: 18.0,
             bold: false,
             italic: false,
+            width: 42.0,
             range: (0, 42),
         }],
         images: vec![],
