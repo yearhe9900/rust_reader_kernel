@@ -14,9 +14,9 @@ use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use rrk_kernel::Kernel;
+use rrk_kernel::{shared_registry, Kernel, OpenIndexStore};
 
 /// 书句柄（0 = 非法）。本地定义（与 `rrk_kernel::BookHandle` 透明等价）：
 /// cbindgen `parse_deps=false` 看不到依赖 crate 里的别名，必须在本 crate 可见。
@@ -36,8 +36,10 @@ use rrk_model::{
 ///      `rrk_search_chapter` / `rrk_image_thumbnail` / `rrk_layout_cancel` /
 ///      `rrk_stats` / 进度与坐标 API / 排版器池（并行排版）；
 /// v10 = `rrk_load_headings`（issue #13：章标题块轻量出口，另 EPUB 无 TOC 书
-///       open 期自动回填首个最小级标题）。
-pub const RRK_ABI_VERSION: u32 = 10;
+///       open 期自动回填首个最小级标题）；
+/// v11 = `rrk_layout_cancel_book`（按书取消在飞排版；并发契约加固：per-request
+///       取消令牌、句柄 generation 防 ABA、锁中毒自恢复、重活出锁）。
+pub const RRK_ABI_VERSION: u32 = 11;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -56,9 +58,37 @@ fn layouter_slot() -> &'static Mutex<Option<rrk_layout::Layouter>> {
     });
     &pool[RR.fetch_add(1, Ordering::Relaxed) % pool.len()]
 }
-/// 排版取消标志（`rrk_layout_cancel` 置位；布局起点消费旧值、块间检查——
-/// 尽力取消语义：只对「已开始的布局」生效，无进行中布局时的取消无害吞掉）。
-static LAYOUT_CANCEL: AtomicBool = AtomicBool::new(false);
+/// 排版取消令牌：每次布局请求独立一个（同一请求 = 同一 `Arc`）。
+///
+/// 深审 §二.3：原实现是单个全局 `AtomicBool` + 布局起点 `swap(false)`
+/// 消费，两个后果：布局 B 的启动会吞掉对在飞布局 A 的取消；
+/// `rrk_layout_cancel` 无差别误杀所有在飞布局。改为「登记 + 独立令牌」：
+/// 取消只置位登记在册的令牌，另一请求的启动不再影响别人。
+type CancelToken = Arc<AtomicBool>;
+
+/// 在飞布局登记表：(书句柄, 令牌)。
+static LAYOUTS_ACTIVE: Mutex<Vec<(BookHandle, CancelToken)>> = Mutex::new(Vec::new());
+
+/// 在飞布局登记（RAII：构造入表、drop 出表，panic 路径也不泄漏）。
+/// 句柄随登记项存于 `LAYOUTS_ACTIVE`（scoped 取消按它匹配），本体只持令牌。
+struct LayoutRun {
+    token: CancelToken,
+}
+
+impl LayoutRun {
+    fn begin(handle: BookHandle) -> Self {
+        let token = CancelToken::new(AtomicBool::new(false));
+        lock_recover(&LAYOUTS_ACTIVE).push((handle, token.clone()));
+        Self { token }
+    }
+}
+
+impl Drop for LayoutRun {
+    fn drop(&mut self) {
+        let mut v = lock_recover(&LAYOUTS_ACTIVE);
+        v.retain(|(_, t)| !Arc::ptr_eq(t, &self.token));
+    }
+}
 /// 排版布局缓存命中/未命中计数（`rrk_stats` 可观测性用）。
 static LAYOUT_HITS: AtomicU64 = AtomicU64::new(0);
 static LAYOUT_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -74,10 +104,19 @@ fn set_last_error(code: u32, msg: impl Into<String>) {
     LAST_ERROR.with(|e| *e.borrow_mut() = (code, msg.into()));
 }
 
+/// 锁获取（中毒恢复）：panic 被 `catch_unwind` 兤住后 Mutex 必然中毒——
+/// 但 Rust 内存模型下数据结构仍一致（无 UB），恢复继续用远好于
+/// 「一次 panic → 引擎永久瘫痪」（深审 §二.1；错误码表里也不该
+/// 出现「锁中毒」这种宿主无法自救的内部状态）。
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
 fn with_kernel<T>(f: impl FnOnce(&mut Kernel) -> Result<T, u32>) -> Result<T, u32> {
-    let mut guard = KERNEL
-        .lock()
-        .map_err(|_| set_err(RrkError::io("内核锁中毒"), RrkErrorKind::Internal.code()))?;
+    let mut guard = lock_recover(&KERNEL);
     let kernel = guard.get_or_insert_with(Kernel::new);
     f(kernel)
 }
@@ -423,7 +462,23 @@ pub unsafe extern "C" fn rrk_open(path: *const u8, path_len: usize) -> u64 {
                 return 0;
             }
         };
-        match with_kernel(|k| k.open_path(&path).map_err(set_kind)) {
+        // 锁外开书三段式（§二.4）：段 1 拿 open 索引缓存句柄（锁内，微秒级）→
+        // 段 2 嗅探+解析+索引重建（锁外，重活）→ 段 3 登记句柄（锁内，微秒级）。
+        let store = match with_kernel(|k| Ok::<_, u32>(k.open_index_cache())) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let idx = OpenIndexStore::new(store);
+        let src = rrk_format::ContentSource::from_path(&path);
+        let book: Arc<dyn rrk_format::BookSource> =
+            match shared_registry().open_cached(&src, &idx) {
+                Ok(b) => Arc::from(b),
+                Err(e) => {
+                    set_kind(e);
+                    return 0;
+                }
+            };
+        match with_kernel(|k| Ok(k.register_book(book, idx.hits(), idx.misses()))) {
             Ok(h) => h,
             Err(_) => 0,
         }
@@ -522,16 +577,24 @@ pub unsafe extern "C" fn rrk_load_chapter(
         {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        with_kernel(|k| {
-            // 内容级缓存（issue #12）：命中免 inflate + 清洗 + 分块
-            let content = k.load_chapter_cached(handle, chapter_id).map_err(set_kind)?;
-            let blocks = blocks_json(&content.text, &content.blocks);
-            let links = links_json(&content.link_ranges);
-            write_buf(content.text.as_bytes().to_vec(), text_ptr, text_len);
-            write_buf(blocks, blocks_ptr, blocks_len);
-            write_buf(links, links_ptr, links_len);
-            Ok(0)
-        })
+        // 锁外载章三段式（§二.4）：段 1 查缓存（锁内，微秒级）→ miss 重活
+        // 出锁（inflate+清洗+分块）→ 段 3 回填缓存（锁内）→ JSON/缓冲全程出锁。
+        let (book, cached, key) =
+            with_kernel(|k| k.chapter_lookup(handle, chapter_id).map_err(set_kind))?;
+        let content = match cached {
+            Some(c) => c,
+            None => {
+                let content = book.load_chapter(chapter_id).map_err(set_kind)?;
+                with_kernel(|k| Ok(k.chapter_store(key, &content)))?;
+                content
+            }
+        };
+        let blocks = blocks_json(&content.text, &content.blocks);
+        let links = links_json(&content.link_ranges);
+        write_buf(content.text.as_bytes().to_vec(), text_ptr, text_len);
+        write_buf(blocks, blocks_ptr, blocks_len);
+        write_buf(links, links_ptr, links_len);
+        Ok(0)
     })
 }
 
@@ -625,6 +688,149 @@ mod tests {
         let mut s = String::new();
         json_str("a\"b\\c\n", &mut s);
         assert_eq!(s, "\"a\\\"b\\\\c\\n\"");
+    }
+
+    // ------------------------------------------------------------------
+    // 深审 §二（FFI 并发契约）复现测试：修复前红，修复后转正/由新 API 回归
+    // ------------------------------------------------------------------
+
+    /// 复现 §二.1：闭包内 panic 毒化内核锁 → 修复前后续所有调用报锁中毒、
+    /// 引擎永久瘫痪（catch_unwind 兜住了异常也救不回锁）。
+    #[test]
+    fn poison_must_not_paralyze_engine() {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_kernel(|_k| -> Result<(), u32> { panic!("复现：内核闭包内 panic") });
+        }));
+        assert!(r.is_err(), "预期 panic 被测试内 catch_unwind 看到");
+        let ok = with_kernel(|_k| Ok(7u32));
+        assert_eq!(ok, Ok(7u32), "锁中毒后引擎不得永久瘫痪（必须自动恢复）");
+    }
+
+    /// 回归 §二.3（转正）：另一布局的启动不得吞掉在飞布局 A 的取消——
+    /// per-request 令牌下 B 的登记不影响 A（原全局 swap 复现已不存在）。
+    #[test]
+    fn cancel_token_not_eaten_by_other_layout_start() {
+        let a = LayoutRun::begin(1);
+        let _b = LayoutRun::begin(2); // B 启动（登记）
+        rrk_layout_cancel(); // 宿主取消全部
+        assert!(a.token.load(Ordering::Relaxed), "A 的取消不得被 B 的启动吞掉");
+        assert!(_b.token.load(Ordering::Relaxed), "B 也应在取消范围内");
+    }
+
+    /// 回归 §二.3（新增 scoped API）：cancel_book 只杀目标书的布局，
+    /// 不误杀其它窗口/预取。
+    #[test]
+    fn cancel_book_scoped_to_one_book() {
+        let a = LayoutRun::begin(11);
+        let b = LayoutRun::begin(22);
+        assert_eq!(rrk_layout_cancel_book(11), 0);
+        assert!(a.token.load(Ordering::Relaxed), "cancel_book(11) 必须取消 A");
+        assert!(!b.token.load(Ordering::Relaxed), "cancel_book(11) 不得误杀他书布局");
+    }
+
+    /// 回归 §二.3：布局结束（drop）后从登记表移除，不泄漏。
+    #[test]
+    fn layout_run_unregisters_on_drop() {
+        let before = lock_recover(&LAYOUTS_ACTIVE).len();
+        {
+            let _r = LayoutRun::begin(33);
+            assert_eq!(lock_recover(&LAYOUTS_ACTIVE).len(), before + 1);
+        }
+        assert_eq!(lock_recover(&LAYOUTS_ACTIVE).len(), before);
+    }
+
+    /// 写一个临时大 TXT（单章多段）。
+    fn write_big_txt(tag: &str, paragraphs: usize, para_bytes: usize) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("rrk_repro_{tag}_{}.txt", std::process::id()));
+        let para = "读者内核并发复现用文本".repeat(para_bytes / 33 + 1); // 11 字×3B
+        let mut s = String::from("第1章 复现\n");
+        for _ in 0..paragraphs {
+            s.push_str(&para);
+            s.push_str("\n\n");
+        }
+        std::fs::write(&p, s).expect("写临时书");
+        p
+    }
+
+    /// 在 `done` 置位前轮询内核锁：拿到即 true（锁可用）。
+    fn poll_kernel_lock_until(done: &AtomicBool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !done.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            match KERNEL.try_lock() {
+                Ok(_g) => return true,
+                Err(std::sync::TryLockError::Poisoned(p)) => {
+                    drop(p.into_inner());
+                    return true;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        false
+    }
+
+    /// 复现 §二.4（open）：rrk_open 重活（嗅探+解析+索引重建）期间内核锁
+    /// 必须可用——契约文档已写「重活已移出该锁」，实现与文档不符。
+    #[test]
+    fn kernel_lock_free_during_open() {
+        let path = write_big_txt("open", 150, 40_000);
+        let bytes = path.to_str().unwrap().as_bytes().to_vec();
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let (s2, d2) = (started.clone(), done.clone());
+        let t = std::thread::spawn(move || {
+            s2.store(true, Ordering::Relaxed);
+            let h = unsafe { rrk_open(bytes.as_ptr(), bytes.len()) };
+            d2.store(true, Ordering::Relaxed);
+            h
+        });
+        while !started.load(Ordering::Relaxed) {
+            std::thread::yield_now();
+        }
+        // 等 opener 真正进入临界区（否则首轮 try_lock 抢在 lock() 之前 = 假绿）
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let got = poll_kernel_lock_until(&done);
+        let h = t.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_ne!(h, 0, "复现载体（临时大书）必须能打开");
+        assert!(got, "rrk_open 重活期间内核锁被长期占用：其它 FFI 调用（含 cancel）全被阻塞");
+    }
+
+    /// 复现 §二.4（载章）：rrk_load_chapter（inflate+清洗+分块+JSON）不得全程持锁。
+    #[test]
+    fn kernel_lock_free_during_load_chapter() {
+        let path = write_big_txt("load", 150, 40_000);
+        let bytes = path.to_str().unwrap().as_bytes().to_vec();
+        let h = unsafe { rrk_open(bytes.as_ptr(), bytes.len()) };
+        assert_ne!(h, 0, "复现载体（临时大书）必须能打开");
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let d2 = done.clone();
+        let t = std::thread::spawn(move || {
+            let mut codes = Vec::new();
+            for _ in 0..3 {
+                let (mut tp, mut tn) = (std::ptr::null_mut::<u8>(), 0usize);
+                let (mut bp, mut bn) = (std::ptr::null_mut::<u8>(), 0usize);
+                let (mut lp, mut ln) = (std::ptr::null_mut::<u8>(), 0usize);
+                let rc = unsafe {
+                    rrk_load_chapter(h, 0, &mut tp, &mut tn, &mut bp, &mut bn, &mut lp, &mut ln)
+                };
+                codes.push(rc);
+                unsafe {
+                    rrk_buf_free(tp, tn);
+                    rrk_buf_free(bp, bn);
+                    rrk_buf_free(lp, ln);
+                }
+            }
+            d2.store(true, Ordering::Relaxed);
+            codes
+        });
+        // 等载章线程进入临界区，再开始观测锁可用性
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let got = poll_kernel_lock_until(&done);
+        let codes = t.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(codes.iter().all(|&c| c == 0), "载章必须成功: {codes:?}");
+        assert!(got, "rrk_load_chapter 重活期间内核锁被长期占用");
     }
 }
 
@@ -843,9 +1049,7 @@ pub unsafe extern "C" fn rrk_cache_configure(
                 Err(e) => return Err(set_kind(RrkError::invalid(format!("缓存目录非 UTF-8: {e}")))),
             }
         };
-        let mut guard = CACHE.lock().map_err(|_| {
-            set_err(RrkError::io("缓存锁中毒"), RrkErrorKind::Internal.code())
-        })?;
+        let mut guard = lock_recover(&CACHE);
         *guard = if dir.is_empty() {
             None
         } else {
@@ -1117,9 +1321,7 @@ fn layout_pages_cached(
 
     // C1 内存 → C2 磁盘（命中免排版）
     let cached = {
-        let mut cache_guard = CACHE.lock().map_err(|_| {
-            set_err(RrkError::io("缓存锁中毒"), RrkErrorKind::Internal.code())
-        })?;
+        let mut cache_guard = lock_recover(&CACHE);
         match cache_guard.as_mut() {
             Some((store, mem)) => {
                 if let Some(bytes) = mem.get(&key) {
@@ -1144,24 +1346,19 @@ fn layout_pages_cached(
     }
     LAYOUT_MISSES.fetch_add(1, Ordering::Relaxed);
 
-    // miss：载章 + 排版（内核锁外；排版器只在 layout 期间短暂持锁）
+    // miss：载章 + 排版（内核锁外；排版器只在 layout 期间短暂持锁；
+    // 取消走 per-request 令牌——本请求登记在册，别人启动不影响它）
     let content = book.load_chapter(chapter_id).map_err(set_kind)?;
     let pages = {
-        let mut guard = layouter_slot()
-            .lock()
-            .map_err(|_| set_err(RrkError::io("排版器锁中毒"), RrkErrorKind::Internal.code()))?;
+        let run = LayoutRun::begin(handle);
+        let mut guard = lock_recover(&layouter_slot());
         let layouter = guard.get_or_insert_with(rrk_layout::Layouter::new);
-        // 起点消费：丢掉「没有进行中布局」时置入的陈旧取消，避免误杀本次
-        LAYOUT_CANCEL.swap(false, Ordering::Relaxed);
         layouter
-            .layout_cancellable(&content, style, vp, &LAYOUT_CANCEL)
+            .layout_cancellable(&content, style, vp, &run.token)
             .map_err(set_kind)?
     };
     let payload = rrk_model::encode_pages(&pages);
-    if let Some((store, mem)) = CACHE
-        .lock()
-        .map_err(|_| set_err(RrkError::io("缓存锁中毒"), RrkErrorKind::Internal.code()))?
-        .as_mut()
+    if let Some((store, mem)) = lock_recover(&CACHE).as_mut()
     {
         let _ = store.save(&key, &payload);
         mem.protect(key);
@@ -1296,12 +1493,33 @@ pub unsafe extern "C" fn rrk_hit_test(
     })
 }
 
-/// 请求取消进行中的排版（尽力取消，块粒度）：`rrk_pages_json` 在块间检查并以
-/// `Cancelled`（1005）返回；布局未开始时的置位会在下次布局起点被消费，无副作用。
+/// 请求取消进行中的排版（尽力取消，块粒度）：布局在块间检查令牌并以
+/// `Cancelled`（1005）返回。只对**登记在册**的在飞布局生效，无进行中布局
+/// 时置位无人可见、天然无副作用（不残留、不影响下一次布局）。
+/// 取消**所有**在飞排版（尽力语义：只对已开始的布局生效，无进行中布局时
+/// 无副作用）。多窗口只想取消单个窗口时用 `rrk_layout_cancel_book`。
 #[no_mangle]
 pub extern "C" fn rrk_layout_cancel() -> u32 {
-    LAYOUT_CANCEL.store(true, Ordering::Relaxed);
-    0
+    guard(|| {
+        for (_, token) in lock_recover(&LAYOUTS_ACTIVE).iter() {
+            token.store(true, Ordering::Relaxed);
+        }
+        Ok(0)
+    })
+}
+
+/// 按书取消在飞排版（v11 增量 ABI）：只置位目标书的布局令牌，
+/// 不误杀其它窗口/预取请求（`rrk_layout_cancel` 保持「取消全部」语义）。
+#[no_mangle]
+pub extern "C" fn rrk_layout_cancel_book(handle: BookHandle) -> u32 {
+    guard(|| {
+        for (h, token) in lock_recover(&LAYOUTS_ACTIVE).iter() {
+            if *h == handle {
+                token.store(true, Ordering::Relaxed);
+            }
+        }
+        Ok(0)
+    })
 }
 
 /// 远跳预取：预热本章布局 + 保护窗口（当前章 + 相邻章）。
@@ -1549,9 +1767,7 @@ pub unsafe extern "C" fn rrk_search_next(
         *out_len = 0;
         let (session, _cancel) =
             with_kernel(|k| k.search_session(search_id).map_err(set_kind))?;
-        let mut s = session.lock().map_err(|_| {
-            set_err(RrkError::io("检索会话锁中毒"), RrkErrorKind::Internal.code())
-        })?;
+        let mut s = lock_recover(&session);
         let page = s.next(max_hits).map_err(set_kind)?;
         write_buf(search_page_json(&page), out_ptr, out_len);
         Ok(0)
@@ -1588,13 +1804,13 @@ pub unsafe extern "C" fn rrk_search_chapter(
             case_sensitive: case_sensitive != 0,
             context_chars: if context_chars == 0 { 30 } else { context_chars },
         };
-        with_kernel(|k| {
-            let page = k
-                .search_chapter(handle, chapter, &query, opts, max_hits)
-                .map_err(set_kind)?;
-            write_buf(search_page_json(&page), out_ptr, out_len);
-            Ok(0)
-        })
+        // 锁外检索（§二.4）：书源锁内取出（微秒级），扫描/清洗重活不持内核锁；
+        // done/cap 语义与 Kernel::search_chapter 同源（rrk_search::search_chapter_once）
+        let book = with_kernel(|k| k.book_arc(handle).map_err(set_kind))?;
+        let page = rrk_search::search_chapter_once(book, chapter, &query, opts, max_hits)
+            .map_err(set_kind)?;
+        write_buf(search_page_json(&page), out_ptr, out_len);
+        Ok(0)
     })
 }
 
@@ -1648,9 +1864,7 @@ pub unsafe extern "C" fn rrk_bm25_step(
         *out_ptr = std::ptr::null_mut();
         *out_len = 0;
         let job = with_kernel(|k| k.bm25_job(index_id).map_err(set_kind))?;
-        let mut j = job
-            .lock()
-            .map_err(|_| set_err(RrkError::io("索引会话锁中毒"), RrkErrorKind::Internal.code()))?;
+        let mut j = lock_recover(&job);
         let progress = j.step(max_chapters).map_err(set_kind)?;
         write_buf(bm25_progress_json(&progress), out_ptr, out_len);
         Ok(0)
@@ -1675,9 +1889,7 @@ pub unsafe extern "C" fn rrk_bm25_pull(
         *out_ptr = std::ptr::null_mut();
         *out_len = 0;
         let job = with_kernel(|k| k.bm25_job(index_id).map_err(set_kind))?;
-        let j = job
-            .lock()
-            .map_err(|_| set_err(RrkError::io("索引会话锁中毒"), RrkErrorKind::Internal.code()))?;
+        let j = lock_recover(&job);
         j.index().map_err(set_kind)?; // 未建完则报错（中文原因带进度）
         let bytes = j.bytes();
         let start = (offset as usize).min(bytes.len());
@@ -1709,9 +1921,7 @@ pub unsafe extern "C" fn rrk_bm25_query(
             return Err(set_kind(RrkError::invalid("查询词为空")));
         }
         let job = with_kernel(|k| k.bm25_job(index_id).map_err(set_kind))?;
-        let j = job
-            .lock()
-            .map_err(|_| set_err(RrkError::io("索引会话锁中毒"), RrkErrorKind::Internal.code()))?;
+        let j = lock_recover(&job);
         let hits = j.index().map_err(set_kind)?.query(&query, top_k.max(1) as usize);
         write_buf(scored_json(&hits), out_ptr, out_len);
         Ok(0)

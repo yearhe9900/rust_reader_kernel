@@ -14,8 +14,10 @@
 //      `rrk_search_chapter` / `rrk_image_thumbnail` / `rrk_layout_cancel` /
 //      `rrk_stats` / 进度与坐标 API / 排版器池（并行排版）；
 // v10 = `rrk_load_headings`（issue #13：章标题块轻量出口，另 EPUB 无 TOC 书
-//       open 期自动回填首个最小级标题）。
-#define RRK_ABI_VERSION 10
+//       open 期自动回填首个最小级标题）；
+// v11 = `rrk_layout_cancel_book`（按书取消在飞排版；并发契约加固：per-request
+//       取消令牌、句柄 generation 防 ABA、锁中毒自恢复、重活出锁）。
+#define RRK_ABI_VERSION 11
 
 // panic 被捕获时的错误码。
 #define ERR_PANIC 2001
@@ -213,9 +215,16 @@ uint32_t rrk_hit_test(BookHandle handle,
                       uint8_t **out_ptr,
                       uintptr_t *out_len);
 
-// 请求取消进行中的排版（尽力取消，块粒度）：`rrk_pages_json` 在块间检查并以
-// `Cancelled`（1005）返回；布局未开始时的置位会在下次布局起点被消费，无副作用。
+// 请求取消进行中的排版（尽力取消，块粒度）：布局在块间检查令牌并以
+// `Cancelled`（1005）返回。只对**登记在册**的在飞布局生效，无进行中布局
+// 时置位无人可见、天然无副作用（不残留、不影响下一次布局）。
+// 取消**所有**在飞排版（尽力语义：只对已开始的布局生效，无进行中布局时
+// 无副作用）。多窗口只想取消单个窗口时用 `rrk_layout_cancel_book`。
 uint32_t rrk_layout_cancel(void);
+
+// 按书取消在飞排版（v11 增量 ABI）：只置位目标书的布局令牌，
+// 不误杀其它窗口/预取请求（`rrk_layout_cancel` 保持「取消全部」语义）。
+uint32_t rrk_layout_cancel_book(BookHandle handle);
 
 // 远跳预取：预热本章布局 + 保护窗口（当前章 + 相邻章）。
 uint32_t rrk_prefetch(BookHandle handle,

@@ -433,6 +433,39 @@ fn scan_block(
     }
 }
 
+/// 一次性章内检索（会话即用即弃；issue #14 done 语义在此实现）。
+///
+/// FFI 可传入**锁外**取到的书源（`Arc`）：inflate/清洗/扫描不持内核锁
+/// （深审 §二.4）；内核 `Kernel::search_chapter` 与本函数同源（同一实现）。
+pub fn search_chapter_once(
+    book: Arc<dyn BookSource>,
+    chapter: ChapterId,
+    query: &str,
+    opts: SearchOptions,
+    max_hits: u32,
+) -> RrkResult<SearchPage> {
+    let mut session = SearchSession::open_chapter(book, chapter, query, opts)?;
+    let cap = if max_hits == 0 { 1000 } else { max_hits as usize };
+    let mut out = SearchPage::default();
+    // done = 扫描确实完成（issue #14）：命中被 cap 截断时保持 false，
+    // 调用方据「契约字段」得知结果不完整、可增大 maxHits 重调；
+    // 真正扫完才置 true（同步 API 空结果场景同样为 true）。
+    let mut finished = false;
+    while out.hits.len() < cap {
+        let page = session.next((cap - out.hits.len()) as u32)?;
+        out.hits.extend(page.hits);
+        out.scanned = page.scanned;
+        out.total = page.total;
+        if page.done {
+            finished = true;
+            break;
+        }
+    }
+    out.hits.truncate(cap);
+    out.done = finished;
+    Ok(out)
+}
+
 fn next_block(cur: &mut CurChapter) {
     cur.block += 1;
     cur.offset = 0;

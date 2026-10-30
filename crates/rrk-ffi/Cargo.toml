@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rrk-model.workspace = true
+rrk-format.workspace = true
 rrk-kernel.workspace = true
 rrk-layout.workspace = true
 rrk-cache.workspace = true

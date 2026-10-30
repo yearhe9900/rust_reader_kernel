@@ -732,6 +732,7 @@ name = "rrk-ffi"
 version = "0.3.0"
 dependencies = [
  "rrk-cache",
+ "rrk-format",
  "rrk-image",
  "rrk-kernel",
  "rrk-layout",

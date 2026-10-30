@@ -44,6 +44,28 @@
 
 ### Fixed
 
+- **FFI 并发契约加固第二批（深审报告 §二）**：四处「App 一开多线程/多窗口
+  就踩」的雷全部拆除，每个修复都先有确定性复现测试（红）后转回归（绿）：
+  1. **panic → 锁中毒 → 引擎永久瘫痪**：内核锁/缓存锁/排版器锁/检索与 BM25
+     会话锁全部改 `lock_recover`（`PoisonError::into_inner` 自恢复）——一次被
+     2001 拦截的 panic 不再把引擎锁死；
+  2. **书句柄 ABA**：句柄表加 generation（高 32 位）——关 A 开 B 复用槽位时
+     旧句柄必报 `InvalidParam`，不再静默指向他书（落实契约文档 §3 承诺）；
+  3. **全局取消令牌**：单个 `LAYOUT_CANCEL` + 起点 `swap(false)` 改为
+     「在飞布局登记 + per-request `Arc<AtomicBool>`」——布局 B 的启动不再吞掉
+     对 A 的取消；新增 `rrk_layout_cancel_book(handle)`（v11 增量 ABI，按书
+     取消不误杀其它窗口）；`rrk_layout_cancel` 保持取消全部语义；
+  4. **重活在全局内核锁内**：`rrk_open` / `rrk_load_chapter` /
+     `rrk_search_chapter` 改「锁内取书源/查缓存 → 锁外干重活 → 锁内回填」
+     三段式（内核新增 `open_index_cache`/`register_book`/`chapter_lookup`/
+     `chapter_store` 与 `rrk_search::search_chapter_once`，issue #14 done 语义
+     同源不变）——载章/开书/检索期间其它 FFI 调用（含取消）不再被阻塞。
+
+  ABI v10 → v11（增量：新符号 `rrk_layout_cancel_book`，既有符号/语义不变）；
+  头文件已重新生成（cbindgen verify 过）；契约文档同步（句柄 generation、
+  中毒自恢复、取消语义、锁范围表）；新增 9 个回归/时序测试，全工作区
+  32 测试单元全绿。
+
 - **畸形输入加固第一批（深审报告 §一）：MOBI 三连 + PDF 流闸 + ObjStm 死循环**，
   全部与「panic 不穿 ABI」红线对齐（abort/OOM/爆栈同样穿 `catch_unwind`）：
   1. **MOBI 头越界 panic**（`parse.rs`）：record0 只校验前 24 字节却直读到偏移

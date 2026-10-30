@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rrk_cache::{CacheKey, CacheKind, DiskStore, MemoryCache};
 use rrk_cbz::CbzAdapter;
@@ -45,14 +45,15 @@ pub struct ContentCacheStats {
 ///
 /// 只走 C2 磁盘层：open 索引一次性使用，不进 C1 内存 LRU 抢容量；
 /// 读写失败不致命（未命中/丢弃由 adapter 重建）。未配置缓存时不计数。
-struct OpenIndexStore<'a> {
-    store: Option<&'a DiskStore>,
+/// 持 `DiskStore` 克隆（轻量，仅路径）——FFI 锁外开书可跨锁持有（§二.4）。
+pub struct OpenIndexStore {
+    store: Option<DiskStore>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
 }
 
-impl<'a> OpenIndexStore<'a> {
-    fn new(store: Option<&'a DiskStore>) -> Self {
+impl OpenIndexStore {
+    pub fn new(store: Option<DiskStore>) -> Self {
         use std::sync::atomic::AtomicU64;
         Self {
             store,
@@ -60,12 +61,23 @@ impl<'a> OpenIndexStore<'a> {
             misses: AtomicU64::new(0),
         }
     }
+
+    /// open 索引命中/未命中计数（归并到内核统计用）。
+    pub fn hits(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.hits.load(Relaxed)
+    }
+
+    pub fn misses(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.misses.load(Relaxed)
+    }
 }
 
-impl IndexCache for OpenIndexStore<'_> {
+impl IndexCache for OpenIndexStore {
     fn load(&self, key: &CacheKey) -> Option<Vec<u8>> {
         use std::sync::atomic::Ordering::Relaxed;
-        let store = self.store?;
+        let store = self.store.as_ref()?;
         let got = store.load(key);
         if got.is_some() {
             self.hits.fetch_add(1, Relaxed);
@@ -76,7 +88,7 @@ impl IndexCache for OpenIndexStore<'_> {
     }
 
     fn save(&self, key: &CacheKey, payload: &[u8]) {
-        if let Some(s) = self.store {
+        if let Some(s) = &self.store {
             let _ = s.save(key, payload);
         }
     }
@@ -89,10 +101,20 @@ pub type SearchId = u64;
 /// BM25 索引会话句柄（0 = 非法）。
 pub type IndexId = u64;
 
+/// 句柄槽：`generation` 防 ABA——关 A 开 B 复用槽位时 generation 递增，
+/// 旧句柄因 generation 不匹配必报 `InvalidParam`（契约 §3：关闭后继续
+/// 用旧句柄不得静默指向他书）。
+struct BookSlot {
+    generation: u64,
+    book: Option<Arc<dyn BookSource>>,
+}
+
 /// 内核实例：格式注册表 + 句柄表 + 检索会话表。
 pub struct Kernel {
-    registry: FormatRegistry,
-    books: Vec<Option<Arc<dyn BookSource>>>,
+    registry: &'static FormatRegistry,
+    books: Vec<BookSlot>,
+    /// 下一个句柄 generation（全局单调；写入句柄高 32 位）。
+    next_generation: u64,
     /// 检索会话：会话本体（互斥） + 取消标志（**不取会话锁即可置位**）。
     searches: HashMap<SearchId, (Arc<Mutex<SearchSession>>, Arc<AtomicBool>)>,
     indexes: HashMap<IndexId, Arc<Mutex<Bm25Job>>>,
@@ -110,9 +132,11 @@ impl Default for Kernel {
     }
 }
 
-impl Kernel {
-    /// 创建内核并注册全部落地格式（EPUB/TXT/MOBI/AZW3）。
-    pub fn new() -> Self {
+static REGISTRY: OnceLock<FormatRegistry> = OnceLock::new();
+
+/// 全局共享格式注册表（无状态分发表，FFI 锁外开书也用同一份；深审 §二.4）。
+pub fn shared_registry() -> &'static FormatRegistry {
+    REGISTRY.get_or_init(|| {
         let mut registry = FormatRegistry::new();
         registry.register(Box::new(EpubAdapter));
         registry.register(Box::new(TxtAdapter));
@@ -120,9 +144,31 @@ impl Kernel {
         // 页级格式也进统一句柄：重排视图（页=章）+ 固定版式视图（as_paged）
         registry.register(Box::new(CbzAdapter));
         registry.register(Box::new(PdfAdapter));
+        registry
+    })
+}
+
+/// 句柄编码：槽位+1（低 32 位；0 永远非法）| generation << 32（高 32 位）。
+fn encode_handle(slot: usize, generation: u64) -> BookHandle {
+    ((generation & 0xFFFF_FFFF) << 32) | (slot as u64 + 1)
+}
+
+/// 解句柄 → (槽位, generation)；0 → None。
+fn decode_handle(handle: BookHandle) -> Option<(usize, u64)> {
+    let slot = (handle & 0xFFFF_FFFF) as usize;
+    if slot == 0 {
+        return None;
+    }
+    Some((slot - 1, handle >> 32))
+}
+
+impl Kernel {
+    /// 创建内核并注册全部落地格式（EPUB/TXT/MOBI/AZW3）。
+    pub fn new() -> Self {
         Self {
-            registry,
+            registry: shared_registry(),
             books: Vec::new(),
+            next_generation: 1,
             searches: HashMap::new(),
             indexes: HashMap::new(),
             next_search_id: 0,
@@ -227,18 +273,39 @@ impl Kernel {
         handle: BookHandle,
         id: u32,
     ) -> RrkResult<ChapterContent> {
+        let (book, cached, key) = self.chapter_lookup(handle, id)?;
+        if let Some(content) = cached {
+            return Ok(content);
+        }
+        let content = book.load_chapter(id)?;
+        self.chapter_store(key, &content);
+        Ok(content)
+    }
+
+    /// 锁外载章三段式（FFI 重活不持内核锁，深审 §二.4）段 1：
+    /// 句柄 → 书源 + 内容缓存查询。miss 时调用方**出锁**干重活
+    /// （`book.load_chapter`：inflate+清洗+分块），完成后用
+    /// [`Self::chapter_store`] 回填（段 3）。
+    pub fn chapter_lookup(
+        &mut self,
+        handle: BookHandle,
+        id: u32,
+    ) -> RrkResult<(Arc<dyn BookSource>, Option<ChapterContent>, CacheKey)> {
         let book = self.book_arc(handle)?;
         let key = CacheKey::content(book.meta().content_hash, CacheKind::ChapterText).with_part(id);
         if let Some(bytes) = self.content_cache_get(&key) {
             if let Some(content) = codec::decode_chapter(&bytes) {
                 self.content_stats.chapter_hits += 1;
-                return Ok(content);
+                return Ok((book, Some(content), key));
             }
         }
         self.content_stats.chapter_misses += 1;
-        let content = book.load_chapter(id)?;
-        self.content_cache_put(key, codec::encode_chapter(&content));
-        Ok(content)
+        Ok((book, None, key))
+    }
+
+    /// 锁外载章三段式段 3：miss 干完后回填缓存。
+    pub fn chapter_store(&mut self, key: CacheKey, content: &ChapterContent) {
+        self.content_cache_put(key, codec::encode_chapter(content));
     }
 
     // -----------------------------------------------------------------------
@@ -440,40 +507,58 @@ impl Kernel {
     /// 打开一本书（任意内容源）。open 索引（entries/pages/toc_raw）走内容级
     /// 缓存持久化（ROADMAP 章级/页级缓存持久化：重开命中免重建）。
     pub fn open(&mut self, src: &ContentSource) -> RrkResult<BookHandle> {
-        let idx = OpenIndexStore::new(self.content_cache.as_ref().map(|(s, _)| s));
+        let idx = OpenIndexStore::new(self.open_index_cache());
         let book: Arc<dyn BookSource> = Arc::from(self.registry.open_cached(src, &idx)?);
-        self.content_stats.open_hits += idx.hits.load(std::sync::atomic::Ordering::Relaxed);
-        self.content_stats.open_misses += idx.misses.load(std::sync::atomic::Ordering::Relaxed);
-        // 复用空槽；句柄 = 槽位 + 1（0 永远非法）
-        if let Some(pos) = self.books.iter().position(|s| s.is_none()) {
-            self.books[pos] = Some(book);
-            Ok((pos + 1) as BookHandle)
+        Ok(self.register_book(book, idx.hits(), idx.misses()))
+    }
+
+    /// 锁外开书三段式（FFI 重活不持内核锁，深审 §二.4）段 1：
+    /// 拿 open 索引缓存句柄（轻量克隆，可在锁外持有）。
+    pub fn open_index_cache(&self) -> Option<DiskStore> {
+        self.content_cache.as_ref().map(|(s, _)| s.clone())
+    }
+
+    /// 锁外开书三段式段 3：登记已在锁外打开的书 + 归并 open 命中统计。
+    pub fn register_book(
+        &mut self,
+        book: Arc<dyn BookSource>,
+        open_hits: u64,
+        open_misses: u64,
+    ) -> BookHandle {
+        self.content_stats.open_hits += open_hits;
+        self.content_stats.open_misses += open_misses;
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        if let Some(pos) = self.books.iter().position(|s| s.book.is_none()) {
+            self.books[pos] = BookSlot { generation, book: Some(book) };
+            encode_handle(pos, generation)
         } else {
-            self.books.push(Some(book));
-            Ok(self.books.len() as BookHandle)
+            self.books.push(BookSlot { generation, book: Some(book) });
+            encode_handle(self.books.len() - 1, generation)
         }
     }
 
     /// 关闭一本书（幂等；非法句柄报错）。
     pub fn close(&mut self, handle: BookHandle) -> RrkResult<()> {
-        let idx = handle
-            .checked_sub(1)
-            .ok_or_else(|| RrkError::invalid("非法句柄 0"))? as usize;
-        if idx >= self.books.len() || self.books[idx].is_none() {
-            return Err(RrkError::invalid(format!("句柄已关闭或越界: {handle}")));
-        }
-        self.books[idx] = None;
+        let (idx, generation) =
+            decode_handle(handle).ok_or_else(|| RrkError::invalid("非法句柄 0"))?;
+        let slot = self
+            .books
+            .get_mut(idx)
+            .filter(|s| s.generation == generation && s.book.is_some())
+            .ok_or_else(|| RrkError::invalid(format!("句柄已关闭或越界: {handle}")))?;
+        slot.book = None;
         Ok(())
     }
 
     /// 取书源（句柄 → 共享引用）。
     pub fn book(&self, handle: BookHandle) -> RrkResult<&Arc<dyn BookSource>> {
-        let idx = handle
-            .checked_sub(1)
-            .ok_or_else(|| RrkError::invalid("非法句柄 0"))? as usize;
+        let (idx, generation) =
+            decode_handle(handle).ok_or_else(|| RrkError::invalid("非法句柄 0"))?;
         self.books
             .get(idx)
-            .and_then(|s| s.as_ref())
+            .filter(|s| s.generation == generation)
+            .and_then(|s| s.book.as_ref())
             .ok_or_else(|| RrkError::invalid(format!("句柄已关闭或越界: {handle}")))
     }
 
@@ -484,7 +569,7 @@ impl Kernel {
 
     /// 当前打开的书数。
     pub fn open_count(&self) -> usize {
-        self.books.iter().filter(|s| s.is_some()).count()
+        self.books.iter().filter(|s| s.book.is_some()).count()
     }
 
     /// 书类型（统一句柄分流：Text / ImageGallery / Paged）。
@@ -554,27 +639,9 @@ impl Kernel {
         opts: SearchOptions,
         max_hits: u32,
     ) -> RrkResult<SearchPage> {
-        let book = self.book_arc(handle)?;
-        let mut session = SearchSession::open_chapter(book, chapter, query, opts)?;
-        let cap = if max_hits == 0 { 1000 } else { max_hits as usize };
-        let mut out = SearchPage::default();
-        // done = 扫描确实完成（issue #14）：命中被 cap 截断时保持 false，
-        // 调用方据「契约字段」得知结果不完整、可增大 maxHits 重调；
-        // 真正扫完才置 true（同步 API 空结果场景同样为 true）。
-        let mut finished = false;
-        while out.hits.len() < cap {
-            let page = session.next((cap - out.hits.len()) as u32)?;
-            out.hits.extend(page.hits);
-            out.scanned = page.scanned;
-            out.total = page.total;
-            if page.done {
-                finished = true;
-                break;
-            }
-        }
-        out.hits.truncate(cap);
-        out.done = finished;
-        Ok(out)
+        // 实现在 rrk_search::search_chapter_once（issue #14 done 语义同源）；
+        // FFI 走锁外拆分版，不再调本方法。
+        rrk_search::search_chapter_once(self.book_arc(handle)?, chapter, query, opts, max_hits)
     }
 
     /// 当前存活的检索会话数（生命周期自检/测试用）。
@@ -1023,5 +1090,22 @@ mod tests {
         assert_eq!(k.index_count(), 0);
         assert!(k.bm25_job(iid).is_err());
         k.close(handle).unwrap();
+    }
+
+    /// 深审 §二.2 复现：关 A 开 B 复用同句柄（ABA）——旧句柄静默指向 B，
+    /// `rrk_close(旧)` 能误关他书；违反契约「关闭后继续用旧句柄必报 InvalidParam」。
+    #[test]
+    fn stale_handle_rejected_after_reopen() {
+        let mut k = Kernel::new();
+        let a = k
+            .open(&ContentSource::from_bytes(Some("a.txt".to_string()), &b"hello book A"[..]))
+            .unwrap();
+        k.close(a).unwrap();
+        let b = k
+            .open(&ContentSource::from_bytes(Some("b.txt".to_string()), &b"hello book B"[..]))
+            .unwrap();
+        assert_ne!(a, b, "关 A 开 B 拿到同句柄（ABA）：旧句柄会静默指向 B");
+        assert!(k.book(a).is_err(), "契约：关闭后用旧句柄必报 InvalidParam");
+        k.close(b).unwrap();
     }
 }
