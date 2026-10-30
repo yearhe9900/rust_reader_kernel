@@ -623,11 +623,73 @@ pub struct PdfDocument {
     pub(crate) image_cache: std::sync::Mutex<crate::raster::RasterImageCache>,
 }
 
+/// 找子序列起点。
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 加密检测（深审 §三）：`/Encrypt` 在 trailer（经典 PDF）或
+/// `/Type/XRef` 流字典（1.5+）。扫描式内核不解析 xref → 用「关键字扫描
+/// + enclosing dict 回溯验证」双路判定，避免内容流里的同名 token 误报。
+pub fn detect_encrypt(data: &[u8]) -> bool {
+    // 路 1：经典 trailer { … /Encrypt n 0 R … }
+    let mut from = 0usize;
+    while let Some(at) = find_sub(&data[from..], b"trailer") {
+        let pos = from + at + 7;
+        let mut p = Parser::new(data);
+        p.pos = pos;
+        p.skip_ws();
+        if let Ok(Object::Dict(d)) = p.parse_object() {
+            if d.contains_key("Encrypt") {
+                return true;
+            }
+        }
+        from = pos;
+    }
+    // 路 2：xref 流字典（/Type /XRef 且 /Encrypt）——回溯 enclosing dict 验证
+    let mut from = 0usize;
+    while let Some(at) = find_sub(&data[from..], b"/Encrypt") {
+        let pos = from + at;
+        // 回溯最近的 "<<"（限定窗口，避免误扫大文件）
+        let lo = pos.saturating_sub(8192);
+        let bpos = data[lo..pos].windows(2).rposition(|w| w == b"<<").map(|i| lo + i);
+        if let Some(bpos) = bpos {
+            let mut p = Parser::new(data);
+            p.pos = bpos;
+            let got = match p.parse_object() {
+                Ok(Object::Dict(d)) => Some(d),
+                // 带 stream 的对象（xref 流）解析为 Stream{dict}
+                Ok(Object::Stream { dict, .. }) => Some(dict),
+                _ => None,
+            };
+            if let Some(d) = got {
+                if d.contains_key("Encrypt") {
+                    let is_xref = d.get("Type").and_then(|t| t.as_name()) == Some("XRef");
+                    let is_trailer = d.contains_key("Root");
+                    if is_xref || is_trailer {
+                        return true;
+                    }
+                }
+            }
+        }
+        from = pos + 8;
+    }
+    false
+}
+
 impl PdfDocument {
     /// 建对象表：全文扫描 `N G obj`（鲁棒，对 xref 流/损坏 xref 都成立）。
     pub fn open(data: Arc<[u8]>) -> RrkResult<Self> {
         if !data.starts_with(b"%PDF-") {
             return Err(RrkError::corrupt("PDF: 缺少 %PDF 头"));
+        }
+        // 加密文档明确拒绝（与 EPUB DRM/MOBI 加密同口径；深审 §三：
+        // 不拒绝则解码流全是乱码，用户看到天书却无任何提示）
+        if detect_encrypt(&data) {
+            return Err(RrkError::unsupported("PDF: 加密文档不支持"));
         }
         let mut offsets = HashMap::new();
         let mut i = 0usize;

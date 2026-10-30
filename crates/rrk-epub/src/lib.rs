@@ -643,18 +643,28 @@ fn build_toc_raw(zip: &Arc<ZipArchive>, opf: &OpfData, opf_dir: &str) -> Vec<Toc
 }
 
 /// nav.xhtml：按 `<ol>/<li>` 嵌套构建目录树（文档序即阅读序）。
+///
+/// 只吃 `epub:type="toc"` 的 `<nav>`（无 `epub:type` 的宽容视为 toc）；
+/// landmarks / page-list 等其它 nav 整体跳过（深审 §四：landmarks 曾混进目录）。
 fn parse_nav_toc(xml: &str) -> Vec<TocRaw> {
     let mut root: Vec<TocRaw> = Vec::new();
     let mut levels: Vec<Vec<TocRaw>> = Vec::new(); // 嵌套 ol 层级
-    let mut in_nav = 0u32;
+    // nav 栈：true = toc nav（内层内容计入目录）；false = landmarks 等（跳过）
+    let mut navs: Vec<bool> = Vec::new();
+    let in_toc = |navs: &Vec<bool>| matches!(navs.last(), Some(true));
     let mut pending: Option<String> = None; // 当前 <a> 的 href
     let mut title = String::new();
     for t in tokenize(xml) {
         match t {
             Token::Open { name, attrs, .. } => match local_name(&name) {
-                "nav" => in_nav += 1,
-                "ol" if in_nav > 0 => levels.push(Vec::new()),
-                "a" if in_nav > 0 => {
+                "nav" => {
+                    let is_toc = attr(&attrs, "epub:type")
+                        .map(|v| v.split_whitespace().any(|tok| tok == "toc"))
+                        .unwrap_or(true);
+                    navs.push(is_toc);
+                }
+                "ol" if in_toc(&navs) => levels.push(Vec::new()),
+                "a" if in_toc(&navs) => {
                     if let Some(href) = attr(&attrs, "href") {
                         pending = Some(href.to_string());
                         title.clear();
@@ -668,7 +678,9 @@ fn parse_nav_toc(xml: &str) -> Vec<TocRaw> {
                 }
             }
             Token::Close(name) => match local_name(&name) {
-                "nav" => in_nav = in_nav.saturating_sub(1),
+                "nav" => {
+                    navs.pop();
+                }
                 "a" => {
                     if let Some(href) = pending.take() {
                         let title = title.trim().to_string();
@@ -1252,5 +1264,20 @@ mod tests {
         assert_eq!(a.toc_raw, b.toc_raw, "目录原始树应与冷构建一致");
         assert_eq!(a.href_to_chapter, b.href_to_chapter);
         assert!(!b.toc_raw.is_empty(), "目录原始树应缓存复用");
+    }
+
+    /// 深审 §四：nav 只吃 epub:type="toc"，landmarks/page-list 不得混进目录；
+    /// 无 epub:type 的宽容视为 toc（兼容不规范书）。
+    #[test]
+    fn nav_filters_non_toc() {
+        let xml = r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body>
+<nav epub:type="toc"><ol><li><a href="c1.xhtml">第一章</a></li></ol></nav>
+<nav epub:type="landmarks"><ol><li><a href="c1.xhtml">开始</a></li><li><a href="c2.xhtml">正文</a></li></ol></nav>
+<nav epub:type="page-list"><ol><li><a href="c3.xhtml">页 1</a></li></ol></nav>
+<nav><ol><li><a href="c4.xhtml">无type宽容</a></li></ol></nav>
+</body></html>"#;
+        let items = parse_nav_toc(xml);
+        let titles: Vec<_> = items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["第一章", "无type宽容"], "landmarks/page-list 应被过滤: {titles:?}");
     }
 }

@@ -396,7 +396,55 @@ fn walk_pages(
     }
 }
 
-/// outline 树 → （目录树、章页区间、章标题表）；顶层项成章。
+/// 命名 Dest 收集：`/Dests` 直接字典 + `/Names → /Dests` 名字树（递归 Kids）。
+/// 名字树值：`[pageRef …]` 或 `<< /D [pageRef …] >>`；这里统一成目标 Dest 对象。
+fn collect_named_dests(doc: &PdfDocument, catalog: &Object) -> HashMap<String, Object> {
+    let mut out = HashMap::new();
+    let mut push_pairs = |pairs: &[Object], out: &mut HashMap<String, Object>| {
+        // Names 数组：[name1, dest1, name2, dest2, …]
+        let mut i = 0;
+        while i + 1 < pairs.len() {
+            if let Some(name) = pairs[i].as_str().map(|b| String::from_utf8_lossy(b).into_owned()) {
+                out.entry(name).or_insert_with(|| pairs[i + 1].clone());
+            }
+            i += 2;
+        }
+    };
+    // /Dests 直接字典（name → dest）
+    if let Some(Object::Dict(d)) = catalog.get("Dests").map(|r| doc.resolve(r)) {
+        for (k, v) in d {
+            out.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    // /Names → /Dests 名字树（Kids 递归；带深度/节点上限防畸形树）
+    if let Some(Object::Dict(names)) = catalog.get("Names").map(|r| doc.resolve(r)) {
+        if let Some(dests) = names.get("Dests") {
+            let mut stack = vec![(doc.resolve(dests), 0u32)];
+            let mut visited = 0u32;
+            while let Some((node, depth)) = stack.pop() {
+                visited += 1;
+                if depth > 16 || visited > 4096 {
+                    break; // 畸形名字树：丢弃剩余（目录降级而非挂死）
+                }
+                let Some(nd) = node.as_dict() else { continue };
+                if let Some(kids) = nd.get("Kids").and_then(|k| k.as_array()) {
+                    for k in kids {
+                        stack.push((doc.resolve(k), depth + 1));
+                    }
+                }
+                if let Some(names_arr) = nd.get("Names").and_then(|n| n.as_array()) {
+                    push_pairs(names_arr, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// outline 树 →（目录树、章页区间、章标题表）；顶层项成章，
+/// 子项递归 `/First` 挂进 children（两级书签不再被压平/丢弃）；
+/// 命名 Dest（字符串/名字）经 `/Dests` 与 `/Names` 名字树解析。
+/// PDF 的 `TocNode.anchor` 语义 = **目标页下标**（子项跳页用）。
 fn build_outline(
     doc: &PdfDocument,
     catalog: &Object,
@@ -411,6 +459,7 @@ fn build_outline(
         return (Vec::new(), Vec::new(), Vec::new());
     };
 
+    let named_dests = collect_named_dests(doc, catalog);
     let dest_page = |item: &Object| -> Option<u32> {
         let d = item.as_dict()?;
         let dest = match d.get("Dest") {
@@ -421,59 +470,132 @@ fn build_outline(
                     .unwrap_or(&Object::Null),
             ),
         };
+        let dest = match &dest {
+            // 命名 Dest：字符串/名字 → 查表（值可能是数组，也可能是 << /D […] >>）
+            Object::Str(bytes) => {
+                let name = String::from_utf8_lossy(bytes).into_owned();
+                named_dests.get(&name)?.clone()
+            }
+            Object::Name(n) => named_dests.get(n)?.clone(),
+            other => other.clone(),
+        };
+        // 名字树叶子常包一层 << /D … >>：剥到真正的 Dest 数组
+        let dest = match &dest {
+            Object::Dict(dd) => doc.resolve(dd.get("D")?),
+            other => other.clone(),
+        };
         match dest {
-            Object::Arr(a) => a
-                .first()
-                .and_then(|r| match doc.resolve(r) {
-                    Object::Ref(n, _) => Some(n),
+            Object::Arr(a) => {
+                // 目标是页引用本身（不要再 resolve——解引用后是页 Dict，
+                // Ref 分支永远匹配不上，数组 Dest 从来解析不出来）
+                match a.first() {
+                    Some(Object::Ref(n, _)) => page_index_of.get(n).copied(),
                     _ => None,
-                })
-                .and_then(|n| page_index_of.get(&n).copied()),
+                }
+            }
             _ => None,
         }
     };
 
-    let mut items: Vec<(u32, String)> = Vec::new();
-    let mut item = doc.resolve(&first);
-    let mut guard = 0;
-    while guard < 10_000 {
-        guard += 1;
-        let Some(d) = item.as_dict() else { break };
-        let title = d
-            .get("Title")
-            .and_then(|t| t.as_str())
-            .map(decode_pdf_text)
-            .unwrap_or_default();
-        if let Some(p) = dest_page(&item) {
-            items.push((p, title));
+    /// 单层子项链表（/First → /Next …）→ 树（子项递归 /First）。
+    struct Walker<'a> {
+        doc: &'a PdfDocument,
+        dest_page: &'a dyn Fn(&Object) -> Option<u32>,
+        budget: u32,
+    }
+    impl Walker<'_> {
+        fn chain(&mut self, first: &Object) -> Vec<(u32, String, Vec<TocNode>)> {
+            let mut out = Vec::new();
+            let mut item = self.doc.resolve(first);
+            while self.budget > 0 {
+                self.budget -= 1;
+                let Some(d) = item.as_dict() else { break };
+                let title = d
+                    .get("Title")
+                    .and_then(|t| t.as_str())
+                    .map(decode_pdf_text)
+                    .unwrap_or_default();
+                let page = (self.dest_page)(&item);
+                let children_first = d.get("First").cloned();
+                let children = match (&children_first, page) {
+                    (Some(f), Some(p)) => self.children(&f, p),
+                    _ => Vec::new(),
+                };
+                if let Some(p) = page {
+                    out.push((p, title, children));
+                }
+                match d.get("Next") {
+                    Some(n) => item = self.doc.resolve(n),
+                    None => break,
+                }
+            }
+            out
         }
-        match d.get("Next") {
-            Some(n) => item = doc.resolve(n),
-            None => break,
+        /// 子项：自身无 Dest 时继承父页（不丢节点）。
+        fn children(&mut self, first: &Object, parent_page: u32) -> Vec<TocNode> {
+            let mut out = Vec::new();
+            let mut item = self.doc.resolve(first);
+            while self.budget > 0 {
+                self.budget -= 1;
+                let Some(d) = item.as_dict() else { break };
+                let title = d
+                    .get("Title")
+                    .and_then(|t| t.as_str())
+                    .map(decode_pdf_text)
+                    .unwrap_or_default();
+                let page = (self.dest_page)(&item).unwrap_or(parent_page);
+                let sub_first = d.get("First").cloned();
+                let kids = match &sub_first {
+                    Some(f) => self.children(f, page),
+                    None => Vec::new(),
+                };
+                out.push(TocNode {
+                    title: if title.is_empty() { format!("第 {} 页", page + 1) } else { title },
+                    chapter: 0, // 占位：外层回填父章 id
+                    anchor: Some(page),
+                    children: kids,
+                });
+                match d.get("Next") {
+                    Some(n) => item = self.doc.resolve(n),
+                    None => break,
+                }
+            }
+            out
         }
     }
-
-    items.sort_by_key(|&(p, _)| p);
+    let mut w = Walker { doc, dest_page: &dest_page, budget: 20_000 };
+    let mut items = w.chain(&first);
+    items.sort_by_key(|&(p, _, _)| p);
     let mut toc = Vec::new();
     let mut ranges = Vec::new();
     let mut titles = Vec::new();
-    for (i, &(p, ref title)) in items.iter().enumerate() {
+    for (i, &(p, ref title, ref children)) in items.iter().enumerate() {
         let end = items
             .get(i + 1)
-            .map(|&(np, _)| np)
+            .map(|&(np, _, _)| np)
             .unwrap_or(page_count as u32)
             .max(p + 1)
             .min(page_count as u32);
         ranges.push((p, end));
         titles.push(if title.is_empty() { None } else { Some(title.clone()) });
+        // 子项回填父章 id（PDF：anchor = 页下标）
+        let mut children = children.clone();
+        fill_chapter(&mut children, i as ChapterId);
         toc.push(TocNode {
             title: if title.is_empty() { format!("第 {} 页", p + 1) } else { title.clone() },
             chapter: i as ChapterId,
             anchor: None,
-            children: Vec::new(),
+            children,
         });
     }
     (toc, ranges, titles)
+}
+
+fn fill_chapter(nodes: &mut [TocNode], chapter: ChapterId) {
+    for n in nodes {
+        n.chapter = chapter;
+        fill_chapter(&mut n.children, chapter);
+    }
 }
 
 fn decode_pdf_text(bytes: &[u8]) -> String {
@@ -880,5 +1002,58 @@ endobj
         assert_eq!(a.chapters, b.chapters, "章表应与冷构建一致");
         assert_eq!(a.chapter_pages, b.chapter_pages);
         assert_eq!(a.toc, b.toc);
+    }
+
+    /// 深审 §四：outline 递归 /First（两级书签不压平）+ 命名 Dest 解析。
+    #[test]
+    fn outline_nested_and_named_dest() {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"%PDF-1.4\n");
+        f.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 6 0 R /Names << /Dests 10 0 R >> >>\nendobj\n");
+        f.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>\nendobj\n");
+        f.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\nendobj\n");
+        f.extend_from_slice(b"4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n");
+        f.extend_from_slice(b"5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\nendobj\n");
+        // Outlines：顶层两项（第一章有子节 1.1；第二章用命名 Dest）
+        f.extend_from_slice(b"6 0 obj\n<< /Type /Outlines /First 7 0 R /Last 8 0 R /Count 2 >>\nendobj\n");
+        f.extend_from_slice(b"7 0 obj\n<< /Title (Chapter 1) /Parent 6 0 R /Next 8 0 R /First 9 0 R /Dest [3 0 R /Fit] >>\nendobj\n");
+        f.extend_from_slice(b"8 0 obj\n<< /Title (Chapter 2) /Parent 6 0 R /Prev 7 0 R /A << /S /GoTo /D (sec2) >> >>\nendobj\n");
+        f.extend_from_slice(b"9 0 obj\n<< /Title (Section 1.1) /Parent 7 0 R /Dest [5 0 R /Fit] >>\nendobj\n");
+        f.extend_from_slice(b"10 0 obj\n<< /Names [(sec2) [5 0 R /Fit]] >>\nendobj\n");
+        let src = ContentSource::from_bytes(Some("t.pdf".to_string()), Arc::<[u8]>::from(f.into_boxed_slice()));
+        let book = PdfBook::parse(&src).unwrap();
+        assert_eq!(book.toc.len(), 2, "顶层两项成两章: {:?}", book.toc);
+        assert_eq!(book.toc[0].title, "Chapter 1");
+        // 子节不再被丢弃：挂在父章下，anchor = 目标页下标（PDF 语义）
+        assert_eq!(book.toc[0].children.len(), 1, "子节应保留");
+        assert_eq!(book.toc[0].children[0].title, "Section 1.1");
+        assert_eq!(book.toc[0].children[0].anchor, Some(1), "子节应指向第 2 页（页下标 1）");
+        assert_eq!(book.toc[0].children[0].chapter, 0, "子节章 id 应回填父章");
+        // 命名 Dest（/A → /D (sec2)）解析到第 2 页
+        assert_eq!(book.toc[1].title, "Chapter 2");
+        assert_eq!(book.chapter_pages[1], (1, 2), "命名 Dest 章应从第 2 页起");
+        assert_eq!(book.chapter_pages[0], (0, 1));
+    }
+
+    /// 深审 §三：加密 PDF 明确拒绝（trailer 与 xref 流两路；内容流同名
+    /// token 不误报）。
+    #[test]
+    fn encrypted_pdf_rejected() {
+        // 经典 trailer 带 /Encrypt
+        let enc = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\ntrailer\n<< /Size 3 /Root 1 0 R /Encrypt 99 0 R >>\n%%EOF\n";
+        assert!(objects::detect_encrypt(enc), "trailer 路应检出");
+        // xref 流字典带 /Encrypt
+        let xref = b"%PDF-1.5\n1 0 obj\n<< /Type /XRef /Size 3 /Root 1 0 R /Encrypt 99 0 R /W [1 2 1] /Length 0 >>\nstream\n\nendstream\nendobj\n";
+        assert!(objects::detect_encrypt(xref), "xref 流路应检出");
+        // 未加密：不误报（内容流里的裸 /Encrypt 文本也不该命中——
+        // enclosing dict 无 XRef/Root 特征）
+        let plain = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+        assert!(!objects::detect_encrypt(plain), "未加密不得误报");
+        // 真实样张不误报
+        assert!(!objects::detect_encrypt(include_bytes!("../../../fixtures/sample.pdf")));
+        // open 拒绝 → UnsupportedFormat（与 EPUB DRM/MOBI 加密同口径）
+        let src = ContentSource::from_bytes(Some("e.pdf".to_string()), Arc::<[u8]>::from(&enc[..]));
+        let Err(err) = PdfBook::parse(&src) else { panic!("加密 PDF 必须被拒绝") };
+        assert_eq!(err.kind, rrk_model::RrkErrorKind::UnsupportedFormat);
     }
 }
