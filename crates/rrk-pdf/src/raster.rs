@@ -306,6 +306,8 @@ pub struct Rasterizer<'a> {
     pb: Option<PathBuilder>,
     last_path: Option<tiny_skia::Path>,
     last_point: (f32, f32),
+    /// Form XObject 递归深度（防畸形嵌套爆栈）。
+    form_depth: u32,
 }
 
 /// 光栅/图像像素上限（防御不可信尺寸字段：fuzz pdf_open 曾以 230 字节输入
@@ -350,6 +352,7 @@ impl<'a> Rasterizer<'a> {
             pb: None,
             last_path: None,
             last_point: (0.0, 0.0),
+            form_depth: 0,
         })
     }
 
@@ -921,6 +924,44 @@ impl<'a> Rasterizer<'a> {
 
     // ---- 图像 XObject ----
 
+    /// Form XObject：递归执行其内容流（q/Q 语义 = 存/恢复 gs、文本状态与
+    /// 资源字典）；/Matrix 并入 CTM；深度上限防畸形嵌套爆栈。
+    fn do_form(&mut self, obj: &Object, dict: &crate::objects::Dict) {
+        if self.form_depth >= 8 {
+            return;
+        }
+        let saved_gs = self.gs.clone();
+        let saved_text = self.text.clone();
+        let saved_res = self.resources.clone();
+        // /Matrix [a b c d e f] → 并入当前 CTM
+        if let Some(nums) = dict
+            .get("Matrix")
+            .and_then(|m| m.as_array())
+            .filter(|a| a.len() == 6)
+            .map(|a| a.iter().map(|o| match o {
+                Object::Int(i) => *i as f32,
+                Object::Real(f) => *f as f32,
+                _ => 0.0,
+            }).collect::<Vec<f32>>())
+        {
+            let m = pdf_matrix(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]);
+            self.gs.ctm = m.post_concat(self.gs.ctm);
+        }
+        // /Resources 覆盖（缺省继承页面资源——saved_res 不变即兑现）
+        if let Some(r) = dict.get("Resources") {
+            self.resources = Some(r.clone());
+        }
+        let doc = self.doc; // 拷引用，免与 &mut self 冲突
+        if let Ok(data) = doc.stream_data(obj) {
+            self.form_depth += 1;
+            self.exec(&data);
+            self.form_depth -= 1;
+        }
+        self.gs = saved_gs;
+        self.text = saved_text;
+        self.resources = saved_res;
+    }
+
     fn do_xobject(&mut self, name: &str) {
         let Some(res) = self.resources.clone() else { return };
         let res = self.doc.resolve(&res);
@@ -938,8 +979,15 @@ impl<'a> Rasterizer<'a> {
         }
         let Some(obj) = xo.get(name).map(|o| self.doc.resolve(o)) else { return };
         let Some(dict) = obj.as_dict() else { return };
-        if dict.get("Subtype").and_then(|s| s.as_name()) != Some("Image") {
-            return;
+        match dict.get("Subtype").and_then(|s| s.as_name()) {
+            Some("Image") => {}
+            // Form XObject：包在 Form 里的页眉页脚/正文图形旧实现整段缺失
+            //（深审 §四）：递归执行其内容流，q/Q 语义由存/恢复状态兑现。
+            Some("Form") => {
+                self.do_form(&obj, dict);
+                return;
+            }
+            _ => return,
         }
         let Ok(data) = self.doc.stream_data(&obj) else { return };
         let w = dict.get("Width").and_then(|v| v.as_int()).unwrap_or(0) as u32;

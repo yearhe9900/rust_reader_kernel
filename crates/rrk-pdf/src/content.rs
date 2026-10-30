@@ -12,8 +12,69 @@ use crate::objects::{Object, Parser, PdfDocument};
 pub struct FontData {
     /// ToUnicode 映射（源码 → 字符串）。
     pub to_unicode: Option<HashMap<u16, String>>,
+    /// /Differences 编码（源码 → 字符串；无 ToUnicode 时的第二级口径，
+    /// 西方导出与部分国内 PDF 常见——旧实现不支持，中文直接乱码/占位）。
+    pub differences: Option<HashMap<u16, String>>,
     /// 双字节码（映射键存在 >0xFF 的源码）。
     pub two_byte: bool,
+}
+
+/// 字形名 → Unicode（AGL 常用子集 + uniXXXX/uXXXX 约定；未知名返回 None）。
+fn glyph_name_to_unicode(name: &str) -> Option<String> {
+    // uni4E2D / u4E2D / u1F600 约定（CJK 与扩展区常用）
+    if let Some(hex) = name.strip_prefix("uni") {
+        if !hex.is_empty() && hex.len() <= 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return char::from_u32(u32::from_str_radix(hex, 16).ok()?).map(|c| c.to_string());
+        }
+    }
+    if let Some(hex) = name.strip_prefix('u') {
+        if (4..=6).contains(&hex.len()) && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return char::from_u32(u32::from_str_radix(hex, 16).ok()?).map(|c| c.to_string());
+        }
+    }
+    // 单字母 / 数字
+    if name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric() {
+        return Some(name.to_string());
+    }
+    // 标准 ASCII 字形名（AGL 核心子集，按 ASCII 码序）
+    const NAMED: &[(&str, char)] = &[
+        ("space", ' '), ("exclam", '!'), ("quotedbl", '"'), ("numbersign", '#'),
+        ("dollar", '$'), ("percent", '%'), ("ampersand", '&'), ("quotesingle", '\''),
+        ("parenleft", '('), ("parenright", ')'), ("asterisk", '*'), ("plus", '+'),
+        ("comma", ','), ("hyphen", '-'), ("period", '.'), ("slash", '/'),
+        ("colon", ':'), ("semicolon", ';'), ("less", '<'), ("equal", '='),
+        ("greater", '>'), ("question", '?'), ("at", '@'), ("bracketleft", '['),
+        ("backslash", '\\'), ("bracketright", ']'), ("asciicircum", '^'),
+        ("underscore", '_'), ("grave", '`'), ("braceleft", '{'), ("bar", '|'),
+        ("braceright", '}'), ("asciitilde", '~'),
+        ("zero", '0'), ("one", '1'), ("two", '2'), ("three", '3'), ("four", '4'),
+        ("five", '5'), ("six", '6'), ("seven", '7'), ("eight", '8'), ("nine", '9'),
+    ];
+    NAMED.iter().find(|(n, _)| *n == name).map(|(_, c)| c.to_string())
+}
+
+/// 解析 /Encoding → /Differences 数组：`[code /name /name … /name code /name …]`。
+/// 数字重设当前码位，名字占用当前码位并递增（PDF 32000-1 §9.6.6.4）。
+pub fn parse_differences(doc: &PdfDocument, font_dict: &crate::objects::Dict) -> Option<HashMap<u16, String>> {
+    let enc = font_dict.get("Encoding")?;
+    let enc = doc.resolve(enc);
+    let d = enc.as_dict()?;
+    let arr = d.get("Differences")?.as_array()?;
+    let mut map = HashMap::new();
+    let mut code = 0u16;
+    for item in arr {
+        match item {
+            Object::Int(n) => code = (*n).clamp(0, u16::MAX as i64) as u16,
+            Object::Name(gname) => {
+                if let Some(s) = glyph_name_to_unicode(gname) {
+                    map.insert(code, s);
+                }
+                code = code.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    (!map.is_empty()).then_some(map)
 }
 
 /// 解析 ToUnicode CMap：`beginbfchar` / `beginbfrange` 两族。
@@ -175,6 +236,28 @@ fn decode_string(bytes: &[u8], font: Option<&FontData>) -> String {
             return out;
         }
     }
+    // /Differences 编码（无 ToUnicode 时的第二级口径）：逐码查表，
+    // 表内未知码退 latin1（混合字体常见），字形名未知则跳过（避免乱码）。
+    if let Some(f) = font {
+        if let Some(diff) = &f.differences {
+            let mut out = String::new();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let (code, adv) = if f.two_byte && i + 1 < bytes.len() {
+                    (u16::from_be_bytes([bytes[i], bytes[i + 1]]), 2)
+                } else {
+                    (bytes[i] as u16, 1)
+                };
+                if let Some(s) = diff.get(&code) {
+                    out.push_str(s);
+                } else {
+                    out.push(bytes[i] as char); // 表内无此码 → 原编码（latin1 近似）
+                }
+                i += adv;
+            }
+            return out;
+        }
+    }
     // 无 ToUnicode：UTF-16BE BOM 或 latin1 近似
     if bytes.starts_with(&[0xFE, 0xFF]) {
         let units: Vec<u16> = bytes[2..]
@@ -207,17 +290,48 @@ fn collect_fonts(doc: &PdfDocument, resources: Option<&Object>) -> HashMap<Strin
                 }
             }
         }
+        let differences = parse_differences(doc, fd);
         let two_byte = to_unicode
             .as_ref()
             .map(|m| m.keys().any(|k| *k > 0xFF))
-            .unwrap_or(false);
-        fonts.insert(name.clone(), FontData { to_unicode, two_byte });
+            .unwrap_or(false)
+            || differences
+                .as_ref()
+                .map(|m| m.keys().any(|k| *k > 0xFF))
+                .unwrap_or(false);
+        fonts.insert(name.clone(), FontData { to_unicode, differences, two_byte });
     }
     fonts
 }
 
 /// 抽取一段内容流的文本（含行/段落切分）。
 pub fn extract_text(doc: &PdfDocument, content: &[u8], resources: Option<&Object>) -> String {
+    extract_text_inner(doc, content, resources, 0)
+}
+
+/// 取 Form XObject 的流数据与资源字典（无自身 Resources 时继承父级）。
+fn form_stream(doc: &PdfDocument, resources: Option<&Object>, name: &str) -> Option<(Vec<u8>, Object)> {
+    let res = doc.resolve(resources?);
+    let xo = doc.resolve(res.get("XObject")?);
+    let obj = doc.resolve(xo.get(name)?);
+    if obj.as_dict()?.get("Subtype").and_then(|s| s.as_name()) != Some("Form") {
+        return None;
+    }
+    let data = doc.stream_data(&obj).ok()?;
+    // Form 缺 Resources 时继承页面资源；递归深度限制防畸形嵌套
+    let res_out = match obj.get("Resources").cloned() {
+        Some(r) => r,
+        None => resources?.clone(),
+    };
+    Some((data, res_out))
+}
+
+fn extract_text_inner(
+    doc: &PdfDocument,
+    content: &[u8],
+    resources: Option<&Object>,
+    depth: u32,
+) -> String {
     let fonts = collect_fonts(doc, resources);
     let mut out = String::new();
     let mut operands: Vec<Object> = Vec::new();
@@ -358,6 +472,25 @@ pub fn extract_text(doc: &PdfDocument, content: &[u8], resources: Option<&Object
                     }
                 }
             }
+            // Form XObject：页眉页脚/整段内容常包在 Form 里——旧实现不递归，
+            // 这部分文本整段缺失（深审 §四）。深度限制防畸形嵌套。
+            b"Do" if depth < 8 => {
+                if let Some(Object::Name(nm)) = operands.last() {
+                    if let Some((data, res)) = form_stream(doc, resources, nm.as_str()) {
+                        if dirty {
+                            push_newline(&mut out, &mut dirty, y, &mut last_y, font_size, leading);
+                        }
+                        let inner = extract_text_inner(doc, &data, Some(&res), depth + 1);
+                        if !inner.trim().is_empty() {
+                            if !out.ends_with('\n') && !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(&inner);
+                            dirty = true;
+                        }
+                    }
+                }
+            }
             b"BT" => {
                 last_y = Some(y);
             }
@@ -407,5 +540,39 @@ mod tests {
         let text = extract_text(&doc, content, None);
         assert!(text.contains("Hello"));
         assert!(text.contains("World"));
+    }
+
+    /// 深审 §四：/Encoding /Differences 解码（无 ToUnicode 的常见导出）——
+    /// 标准字形名 + uniXXXX（CJK）；未知字形名跳过、表内无码退 latin1。
+    #[test]
+    fn differences_encoding_decodes() {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"%PDF-1.4\n9 0 obj\n<< >>\nendobj\n");
+        f.extend_from_slice(b"10 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Foo /Encoding << /Differences [65 /A /B /uni4E2D /uni6587 /space /zzz] >> >>\nendobj\n");
+        f.extend_from_slice(b"11 0 obj\n<< /Font << /F1 10 0 R >> >>\nendobj\n");
+        let doc = PdfDocument::open(std::sync::Arc::from(f.into_boxed_slice())).unwrap();
+        let res = Object::Ref(11, 0);
+        let content = b"BT /F1 12 Tf 100 700 Td (ABCDEF) Tj ET";
+        let text = extract_text(&doc, content, Some(&res));
+        // 码 65..70 → A B 中 文 空格 F（zzz 未知字形不入表 → 70 退 latin1 'F'）
+        assert!(text.contains("AB中文 "), "Differences 解码错误: {text:?}");
+        assert!(!text.contains('z'), "未知字形名应不入表: {text:?}");
+    }
+
+    /// 深审 §四：Form XObject 内的文本必须进抽取结果（旧实现不递归，
+    /// 包在 Form 里的页眉页脚/整段内容整段缺失）。
+    #[test]
+    fn form_xobject_text_extracted() {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"%PDF-1.4\n9 0 obj\n<< >>\nendobj\n");
+        f.extend_from_slice(b"20 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /Font << /F2 22 0 R >> >> >>\nstream\nBT /F2 12 Tf (FormText) Tj ET\nendstream\nendobj\n");
+        f.extend_from_slice(b"21 0 obj\n<< /Font << /F1 22 0 R >> /XObject << /Fm1 20 0 R >> >>\nendobj\n");
+        f.extend_from_slice(b"22 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+        let doc = PdfDocument::open(std::sync::Arc::from(f.into_boxed_slice())).unwrap();
+        let res = Object::Ref(21, 0);
+        let content = b"(PageText) Tj /Fm1 Do";
+        let text = extract_text(&doc, content, Some(&res));
+        assert!(text.contains("PageText"), "页面文本: {text:?}");
+        assert!(text.contains("FormText"), "Form 内文本不得缺失: {text:?}");
     }
 }
