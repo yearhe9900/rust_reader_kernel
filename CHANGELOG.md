@@ -85,7 +85,7 @@
      同源不变）——载章/开书/检索期间其它 FFI 调用（含取消）不再被阻塞。
 
   ABI v10 → v11（增量：新符号 `rrk_layout_cancel_book`，既有符号/语义不变）；
-  头文件已重新生成（cbindgen verify 过）；契约文档同步（句柄 generation、
+  头文件与 **Dart 封装常量 `kRrkAbiVersion` 已同步 11**；契约文档同步（句柄 generation、
   中毒自恢复、取消语义、锁范围表）；新增 9 个回归/时序测试，全工作区
   32 测试单元全绿。
 

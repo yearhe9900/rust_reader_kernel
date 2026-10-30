@@ -29,6 +29,7 @@ void main() {
         body: ReadingPage(
           pages: [samplePage()],
           chapterText: text,
+          fontFamily: '',
           controller: PageController(),
           onPageChanged: (_) {},
           onTapPrev: () => prev++,

@@ -15,8 +15,9 @@ import 'package:ffi/ffi.dart';
 /// ABI 版本（与 rrk-ffi 的 RRK_ABI_VERSION 对齐，启动校验）。
 /// v8 = rrk_last_error_code / rrk_content_cache_*（issue #11、#12）；
 /// v9 = blocks JSON 改部件流（文本区间+图片 key，不再内嵌正文）等接入面扩充；
-/// v10 = rrk_load_headings（issue #13：章标题块轻量出口）。
-const int kRrkAbiVersion = 10;
+/// v10 = rrk_load_headings（issue #13：章标题块轻量出口）；
+/// v11 = rrk_layout_cancel_book（按书取消；并发契约加固 + hit_test 精度）。
+const int kRrkAbiVersion = 11;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
