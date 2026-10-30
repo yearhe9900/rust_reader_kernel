@@ -41,6 +41,13 @@ fn be16(b: &[u8], off: usize) -> u16 {
     u16::from_be_bytes([b[off], b[off + 1]])
 }
 
+/// 单次 `unpack` 调用的输出预算（防解压炸弹：真实文本记录压缩后仅数 KB，
+/// 即使 1000:1 脏压缩也远小于此；超限报错而非 abort）。
+const MAX_UNPACK_BYTES: usize = 32 * 1024 * 1024;
+
+/// 词典条目递归展开深度上限（链式嵌套防爆栈；真实书 ≤ 个位数层）。
+const MAX_EXPAND_DEPTH: usize = 64;
+
 /// 从 bitpos 起读 32 位（MSB 优先，越界补 0）。
 fn read32(data: &[u8], bitpos: usize) -> u32 {
     let start = bitpos >> 3;
@@ -100,7 +107,11 @@ impl HuffCdic {
             return Err(RrkError::corrupt("MOBI: CDIC 头非法"));
         }
         let entries = &record[header_len..];
-        let n = (1usize << code_bits).min(total_entries.saturating_sub(self.dict.len()));
+        // 偏移表本身可能越界（code_bits/total_entries 不可信）：条目数以
+        // 「偏移表实际能容纳的条数」夹紧，否则 be16(entries, j*2) 越界 panic。
+        let n = (1usize << code_bits)
+            .min(total_entries.saturating_sub(self.dict.len()))
+            .min(entries.len() / 2);
         for j in 0..n {
             let off = be16(entries, j * 2) as usize;
             if off + 2 > entries.len() {
@@ -119,10 +130,25 @@ impl HuffCdic {
         Ok(())
     }
 
-    /// 解码一段 HUFF/CDIC 压缩流。
+    /// 解码一段 HUFF/CDIC 压缩流（输出带预算，防解压炸弹）。
     pub fn unpack(&mut self, data: &[u8]) -> RrkResult<Vec<u8>> {
-        let bit_len = data.len() * 8;
         let mut out = Vec::with_capacity(data.len() * 2);
+        let mut budget = MAX_UNPACK_BYTES;
+        self.unpack_into(data, &mut out, 0, &mut budget)?;
+        Ok(out)
+    }
+
+    fn unpack_into(
+        &mut self,
+        data: &[u8],
+        out: &mut Vec<u8>,
+        depth: usize,
+        budget: &mut usize,
+    ) -> RrkResult<()> {
+        if depth > MAX_EXPAND_DEPTH {
+            return Err(RrkError::corrupt("MOBI: CDIC 词典嵌套过深"));
+        }
+        let bit_len = data.len() * 8;
         let mut pos = 0usize;
         while pos < bit_len {
             let bits = read32(data, pos);
@@ -147,14 +173,18 @@ impl HuffCdic {
             if idx >= self.dict.len() {
                 return Err(RrkError::corrupt("MOBI: 词典下标越界"));
             }
-            let chunk = self.expand(idx)?;
+            let chunk = self.expand(idx, depth + 1, budget)?;
+            if chunk.len() > *budget {
+                return Err(RrkError::corrupt("MOBI: CDIC 解压输出超限"));
+            }
+            *budget -= chunk.len();
             out.extend_from_slice(&chunk);
         }
-        Ok(out)
+        Ok(())
     }
 
-    /// 展开词典条目（Compressed 递归解码，带缓存与环保护）。
-    fn expand(&mut self, idx: usize) -> RrkResult<Vec<u8>> {
+    /// 展开词典条目（Compressed 递归解码，带缓存、环保护与深度/预算限制）。
+    fn expand(&mut self, idx: usize, depth: usize, budget: &mut usize) -> RrkResult<Vec<u8>> {
         match std::mem::replace(&mut self.dict[idx], Entry::Expanding) {
             Entry::Plain(v) => {
                 self.dict[idx] = Entry::Plain(v.clone());
@@ -165,7 +195,8 @@ impl HuffCdic {
                 Ok(v)
             }
             Entry::Compressed(raw) => {
-                let out = self.unpack(&raw)?; // 递归展开
+                let mut out = Vec::new();
+                self.unpack_into(&raw, &mut out, depth, budget)?; // 递归展开
                 self.dict[idx] = Entry::Expanded(out.clone());
                 Ok(out)
             }
@@ -220,6 +251,31 @@ mod tests {
         rec
     }
 
+    /// 构造 CDIC 记录：条目 = (u16 len|0x8000, bytes)，可指定 code_bits 与明文标记。
+    fn build_cdic_bits(items: &[(Vec<u8>, bool)], code_bits: u32) -> Vec<u8> {
+        let mut entries = Vec::new();
+        let table_len = items.len() * 2;
+        let mut offsets = Vec::new();
+        let mut body = Vec::new();
+        for (it, plain) in items {
+            offsets.push((table_len + body.len()) as u16);
+            let flag = if *plain { 0x8000u16 } else { 0 };
+            body.extend_from_slice(&((it.len() as u16) | flag).to_be_bytes());
+            body.extend_from_slice(it);
+        }
+        for o in offsets {
+            entries.extend_from_slice(&o.to_be_bytes());
+        }
+        entries.extend_from_slice(&body);
+        let mut rec = Vec::new();
+        rec.extend_from_slice(b"CDIC");
+        rec.extend_from_slice(&16u32.to_be_bytes());
+        rec.extend_from_slice(&(items.len() as u32).to_be_bytes());
+        rec.extend_from_slice(&code_bits.to_be_bytes());
+        rec.extend_from_slice(&entries);
+        rec
+    }
+
     #[test]
     fn decode_literals() {
         let huff = build_huff(2);
@@ -261,5 +317,49 @@ mod tests {
         assert_eq!(out, b"lo".to_vec()); // 递归展开缓存
         let out2 = d.unpack(&[0x00]).unwrap();
         assert_eq!(out2, b"lo".to_vec()); // 命中缓存
+    }
+
+    #[test]
+    fn cdic_offset_table_clamped() {
+        // 回归（审计 #2）：code_bits 虚报每记录 256 条，但偏移表只有 2 条空间
+        // ——原实现 be16(entries, j*2) 直接越界 panic；现夹紧到表容量。
+        let huff = build_huff(2);
+        let cdic = build_cdic_bits(
+            &[(b"hel".to_vec(), true), (b"lo".to_vec(), true)],
+            8,
+        );
+        let mut d = HuffCdic::load_huff(&huff).unwrap();
+        d.load_cdic(&cdic).unwrap();
+        assert_eq!(d.dict.len(), 2);
+        let out = d.unpack(&[0x00, 0x01]).unwrap();
+        assert_eq!(out, b"hello".to_vec());
+    }
+
+    #[test]
+    fn expand_depth_limit() {
+        // 回归（审计 #3b）：链式嵌套超深度上限 → 报错而非爆栈
+        let depth = MAX_EXPAND_DEPTH + 8;
+        let huff = build_huff((depth + 1) as u32);
+        let mut items: Vec<(Vec<u8>, bool)> = (0..depth)
+            .map(|i| (vec![(i + 1) as u8], false))
+            .collect();
+        items.push((b"x".to_vec(), true));
+        let cdic = build_cdic_bits(&items, 16);
+        let mut d = HuffCdic::load_huff(&huff).unwrap();
+        d.load_cdic(&cdic).unwrap();
+        assert!(d.unpack(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn unpack_output_budget() {
+        // 回归（审计 #3a）：解压炸弹（单条 1KB 明文 × 3 万次引用 ≈ 32MB+）
+        // 超输出预算即报错，不 allow 无限展开
+        let payload = vec![b'a'; 1000];
+        let huff = build_huff(1);
+        let cdic = build_cdic(&[payload.as_slice()]);
+        let mut d = HuffCdic::load_huff(&huff).unwrap();
+        d.load_cdic(&cdic).unwrap();
+        let codes = vec![0u8; MAX_UNPACK_BYTES / 1000 + 16];
+        assert!(d.unpack(&codes).is_err());
     }
 }

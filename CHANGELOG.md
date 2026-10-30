@@ -44,6 +44,25 @@
 
 ### Fixed
 
+- **畸形输入加固第一批（深审报告 §一）：MOBI 三连 + PDF 流闸 + ObjStm 死循环**，
+  全部与「panic 不穿 ABI」红线对齐（abort/OOM/爆栈同样穿 `catch_unwind`）：
+  1. **MOBI 头越界 panic**（`parse.rs`）：record0 只校验前 24 字节却直读到偏移
+     240——扩展字段改 `opt32` 缺省读取（短头脏书按 0），封面偏移加法改饱和；
+  2. **HUFF/CDIC 偏移表越界 panic**（`huffcdic.rs`）：`code_bits`/`total_entries`
+     不可信——条目数夹紧到偏移表实际容量；
+  3. **HUFF/CDIC 解压炸弹 + 递归爆栈**：单次 unpack 输出预算 32MB + 词典展开
+     深度上限 64 层 + `assemble_text` 全书解压总量闸 256MB，超限报错而非 OOM；
+  4. **PDF 流解码无输出上限**（`objects.rs`）：Flate/RunLength/LZW 全部改限长
+     解码（新增 `decode_stream_limited` 可注入上限），与 zip 层 512MB 口径一致；
+  5. **ObjStm 合并挂死**：`/N` 负数 `as usize` 变 `usize::MAX`，而 `parse_object`
+     在 EOF 返回 `Ok(Null)` 不报错——夹紧 + 无进展即退出，另补偏移越界跳过；
+  6. **MOBI 书名尾部 NUL**：真实书 `titleLength` 常含 `\0`，现剔除后再交 UI。
+
+  测试/语料：`fuzz/seed-corpus/format_open/seed.mobi`（首个 MOBI 种子，之前
+  `BOOKMOBI` 魔数纯变异几乎到不了解析面）+ `fuzz_seed_opens` 端到端回归 +
+  6 个新增单测（短 record0 / 封面饱和 / CDIC 夹紧 / 深度上限 / 输出预算 /
+  流上限 / ObjStm 负 N）；cargo test --workspace 32 单元全绿。
+
 - **issue #14（bug）**：`Kernel::search_chapter` 的 `SearchPage.done` 恒 false
   （聚合循环未拷出内层 done）。修复采用 issue 备选方案 2（优于推荐方案 1）：
   `done = 扫描确实完成`——真正扫完为 true（含无命中章），命中被 maxHits

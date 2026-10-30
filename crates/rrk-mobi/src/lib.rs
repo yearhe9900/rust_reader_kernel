@@ -31,6 +31,10 @@ use rrk_txt::match_heading;
 /// 单章最大字节上限（超长按 pagebreak/h 标题天然分段；此为兜底逻辑块）。
 const CHAPTER_LIMIT: usize = 1024 * 1024;
 
+/// 全书解压后正文总上限（防压缩炸弹：单记录已有预算，这里是全书闸；
+/// 真实书籍正文远小于此，超限即拒而非 OOM abort）。
+const MAX_TEXT_BYTES: usize = 256 * 1024 * 1024;
+
 /// MOBI/AZW3 书源。
 pub struct MobiBook {
     meta: BookMeta,
@@ -95,6 +99,9 @@ fn assemble_text(c: &MobiContainer) -> RrkResult<Vec<u8>> {
             }
         };
         decoded.extend_from_slice(&chunk);
+        if decoded.len() > MAX_TEXT_BYTES {
+            return Err(RrkError::corrupt("MOBI: 正文解压总量超限"));
+        }
     }
 
     // 脏书兜底（实测口径）：声明压缩但实际未压缩的书，解压会毁掉正文——
@@ -593,6 +600,21 @@ fn _limit_note() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fuzz 语料回归：seed.mobi 必须能完整打开（种子有效性 + 解析面不回退）。
+    #[test]
+    fn fuzz_seed_opens() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fuzz/seed-corpus/format_open/seed.mobi"
+        );
+        let Ok(bytes) = std::fs::read(path) else { return };
+        let src = ContentSource::from_bytes(Some("seed.mobi".into()), bytes);
+        let book = MobiAdapter.open(&src).unwrap();
+        assert_eq!(book.meta().title, "RRK Seed");
+        assert!(!book.chapters().unwrap().is_empty());
+        assert!(book.toc().is_ok());
+    }
 
     #[test]
     fn split_on_pagebreaks() {

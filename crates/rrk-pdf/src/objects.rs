@@ -27,6 +27,13 @@ pub enum Object {
 
 pub type Dict = BTreeMap<String, Object>;
 
+/// 单条流解码输出上限（与 zip 层 512MB 口径一致：防 Flate/LZW/RunLength 炸弹；
+/// 文本流真实尺寸远小于此）。
+const MAX_STREAM_BYTES: usize = 512 * 1024 * 1024;
+
+/// 单个 ObjStm 合并的对象数上限（`/N` 不可信，负数 as usize 会变 usize::MAX）。
+const MAX_OBJSTM_OBJECTS: i64 = 100_000;
+
 impl Object {
     pub fn as_name(&self) -> Option<&str> {
         match self {
@@ -403,6 +410,11 @@ impl<'a> Parser<'a> {
 
 /// 应用 /Filter 链解码流数据；不支持的过滤器跳过（按原样返回）。
 pub fn decode_stream(dict: &Dict, data: &[u8]) -> RrkResult<Vec<u8>> {
+    decode_stream_limited(dict, data, MAX_STREAM_BYTES)
+}
+
+/// 同 [`decode_stream`]，输出上限可注入（测试用小上限验证闸门）。
+pub fn decode_stream_limited(dict: &Dict, data: &[u8], max: usize) -> RrkResult<Vec<u8>> {
     let filters: Vec<String> = match dict.get("Filter") {
         Some(Object::Name(n)) => vec![n.clone()],
         Some(Object::Arr(a)) => a
@@ -414,36 +426,42 @@ pub fn decode_stream(dict: &Dict, data: &[u8]) -> RrkResult<Vec<u8>> {
     let mut out = data.to_vec();
     for f in filters {
         out = match f.as_str() {
-            "FlateDecode" | "Fl" => flate2::read::ZlibDecoder::new(&out[..])
-                .read_to_end_or_fallback(&out),
+            "FlateDecode" | "Fl" => flate_decode(&out, max)?,
             "ASCIIHexDecode" | "AHx" => ascii_hex_decode(&out),
             "ASCII85Decode" | "A85" => ascii85_decode(&out),
-            "RunLengthDecode" | "RL" => runlength_decode(&out),
-            "LZWDecode" | "LZW" => lzw_decode(&out, dict),
+            "RunLengthDecode" | "RL" => runlength_decode(&out, max)?,
+            "LZWDecode" | "LZW" => lzw_decode(&out, dict, max)?,
             _ => out, // 图像类过滤器（DCT/CCITT…）不属于文本链路
         };
+        if out.len() > max {
+            return Err(RrkError::corrupt("PDF: 流解码输出超限"));
+        }
     }
     Ok(out)
 }
 
-trait ReadToEndFallback {
-    fn read_to_end_or_fallback(self, original: &[u8]) -> Vec<u8>;
-}
-
-impl<R: std::io::Read> ReadToEndFallback for R {
-    fn read_to_end_or_fallback(mut self, original: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        match std::io::Read::read_to_end(&mut self, &mut out) {
-            Ok(_) => out,
-            Err(_) => {
-                // 有些流不带 zlib 头：试原始 deflate
-                match flate2::read::DeflateDecoder::new(original).read_to_end(&mut out) {
-                    Ok(_) => out,
-                    Err(_) => original.to_vec(),
-                }
-            }
+/// zlib/deflate 解码（带输出上限：超限即错，不先申请 GB 级缓冲）。
+fn flate_decode(data: &[u8], max: usize) -> RrkResult<Vec<u8>> {
+    let mut out = Vec::new();
+    let zlib_ok = flate2::read::ZlibDecoder::new(data)
+        .take(max as u64 + 1)
+        .read_to_end(&mut out)
+        .is_ok();
+    if !zlib_ok {
+        out.clear();
+        // 有些流不带 zlib 头：试原始 deflate
+        let raw_ok = flate2::read::DeflateDecoder::new(data)
+            .take(max as u64 + 1)
+            .read_to_end(&mut out)
+            .is_ok();
+        if !raw_ok {
+            return Ok(data.to_vec());
         }
     }
+    if out.len() > max {
+        return Err(RrkError::corrupt("PDF: 流解码输出超限"));
+    }
+    Ok(out)
 }
 
 fn ascii_hex_decode(data: &[u8]) -> Vec<u8> {
@@ -501,7 +519,7 @@ fn ascii85_decode(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn runlength_decode(data: &[u8]) -> Vec<u8> {
+fn runlength_decode(data: &[u8], max: usize) -> RrkResult<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < data.len() {
@@ -522,12 +540,16 @@ fn runlength_decode(data: &[u8]) -> Vec<u8> {
             i += 1;
             out.extend(std::iter::repeat(byte).take(257 - len as usize));
         }
+        // 重复字节最高 128:1 膨胀——每轮验限，不让炸弹先撑爆内存
+        if out.len() > max {
+            return Err(RrkError::corrupt("PDF: 流解码输出超限"));
+        }
     }
-    out
+    Ok(out)
 }
 
 /// LZW 解码（PDF 变体：9~12 位码、early-change 1）。
-fn lzw_decode(data: &[u8], dict: &Dict) -> Vec<u8> {
+fn lzw_decode(data: &[u8], dict: &Dict, max: usize) -> RrkResult<Vec<u8>> {
     let early = match dict.get("DecodeParms").and_then(|p| p.as_dict()).and_then(|d| d.get("EarlyChange")) {
         Some(Object::Int(0)) => 0u32,
         _ => 1u32,
@@ -567,6 +589,9 @@ fn lzw_decode(data: &[u8], dict: &Dict) -> Vec<u8> {
             break;
         };
         out.extend_from_slice(&entry);
+        if out.len() > max {
+            return Err(RrkError::corrupt("PDF: 流解码输出超限"));
+        }
         if let Some(p) = &prev {
             let mut new_entry = p.clone();
             new_entry.push(entry[0]);
@@ -578,7 +603,7 @@ fn lzw_decode(data: &[u8], dict: &Dict) -> Vec<u8> {
             code_len += 1;
         }
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -692,11 +717,9 @@ impl PdfDocument {
     /// ObjStm 合并（解析 /Type/ObjStm 流内的压缩对象）。
     /// 只在解析失败时惰性触发一次。
     pub fn merge_objstms(&self) {
-        let mut merged = self.virtuals.lock().unwrap().len() > 0;
-        if merged {
+        if !self.virtuals.lock().unwrap().is_empty() {
             return;
         }
-        merged = true;
         let nums: Vec<u32> = self.offsets.keys().copied().collect();
         for num in nums {
             let Ok(obj) = self.get(num) else { continue };
@@ -705,20 +728,36 @@ impl PdfDocument {
                     continue;
                 }
                 let Ok(decoded) = self.stream_data(&obj) else { continue };
-                let n = dict.get("N").and_then(|v| v.as_int()).unwrap_or(0) as usize;
-                let first = dict.get("First").and_then(|v| v.as_int()).unwrap_or(0) as usize;
+                // `/N` 不可信：负数 as usize 会变 usize::MAX；而 parse_object 在
+                // EOF 返回 Ok(Null) 不报错——不夹紧 + 不查无进展，这里就是死循环。
+                let n = dict
+                    .get("N")
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0)
+                    .clamp(0, MAX_OBJSTM_OBJECTS) as usize;
+                let first = dict.get("First").and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
                 let mut p = Parser::new(&decoded);
                 let mut pairs = Vec::new();
                 for _ in 0..n {
+                    let before = p.pos;
                     let Ok(a) = p.parse_object() else { break };
                     let Ok(b) = p.parse_object() else { break };
+                    if p.pos == before {
+                        break; // 无进展（EOF 反复返回 Null）——拦死循环
+                    }
                     if let (Some(id), Some(off)) = (a.as_int(), b.as_int()) {
-                        pairs.push((id as u32, off as usize));
+                        if id >= 0 && off >= 0 {
+                            pairs.push((id as u32, off as usize));
+                        }
                     }
                 }
                 for (id, off) in pairs {
+                    let at = first.saturating_add(off);
+                    if at >= decoded.len() {
+                        continue; // 偏移越界：跳过而非解析出垃圾
+                    }
                     let mut inner = Parser::new(&decoded);
-                    inner.pos = first + off;
+                    inner.pos = at;
                     if let Ok(o) = inner.parse_object() {
                         self.virtuals.lock().unwrap().entry(id).or_insert(o);
                     }
@@ -838,5 +877,47 @@ mod tests {
             Object::Dict(d) => assert_eq!(d.get("X").unwrap().as_int(), Some(42)),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn objstm_negative_n_no_hang() {
+        // 回归（审计 #5）：/N = -1 → as usize 变 usize::MAX，而 parse_object 在
+        // EOF 返回 Ok(Null) 不报错——原实现在此死循环；现夹紧 + 无进展即退出。
+        let mut body = Vec::new();
+        body.extend_from_slice(b"5 0 ");
+        let first = body.len();
+        body.extend_from_slice(b"<< /X 42 >>");
+        let mut file = Vec::new();
+        file.extend_from_slice(b"%PDF-1.5\n");
+        file.extend_from_slice(b"1 0 obj\n<< /Type /ObjStm /N -1 /First ");
+        file.extend_from_slice(first.to_string().as_bytes());
+        file.extend_from_slice(b" /Length ");
+        file.extend_from_slice(body.len().to_string().as_bytes());
+        file.extend_from_slice(b" >>\nstream\n");
+        file.extend_from_slice(&body);
+        file.extend_from_slice(b"\nendstream\nendobj\n");
+        let doc = PdfDocument::open(Arc::from(file.into_boxed_slice())).unwrap();
+        // 能返回（而非挂死）即过；/N 负数按 0 处理 → 无合并产物
+        doc.merge_objstms();
+        assert!(doc.get(5).is_err());
+    }
+
+    #[test]
+    fn stream_decode_output_limit() {
+        // 回归（审计 #4）：解码输出上限闸门（用小上限验证，不真造 512MB 炸弹）
+        // Flate：4KB 全零 → 压缩后极小，解码超 1KB 上限必须报错而非解到底
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut enc, &vec![0u8; 4096]).unwrap();
+        let z = enc.finish().unwrap();
+        let mut d = BTreeMap::new();
+        d.insert("Filter".to_string(), Object::Name("FlateDecode".into()));
+        assert!(decode_stream_limited(&d, &z, 1024).is_err());
+        // RunLength：重复字节 128:1 膨胀同样受闸（0x81 → 每字节重复 128 次）
+        let rl: Vec<u8> = std::iter::repeat(0x81u8).take(64).collect();
+        let mut d2 = BTreeMap::new();
+        d2.insert("Filter".to_string(), Object::Name("RunLengthDecode".into()));
+        assert!(decode_stream_limited(&d2, &rl, 1024).is_err());
+        // 上限之内正常解码不受影响
+        assert!(decode_stream_limited(&d, &z, 1 << 20).is_ok());
     }
 }

@@ -45,6 +45,12 @@ fn be32(b: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+/// MOBI 头扩展字段（@28 起）读取：短头脏书里 headerLength 未覆盖的字段
+/// 按 0（缺省语义）处理，绝不越界 panic（record0 可短至 24 字节）。
+fn opt32(r0: &[u8], off: usize) -> u32 {
+    if off + 4 <= r0.len() { be32(r0, off) } else { 0 }
+}
+
 impl MobiContainer {
     /// 记录 [index] 的字节切片。
     pub fn record(&self, index: usize) -> RrkResult<&[u8]> {
@@ -114,19 +120,21 @@ pub fn parse(bytes: Arc<[u8]>) -> RrkResult<MobiContainer> {
         return Err(RrkError::corrupt("MOBI: 缺少 MOBI 头"));
     }
     let header_length = be32(r0, 20) as usize;
-    let text_encoding = be32(r0, 28);
-    let version = be32(r0, 36);
-    let title_offset = be32(r0, 84) as usize;
-    let title_length = be32(r0, 88) as usize;
-    let resource_start = be32(r0, 108);
-    let huffcdic = be32(r0, 112);
-    let num_huffcdic = be32(r0, 116);
-    let exth_flags = be32(r0, 128);
-    let trailing_flags = be32(r0, 240);
+    let text_encoding = opt32(r0, 28);
+    let version = opt32(r0, 36);
+    let title_offset = opt32(r0, 84) as usize;
+    let title_length = opt32(r0, 88) as usize;
+    let resource_start = opt32(r0, 108);
+    let huffcdic = opt32(r0, 112);
+    let num_huffcdic = opt32(r0, 116);
+    let exth_flags = opt32(r0, 128);
+    let trailing_flags = opt32(r0, 240);
 
-    let full_name = if title_offset > 0 && title_length > 0 && record_zero + title_offset + title_length <= bytes.len() {
-        let raw = &bytes[record_zero + title_offset..record_zero + title_offset + title_length];
-        Some(decode_text(raw, text_encoding))
+    let title_end = record_zero.saturating_add(title_offset).saturating_add(title_length);
+    let full_name = if title_offset > 0 && title_length > 0 && title_end <= bytes.len() {
+        let raw = &bytes[record_zero + title_offset..title_end];
+        // 真实书 titleLength 常含尾部 NUL——不剔会把 "书名\0" 直接交给 UI
+        Some(decode_text(raw, text_encoding).trim_end_matches('\0').to_string())
     } else {
         None
     };
@@ -158,7 +166,7 @@ pub fn parse(bytes: Arc<[u8]>) -> RrkResult<MobiContainer> {
         .and_then(|raw| {
             (raw.len() == 4).then(|| be32(raw, 0)).filter(|&v| v != 0xFFFF_FFFF)
         })
-        .map(|delta| resource_start + delta);
+        .map(|delta| resource_start.saturating_add(delta));
 
     Ok(MobiContainer {
         bytes,
@@ -194,5 +202,60 @@ pub fn decode_text(bytes: &[u8], encoding: u32) -> String {
     } else {
         let (cow, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
         cow.into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最小 PalmDB：1 条记录，record0 定长 `record0_len`（魔数 + 最小 MOBI 头）。
+    fn mini_pdb(record0_len: usize) -> Vec<u8> {
+        let record_zero = 78 + 8; // 头 78B + 记录表 1×8B
+        let mut b = vec![0u8; record_zero + record0_len];
+        b[60..68].copy_from_slice(b"BOOKMOBI");
+        b[76..78].copy_from_slice(&1u16.to_be_bytes()); // recordCount
+        b[78..82].copy_from_slice(&(record_zero as u32).to_be_bytes());
+        if record0_len >= 24 {
+            b[record_zero + 16..record_zero + 20].copy_from_slice(b"MOBI");
+            b[record_zero + 20..record_zero + 24].copy_from_slice(&8u32.to_be_bytes()); // headerLength
+        }
+        b
+    }
+
+    #[test]
+    fn short_record0_defaults_not_panic() {
+        // 回归（审计 #1）：原实现在 record0 < 244B 时仍按偏移 240 直读 → 越界 panic。
+        let c = parse(Arc::from(mini_pdb(24))).unwrap();
+        assert_eq!(c.trailing_flags, 0);
+        assert_eq!(c.text_encoding, 0);
+        assert!(c.full_name.is_none());
+    }
+
+    #[test]
+    fn record0_too_short_errors() {
+        assert!(parse(Arc::from(mini_pdb(16))).is_err());
+    }
+
+    #[test]
+    fn cover_record_offset_saturates() {
+        // EXTH 201 封面偏移 + resource_start 双 0x80000000 → u32 加法溢出，
+        // 必须饱和（debug 下裸加法直接 panic）。
+        let mut b = mini_pdb(244);
+        let rz = 78 + 8;
+        b[rz + 108..rz + 112].copy_from_slice(&0xFFFF_FF00u32.to_be_bytes()); // resourceStart
+        b[rz + 128..rz + 132].copy_from_slice(&0x40u32.to_be_bytes()); // exthFlags
+        // EXTH @16+headerLength(8)=24：magic + 总长 24 + count 1 + (201,12,0x200)
+        let e = rz + 24;
+        b[e..e + 4].copy_from_slice(b"EXTH");
+        b[e + 4..e + 8].copy_from_slice(&24u32.to_be_bytes());
+        b[e + 8..e + 12].copy_from_slice(&1u32.to_be_bytes());
+        b[e + 12..e + 16].copy_from_slice(&201u32.to_be_bytes());
+        b[e + 16..e + 20].copy_from_slice(&12u32.to_be_bytes());
+        b[e + 20..e + 24].copy_from_slice(&0x200u32.to_be_bytes());
+        let c = parse(Arc::from(b)).unwrap();
+        // 0xFFFFFF00 + 0x200 饱和到 0xFFFFFFFF；裸 u32 加法在 debug 构建会
+        // 直接 panic、release 会回绕成 0x100（错记录号）——本断言守饱和语义。
+        assert_eq!(c.cover_record, Some(0xFFFF_FFFF));
     }
 }
