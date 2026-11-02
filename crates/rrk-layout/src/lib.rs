@@ -41,8 +41,17 @@ impl Default for Layouter {
 
 impl Layouter {
     pub fn new() -> Self {
+        Self::with_font_context(FontContext::new())
+    }
+
+    /// 以指定字体上下文构造排版器（嵌入方自带字体库 / 确定性金样测试用）。
+    ///
+    /// 重排口径默认走系统字体栈（`new`，方案 §4.2 字体策略）；需要跨平台逐位
+    /// 可复现（金样回归）或固定版式保真时，用本构造注入 `FontContext`——
+    /// 可禁系统字体 + `register_fonts` 注入自管字体（`parley::fontique`）。
+    pub fn with_font_context(font_cx: FontContext) -> Self {
         Self {
-            font_cx: FontContext::new(),
+            font_cx,
             layout_cx: LayoutContext::new(),
             text_buf: String::new(),
             spans_buf: Vec::new(),

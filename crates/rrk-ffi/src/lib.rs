@@ -10,6 +10,11 @@
 //! 结构化数据（meta/toc/章节/块）以 JSON 字符串缓冲传递（自研转义，零新增依赖）；
 //! 大块正文走原始 UTF-8 缓冲（零拷贝语义）。
 
+// 红线（panic 不穿 C ABI）：生产代码禁 `unwrap`/`expect`/`panic!`，所有出口
+// 一律 `guard`/`guard_val` 兜底。机器门禁双保险：
+// 1. clippy deny（测试目标除外）；2. 源码扫描测试 `every_ffi_export_is_guarded`。
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -131,15 +136,28 @@ fn set_kind(e: RrkError) -> u32 {
     set_err(e, code)
 }
 
-/// 统一 panic 兜底：任何 panic → 2001 + 线程局部错误。
-fn guard(f: impl FnOnce() -> Result<u32, u32>) -> u32 {
+/// panic 记录：自身必须不 panic——线程退出期 TLS 访问可能二次 panic，
+/// 二次 panic 绝不能穿 ABI，故再套一层 `catch_unwind` 吞掉。
+fn record_panic() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        set_last_error(ERR_PANIC, "内部 panic（已拦截）");
+    }));
+}
+
+/// 任意返回值的统一 panic 兜底：panic → `fallback` + 2001 + 线程局部错误。
+fn guard_val<T>(fallback: T, f: impl FnOnce() -> T) -> T {
     match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(r) => r.unwrap_or_else(|code| code),
+        Ok(v) => v,
         Err(_) => {
-            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
-            ERR_PANIC
+            record_panic();
+            fallback
         }
     }
+}
+
+/// 统一 panic 兜底（u32 出口）：任何 panic → 2001 + 线程局部错误。
+fn guard(f: impl FnOnce() -> Result<u32, u32>) -> u32 {
+    guard_val(ERR_PANIC, || f().unwrap_or_else(|code| code))
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +191,8 @@ pub unsafe extern "C" fn rrk_buf_free(ptr: *mut u8, len: usize) {
 /// 返回 ABI 版本号。
 #[no_mangle]
 pub extern "C" fn rrk_abi_version() -> u32 {
-    RRK_ABI_VERSION
+    // 即使纯常量出口也统一兜底：不留「此出口不必包」的例外，审计口径一刀切。
+    guard(|| Ok(RRK_ABI_VERSION))
 }
 
 /// 取最近一次错误信息（UTF-8；调用方负责 `rrk_buf_free`）。
@@ -194,7 +213,8 @@ pub unsafe extern "C" fn rrk_last_error(out_ptr: *mut *mut u8, out_len: *mut usi
 /// 与 `rrk_last_error` 的消息来自同一次错误（设置时一并写入）。
 #[no_mangle]
 pub extern "C" fn rrk_last_error_code() -> u32 {
-    LAST_ERROR.with(|e| e.borrow().0)
+    // TLS 访问在线程退出期可能 panic，同样兜底。
+    guard(|| Ok(LAST_ERROR.with(|e| e.borrow().0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +469,7 @@ fn write_parts(parts: &[rrk_model::TextPart], s: &mut String) {
 /// 打开一本书（UTF-8 路径）；成功返回句柄（≥1），失败返回 0。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_open(path: *const u8, path_len: usize) -> u64 {
-    match catch_unwind(AssertUnwindSafe(|| {
+    guard_val(0, || {
         if path.is_null() {
             set_last_error(RrkErrorKind::InvalidParam.code(), "路径为空指针");
             return 0;
@@ -482,13 +502,7 @@ pub unsafe extern "C" fn rrk_open(path: *const u8, path_len: usize) -> u64 {
             Ok(h) => h,
             Err(_) => 0,
         }
-    })) {
-        Ok(h) => h,
-        Err(_) => {
-            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
-            0
-        }
-    }
+    })
 }
 
 /// 关闭一本书；0 = 成功。
@@ -855,6 +869,44 @@ mod tests {
         assert!(codes.iter().all(|&c| c == 0), "载章必须成功: {codes:?}");
         assert!(got, "rrk_load_chapter 重活期间内核锁被长期占用");
     }
+
+    /// 红线回归：panic 必须被拦截为 2001 + 线程局部错误，绝不穿越 C ABI。
+    #[test]
+    fn guard_catches_panic_to_2001() {
+        let code = guard(|| -> Result<u32, u32> { panic!("红线回归：故意 panic") });
+        assert_eq!(code, ERR_PANIC);
+        assert_eq!(rrk_last_error_code(), ERR_PANIC);
+    }
+
+    /// 红线门禁：扫描本文件源码，逐个 C ABI 导出校验 catch_unwind 兜底存在——
+    /// 新增出口漏兜底即红（人工 review 之外的机器门禁）。
+    #[test]
+    fn every_ffi_export_is_guarded() {
+        let src = include_str!("lib.rs");
+        let mut checked = 0usize;
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let sig = line
+                .strip_prefix("pub unsafe extern \"C\" fn ")
+                .or_else(|| line.strip_prefix("pub extern \"C\" fn "));
+            let Some(sig) = sig else { continue };
+            let name = sig.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
+            seen.push(name);
+            // 函数体 = 签名行起到首个顶格收尾括号（rustfmt 形态）为止
+            let body: Vec<&str> = src.lines().skip(i).take_while(|l| *l != "}").collect();
+            let body = body.join("\n");
+            assert!(
+                body.contains("guard(")
+                    || body.contains("guard_val(")
+                    || body.contains("catch_unwind"),
+                "导出函数 {name}（第 {} 行）缺 catch_unwind 兜底",
+                i + 1
+            );
+            checked += 1;
+        }
+        assert!(checked >= 40, "C ABI 导出扫描数异常（解析失效？）: {checked}");
+        assert!(seen.contains(&"rrk_open") && seen.contains(&"rrk_buf_free"), "关键出口未扫到");
+    }
 }
 
 
@@ -931,10 +983,12 @@ pub unsafe extern "C" fn rrk_render_page(
 /// 书类型：0=Text 1=ImageGallery 2=Paged；非法句柄返回 u32::MAX。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_book_kind(handle: BookHandle) -> u32 {
-    match with_kernel(|k| k.kind(handle).map_err(set_kind).map(|b| b.code())) {
-        Ok(c) => c,
-        Err(_) => u32::MAX,
-    }
+    guard(|| {
+        Ok(match with_kernel(|k| k.kind(handle).map_err(set_kind).map(|b| b.code())) {
+            Ok(c) => c,
+            Err(_) => u32::MAX,
+        })
+    })
 }
 
 /// 页数（仅页级格式；重排格式返回 Unsupported）。
@@ -1781,7 +1835,7 @@ pub unsafe extern "C" fn rrk_search_open(
     case_sensitive: u32,
     context_chars: u32,
 ) -> u64 {
-    match catch_unwind(AssertUnwindSafe(|| {
+    guard_val(0, || {
         let query = match read_utf8(query_ptr, query_len, "检索词") {
             Ok(q) => q,
             Err(_) => return 0,
@@ -1791,13 +1845,7 @@ pub unsafe extern "C" fn rrk_search_open(
             context_chars: if context_chars == 0 { 30 } else { context_chars },
         };
         with_kernel(|k| k.search_open(handle, &query, opts).map_err(set_kind)).unwrap_or(0)
-    })) {
-        Ok(id) => id,
-        Err(_) => {
-            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
-            0
-        }
-    }
+    })
 }
 
 /// 拉取一批命中（**拉模式分块**）；批次 JSON 见 `search_page_json`。
@@ -1869,34 +1917,20 @@ pub unsafe extern "C" fn rrk_search_chapter(
 /// 开一个 BM25 索引会话；成功返回 `index_id`（≥1），失败返回 0。
 #[no_mangle]
 pub extern "C" fn rrk_bm25_open(handle: BookHandle) -> u64 {
-    match catch_unwind(AssertUnwindSafe(|| {
-        with_kernel(|k| k.bm25_open(handle).map_err(set_kind)).unwrap_or(0)
-    })) {
-        Ok(id) => id,
-        Err(_) => {
-            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
-            0
-        }
-    }
+    guard_val(0, || with_kernel(|k| k.bm25_open(handle).map_err(set_kind)).unwrap_or(0))
 }
 
 /// 从宿主落盘的索引字节载入（跨启动复用）；成功返回 `index_id`，失败返回 0。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_bm25_load(data_ptr: *const u8, data_len: usize) -> u64 {
-    match catch_unwind(AssertUnwindSafe(|| {
+    guard_val(0, || {
         if data_ptr.is_null() || data_len == 0 {
             set_last_error(RrkErrorKind::InvalidParam.code(), "索引字节为空");
             return 0;
         }
         let bytes = std::slice::from_raw_parts(data_ptr, data_len);
         with_kernel(|k| k.bm25_load(bytes).map_err(set_kind)).unwrap_or(0)
-    })) {
-        Ok(id) => id,
-        Err(_) => {
-            set_last_error(ERR_PANIC, "内部 panic（已拦截）");
-            0
-        }
-    }
+    })
 }
 
 /// 分组推进索引构建（每次最多 `max_chapters` 章）；返回进度 JSON。

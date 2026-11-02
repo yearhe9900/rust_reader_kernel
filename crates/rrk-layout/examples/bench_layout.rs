@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use rrk_format::{BookSource, ContentSource, FormatRegistry};
+use rrk_format::{ContentSource, FormatRegistry};
 use rrk_layout::Layouter;
 use rrk_model::{style_hash, viewport_hash, StyleSpec, Viewport};
 use rrk_txt::TxtAdapter;
