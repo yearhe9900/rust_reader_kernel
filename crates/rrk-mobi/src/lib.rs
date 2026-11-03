@@ -21,7 +21,7 @@ use parse::{MobiContainer, COMPRESSION_HUFF_CDIC, COMPRESSION_NONE, COMPRESSION_
 
 use rrk_cache::{CacheKey, CacheKind};
 use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache};
-use rrk_markup::{clean_xhtml, CleanResult};
+use rrk_markup::{attr, clean_xhtml, local_name, tokenize, CleanResult, Token};
 use rrk_model::{
     fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     Resource, ResourceKey, RrkError, RrkErrorKind, RrkResult, TocNode,
@@ -290,6 +290,99 @@ fn scan_filepos_anchors(text: &[u8]) -> Vec<(usize, String)> {
     out
 }
 
+/// NCX `content src` → filepos：`text.xhtml#0000000123` 取 `#` 后纯数字，
+/// 或整体纯数字（`0000000123`）；其它形态（图片/无锚）返回 None。
+fn filepos_from_src(src: &str) -> Option<usize> {
+    let tail = src.rsplit('#').next().unwrap_or(src).trim();
+    if tail.len() >= 4 && tail.bytes().all(|b| b.is_ascii_digit()) {
+        tail.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// 解析 NCX（`EXTH 121` 指向的 DTB 记录）→ (filepos, 标题, 嵌套深度)。
+///
+/// KF8/AZW3 的主流目录形态（设计 §3.5："KF8 用 EXTH 121/NCX 记录"）；
+/// 旧实现不解析、只靠 filepos 锚点扫描，KF8 书基本无目录（深审 §四）。
+/// navPoint 嵌套保留为目录树深度；条目按 **open 序**（父先于子）输出——
+/// 闭合序里子节点先于父节点，直接用会把子项错挂到顶层；畸形输入丢节点不 panic。
+fn parse_ncx_toc(xml: &str) -> Vec<(usize, String, usize)> {
+    // (深度, 标题, filepos)：open 时入表（父先于子），close 时回填
+    let mut items: Vec<(usize, String, Option<usize>)> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new(); // navPoint → items 下标
+    let mut depth = 0usize;
+    let mut in_text = 0u32;
+    let mut text_buf = String::new();
+    for t in tokenize(xml) {
+        match t {
+            Token::Open { name, attrs, .. } => match local_name(&name) {
+                "navpoint" => {
+                    items.push((depth, String::new(), None));
+                    stack.push(items.len() - 1);
+                    depth += 1;
+                }
+                "text" if !stack.is_empty() => {
+                    in_text += 1;
+                    text_buf.clear();
+                }
+                "content" if !stack.is_empty() => {
+                    if let Some(src) = attr(&attrs, "src") {
+                        if let Some(&li) = stack.last() {
+                            items[li].2 = filepos_from_src(src);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Token::Text(s) => {
+                if in_text > 0 {
+                    text_buf.push_str(&s);
+                }
+            }
+            Token::Close(name) => match local_name(&name) {
+                "text" => {
+                    if in_text > 0 {
+                        in_text -= 1;
+                        if in_text == 0 {
+                            if let Some(&li) = stack.last() {
+                                if items[li].1.is_empty() {
+                                    items[li].1 = text_buf.trim().to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+                "navpoint" => {
+                    depth = depth.saturating_sub(1);
+                    stack.pop();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    items
+        .into_iter()
+        .filter_map(|(d, t, fp)| fp.map(|fp| (fp, t, d)))
+        .collect()
+}
+
+/// 按路径（顶层下标链）取嵌套节点。
+fn toc_node_at<'a>(nodes: &'a mut Vec<TocNode>, path: &[usize]) -> Option<&'a mut TocNode> {
+    match path.split_first() {
+        None => None,
+        Some((&i, rest)) => {
+            let n = nodes.get_mut(i)?;
+            if rest.is_empty() {
+                Some(n)
+            } else {
+                toc_node_at(&mut n.children, rest)
+            }
+        }
+    }
+}
+
 /// 缓存 open 索引可信校验：spans 有序不重叠且在文本内、章表与 spans 对齐、
 /// 目录章号在范围内（防错配/损坏载荷）。
 fn index_ok(
@@ -373,22 +466,51 @@ impl MobiBook {
                 }
                 let spans = kept_spans;
 
-                // 目录：filepos 锚点 → 章 id；并回填章标题
-                let anchors = scan_filepos_anchors(&raw_arc);
-                let mut toc = Vec::new();
-                for (filepos, title) in anchors {
+                // 目录：优先 NCX（EXTH 121，KF8/AZW3 主流；设计 §3.5），
+                // 回退 filepos 锚点扫描（MOBI6 目录页形态）；filepos → 章 id
+                // 映射并回填章标题；navPoint 嵌套保留为目录树（深审 §四）。
+                let ncx = container
+                    .exth_uint(121)
+                    .and_then(|rec| container.record(rec as usize).ok())
+                    .map(|r| parse_ncx_toc(&parse::decode_text(r, container.text_encoding)))
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_default();
+                let items: Vec<(usize, String, usize)> = if ncx.is_empty() {
+                    scan_filepos_anchors(&raw_arc)
+                        .into_iter()
+                        .map(|(fp, t)| (fp, t, 0))
+                        .collect()
+                } else {
+                    ncx
+                };
+                let mut toc: Vec<TocNode> = Vec::new();
+                let mut path: Vec<usize> = Vec::new();
+                for (filepos, title, depth) in items {
                     let Some(idx) = spans.iter().position(|&(s, e)| filepos >= s && filepos < e) else {
                         continue;
                     };
                     if entries[idx].title.is_none() {
                         entries[idx].title = Some(title.clone());
                     }
-                    toc.push(TocNode {
+                    let depth = depth.min(path.len()); // 防畸形跳级
+                    path.truncate(depth);
+                    let node = TocNode {
                         title,
                         chapter: idx as ChapterId,
                         anchor: None,
                         children: Vec::new(),
-                    });
+                    };
+                    if depth == 0 {
+                        toc.push(node);
+                        path = vec![toc.len() - 1];
+                    } else if let Some(parent) = toc_node_at(&mut toc, &path[..depth]) {
+                        let ci = parent.children.len();
+                        parent.children.push(node);
+                        path.push(ci);
+                    } else {
+                        toc.push(node); // 不可达兑底（parent 缺失时归顶层）
+                        path = vec![toc.len() - 1];
+                    }
                 }
                 // 目录没覆盖到的章：用推导标题回填
                 for (entry, title) in entries.iter_mut().zip(titles) {
@@ -693,5 +815,96 @@ mod tests {
             anchor: None,
             children: vec![],
         }], 25), "目录章号越界应拒");
+    }
+
+    /// NCX 解析：嵌套深度、src 两种形态（`#` 锚/纯数字）、无 filepos 丢节点。
+    #[test]
+    fn parse_ncx_toc_nested_and_src_forms() {
+        let xml = r#"<ncx><navMap>
+<navPoint><navLabel><text>Part One</text></navLabel><content src="0000000010"/></navPoint>
+<navPoint><navLabel><text>Child</text></navLabel>
+  <content src="text.xhtml#0000000099"/>
+  <navPoint><navLabel><text>Grand</text></navLabel><content src="0000000150"/></navPoint>
+</navPoint>
+<navPoint><navLabel><text>NoFilepos</text></navLabel><content src="cover.jpg"/></navPoint>
+</navMap></ncx>"#;
+        let items = parse_ncx_toc(xml);
+        assert_eq!(items.len(), 3, "无 filepos 节点丢弃: {items:?}");
+        // 父先于子（open 序）；嵌套深度正确（Child 顶层，Grand 嵌在 Child 内）
+        assert_eq!(items[0], (10, "Part One".to_string(), 0));
+        assert_eq!(items[1], (99, "Child".to_string(), 0));
+        assert_eq!(items[2], (150, "Grand".to_string(), 1));
+    }
+
+    /// EXTH 121 → NCX 目录端到端（深审 §四）：KF8 形态书打开有目录——
+    /// 树形挂接、章映射、章标题回填。
+    #[test]
+    fn ncx_toc_from_exth121_end_to_end() {
+        let text = "<p>前言</p><mbp:pagebreak/><h1>第二章</h1><p>正文二</p><mbp:pagebreak/><h1>第三章</h1><p>正文三</p>";
+        let p1 = text.find("<mbp:pagebreak/>").unwrap();
+        let p2 = text.rfind("<mbp:pagebreak/>").unwrap();
+        let ncx = format!(
+            "<ncx><navMap>\
+<navPoint><navLabel><text>Part1</text></navLabel><content src=\"0000000000\"/></navPoint>\
+<navPoint><navLabel><text>Ch2</text></navLabel><content src=\"text.xhtml#{p1:010}\"/>\
+<navPoint><navLabel><text>Ch3</text></navLabel><content src=\"{p2:010}\"/></navPoint>\
+</navPoint>\
+</navMap></ncx>"
+        );
+        let text_b = text.as_bytes();
+        let ncx_b = ncx.as_bytes();
+        let r0_len = 272usize;
+        let r0_off = 78 + 3 * 8; // 3 条记录表
+        let r1_off = r0_off + r0_len;
+        let r2_off = r1_off + text_b.len();
+        let mut b = vec![0u8; 78];
+        b[60..68].copy_from_slice(b"BOOKMOBI");
+        b[76..78].copy_from_slice(&3u16.to_be_bytes());
+        for off in [r0_off as u32, r1_off as u32, r2_off as u32] {
+            b.extend_from_slice(&off.to_be_bytes());
+            b.extend_from_slice(&0u32.to_be_bytes());
+        }
+        let rz = r0_off;
+        b.resize(rz + r0_len, 0);
+        // PalmDOC 头：无压缩 + 正文长度 + 1 条文本记录
+        b[rz..rz + 2].copy_from_slice(&1u16.to_be_bytes());
+        b[rz + 4..rz + 8].copy_from_slice(&(text_b.len() as u32).to_be_bytes());
+        b[rz + 8..rz + 10].copy_from_slice(&1u16.to_be_bytes());
+        b[rz + 10..rz + 12].copy_from_slice(&4096u16.to_be_bytes());
+        // MOBI 头：UTF-8 + headerLength 228
+        b[rz + 16..rz + 20].copy_from_slice(b"MOBI");
+        b[rz + 20..rz + 24].copy_from_slice(&228u32.to_be_bytes());
+        b[rz + 28..rz + 32].copy_from_slice(&65001u32.to_be_bytes());
+        // EXTH：flags + 一条 (121 = NCX 记录号 2)
+        b[rz + 128..rz + 132].copy_from_slice(&0x40u32.to_be_bytes());
+        let e = rz + 244; // 16 + headerLength
+        b[e..e + 4].copy_from_slice(b"EXTH");
+        b[e + 4..e + 8].copy_from_slice(&24u32.to_be_bytes());
+        b[e + 8..e + 12].copy_from_slice(&1u32.to_be_bytes());
+        b[e + 12..e + 16].copy_from_slice(&121u32.to_be_bytes());
+        b[e + 16..e + 20].copy_from_slice(&12u32.to_be_bytes());
+        b[e + 20..e + 24].copy_from_slice(&2u32.to_be_bytes());
+        // record1 = 正文，record2 = NCX
+        assert_eq!(b.len(), r1_off);
+        b.extend_from_slice(text_b);
+        assert_eq!(b.len(), r2_off);
+        b.extend_from_slice(ncx_b);
+
+        let src = ContentSource::from_bytes(
+            Some("k.epub3".to_string()),
+            Arc::<[u8]>::from(b.into_boxed_slice()),
+        );
+        let book = MobiBook::parse(&src).unwrap();
+        assert_eq!(book.toc.len(), 2, "顶层两项: {:?}", book.toc);
+        assert_eq!(book.toc[0].title, "Part1");
+        assert_eq!(book.toc[0].chapter, 0);
+        assert_eq!(book.toc[1].title, "Ch2");
+        assert_eq!(book.toc[1].chapter, 1);
+        assert_eq!(book.toc[1].children.len(), 1, "嵌套子节点应挂上: {:?}", book.toc[1].children);
+        assert_eq!(book.toc[1].children[0].title, "Ch3");
+        assert_eq!(book.toc[1].children[0].chapter, 2);
+        // NCX 标题回填章标题
+        assert_eq!(book.entries[1].title.as_deref(), Some("Ch2"));
+        assert_eq!(book.entries[2].title.as_deref(), Some("Ch3"));
     }
 }
