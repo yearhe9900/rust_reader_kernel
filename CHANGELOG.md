@@ -5,9 +5,34 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.4.0] - 2026-11-04
+
+**ABI 10 → 11**（增量：新符号 `rrk_layout_cancel_book`，既有符号/语义不变）：
+按书取消（多窗口不误杀）、并发契约加固（句柄 generation、锁中毒自恢复、
+重活出锁）。Dart 封装（`kRrkAbiVersion = 11`）与预编译原生库必须同步升级。
+另含：体验冲刺三批（PDF/EPUB/MOBI 目录与中文正确性）、渲染正确性第三批、
+畸形输入加固、open 索引磁盘缓存、FFI panic 红线门禁与排版金样基建。
 
 ### Added
+
+- **体验冲刺第一批（PDF/EPUB 目录正确性）**：PDF outline 递归 /First（两级
+  书签不再压平）、命名 Dest（/Dests 字典与 /Names→/Dests 名字树，含数组
+  Dest 页引用 resolve 后永远不命中的既有 bug）、/Encrypt 双路检测报
+  UnsupportedFormat（与 EPUB DRM/MOBI 加密同口径）；EPUB nav 只吃
+  epub:type="toc"，landmarks/page-list 不再混进目录。新增 3 个回归测试。
+
+- **体验冲刺第二批（PDF 中文与 Form XObject）**：/Encoding→/Differences
+  解码（code 重设语法 + 字形名→Unicode：uniXXXX/uXXXX + AGL 常用子集；
+  解码顺序 ToUnicode → Differences → BOM → latin1）修中文乱码；Form
+  XObject 递归在文本抽取层与光栅层双双落地（/Matrix 并 CTM、/Resources
+  父级继承、q/Q 状态存取，深度上限 8）——包在 Form 里的页眉页脚不再整段
+  缺失。新增 2 个回归测试。
+
+- **体验冲刺第三批（MOBI/KF8 目录）**：EXTH 121 → NCX（DTB navMap）解析，
+  navPoint 嵌套保留目录树深度、条目按 open 序输出；content src 支持
+  `text.xhtml#0000000123` 锚点与整体纯数字两种形态；目录构建优先级
+  NCX → filepos 回退（MOBI6）。此前 KF8/AZW3 书基本无目录。新增 2 个
+  回归测试。
 
 - **章级/页级缓存持久化扩展（ROADMAP）**：open 索引按内容 key 持久化——
   open 期重建的索引（EPUB entries+toc_raw / MOBI spans+章表+目录 / CBZ 页表+
@@ -384,5 +409,10 @@ GPG 签名 Release）与本地 fuzz 工具链落地。
 - CID 字体（Type0）字形取自 DescendantFonts 的 FontFile2；混合 gid 策略
   （ToUnicode→cmap 优先，CID→CIDToGIDMap 兜底）使中文上屏。
 
-[Unreleased]: https://github.com/yearhe9900/rust_reader_kernel/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/yearhe9900/rust_reader_kernel/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/yearhe9900/rust_reader_kernel/releases/tag/v0.4.0
+[0.3.0]: https://github.com/yearhe9900/rust_reader_kernel/releases/tag/v0.3.0
+[0.2.0]: https://github.com/yearhe9900/rust_reader_kernel/releases/tag/v0.2.0
+[0.1.2]: https://github.com/yearhe9900/rust_reader_kernel/releases/tag/v0.1.2
+[0.1.1]: https://github.com/yearhe9900/rust_reader_kernel/releases/tag/v0.1.1
 [0.1.0]: https://github.com/yearhe9900/rust_reader_kernel/releases/tag/v0.1.0
