@@ -789,62 +789,89 @@ mod tests {
         p
     }
 
-    /// 在 `done` 置位前轮询内核锁：拿到即 true（锁可用）。
-    fn poll_kernel_lock_until(done: &AtomicBool) -> bool {
+    /// 观测「重活进行中内核锁可用性」：工作线程用 `busy` 标记在飞的重活并
+    /// 持续干活直到 `stop` 置位，观测方只在 `busy=true` 的窗口内尝试拿锁——
+    /// 拿到即证明「重活期间锁可用」，随即置 `stop` 让工作线程收尾退出。
+    ///
+    /// 与旧实现（轮询到 `done` 即退出）不同，这里观测窗口由观测方主动关闭，
+    /// 工作线程不会先跑完导致窗口落空（CI 上 3 次载章在 10ms sleep 内全部
+    /// 完成 → `done` 已置位 → 轮询一次没做就返回 false 的假红）。
+    /// 120s 内始终拿不到锁才返回 false（真违规：重活全程持锁）。
+    fn poll_lock_free_while_busy(busy: &AtomicBool, stop: &AtomicBool) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while !done.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
-            match KERNEL.try_lock() {
-                Ok(_g) => return true,
-                Err(std::sync::TryLockError::Poisoned(p)) => {
-                    drop(p.into_inner());
-                    return true;
+        let got = loop {
+            if busy.load(Ordering::Relaxed) {
+                match KERNEL.try_lock() {
+                    Ok(_g) => break true,
+                    Err(std::sync::TryLockError::Poisoned(p)) => {
+                        drop(p.into_inner());
+                        break true;
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {}
                 }
-                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
             }
             std::thread::sleep(std::time::Duration::from_micros(200));
-        }
-        false
+        };
+        stop.store(true, Ordering::Relaxed);
+        got
     }
 
     /// 复现 §二.4（open）：rrk_open 重活（嗅探+解析+索引重建）期间内核锁
     /// 必须可用——契约文档已写「重活已移出该锁」，实现与文档不符。
+    ///
+    /// 工作线程持续开书（开完即关，防句柄累积）直到观测方拿到锁；只在
+    /// `busy=true`（rrk_open 在飞）窗口内观测，杜绝「open 先跑完、观测
+    /// 窗口落空」的假红，也杜绝线程未调度时的假绿。
     #[test]
     fn kernel_lock_free_during_open() {
         let path = write_big_txt("open", 150, 40_000);
         let bytes = path.to_str().unwrap().as_bytes().to_vec();
-        let started = std::sync::Arc::new(AtomicBool::new(false));
-        let done = std::sync::Arc::new(AtomicBool::new(false));
-        let (s2, d2) = (started.clone(), done.clone());
+        let busy = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (b2, s2) = (busy.clone(), stop.clone());
         let t = std::thread::spawn(move || {
-            s2.store(true, Ordering::Relaxed);
-            let h = unsafe { rrk_open(bytes.as_ptr(), bytes.len()) };
-            d2.store(true, Ordering::Relaxed);
-            h
+            let mut all_ok = true;
+            let mut rounds = 0usize;
+            while !s2.load(Ordering::Relaxed) && rounds < 10_000 {
+                b2.store(true, Ordering::Relaxed);
+                let h = unsafe { rrk_open(bytes.as_ptr(), bytes.len()) };
+                if h == 0 {
+                    all_ok = false;
+                } else {
+                    rrk_close(h);
+                }
+                b2.store(false, Ordering::Relaxed);
+                rounds += 1;
+            }
+            all_ok
         });
-        while !started.load(Ordering::Relaxed) {
-            std::thread::yield_now();
-        }
-        // 等 opener 真正进入临界区（否则首轮 try_lock 抢在 lock() 之前 = 假绿）
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let got = poll_kernel_lock_until(&done);
-        let h = t.join().unwrap();
+        let got = poll_lock_free_while_busy(&busy, &stop);
+        let all_ok = t.join().unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_ne!(h, 0, "复现载体（临时大书）必须能打开");
+        assert!(all_ok, "复现载体（临时大书）必须能打开");
         assert!(got, "rrk_open 重活期间内核锁被长期占用：其它 FFI 调用（含 cancel）全被阻塞");
     }
 
     /// 复现 §二.4（载章）：rrk_load_chapter（inflate+清洗+分块+JSON）不得全程持锁。
+    ///
+    /// 载章循环持续到观测方拿到锁（旧实现只载 3 次，缓存命中时快于观测方
+    /// 的 10ms sleep，`done` 提前置位让轮询空转返回 false——CI 假红根因）。
     #[test]
     fn kernel_lock_free_during_load_chapter() {
         let path = write_big_txt("load", 150, 40_000);
         let bytes = path.to_str().unwrap().as_bytes().to_vec();
         let h = unsafe { rrk_open(bytes.as_ptr(), bytes.len()) };
         assert_ne!(h, 0, "复现载体（临时大书）必须能打开");
-        let done = std::sync::Arc::new(AtomicBool::new(false));
-        let d2 = done.clone();
+        let busy = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (b2, s2) = (busy.clone(), stop.clone());
         let t = std::thread::spawn(move || {
             let mut codes = Vec::new();
-            for _ in 0..3 {
+            while !s2.load(Ordering::Relaxed) && codes.len() < 10_000 {
+                b2.store(true, Ordering::Relaxed);
                 let (mut tp, mut tn) = (std::ptr::null_mut::<u8>(), 0usize);
                 let (mut bp, mut bn) = (std::ptr::null_mut::<u8>(), 0usize);
                 let (mut lp, mut ln) = (std::ptr::null_mut::<u8>(), 0usize);
@@ -857,15 +884,14 @@ mod tests {
                     rrk_buf_free(bp, bn);
                     rrk_buf_free(lp, ln);
                 }
+                b2.store(false, Ordering::Relaxed);
             }
-            d2.store(true, Ordering::Relaxed);
             codes
         });
-        // 等载章线程进入临界区，再开始观测锁可用性
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let got = poll_kernel_lock_until(&done);
+        let got = poll_lock_free_while_busy(&busy, &stop);
         let codes = t.join().unwrap();
         let _ = std::fs::remove_file(&path);
+        assert!(!codes.is_empty(), "载章线程至少完成一轮");
         assert!(codes.iter().all(|&c| c == 0), "载章必须成功: {codes:?}");
         assert!(got, "rrk_load_chapter 重活期间内核锁被长期占用");
     }
