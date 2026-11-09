@@ -727,10 +727,10 @@ impl PdfDocument {
 
     /// 取对象（含间接引用解引用一层；ObjStm 惰性合并）。
     pub fn get(&self, num: u32) -> RrkResult<Object> {
-        if let Some(o) = self.cache.lock().unwrap().get(&num) {
+        if let Some(o) = rrk_model::lock_recover(&self.cache).get(&num) {
             return Ok(o.clone());
         }
-        if let Some(o) = self.virtuals.lock().unwrap().get(&num) {
+        if let Some(o) = rrk_model::lock_recover(&self.virtuals).get(&num) {
             return Ok(o.clone());
         }
         let &offset = self
@@ -749,7 +749,7 @@ impl PdfDocument {
             p.pos += 3;
         }
         let obj = p.parse_object()?;
-        self.cache.lock().unwrap().insert(num, obj.clone());
+        rrk_model::lock_recover(&self.cache).insert(num, obj.clone());
         Ok(obj)
     }
 
@@ -779,7 +779,7 @@ impl PdfDocument {
     /// ObjStm 合并（解析 /Type/ObjStm 流内的压缩对象）。
     /// 只在解析失败时惰性触发一次。
     pub fn merge_objstms(&self) {
-        if !self.virtuals.lock().unwrap().is_empty() {
+        if !rrk_model::lock_recover(&self.virtuals).is_empty() {
             return;
         }
         let nums: Vec<u32> = self.offsets.keys().copied().collect();
@@ -821,7 +821,7 @@ impl PdfDocument {
                     let mut inner = Parser::new(&decoded);
                     inner.pos = at;
                     if let Ok(o) = inner.parse_object() {
-                        self.virtuals.lock().unwrap().entry(id).or_insert(o);
+                        rrk_model::lock_recover(&self.virtuals).entry(id).or_insert(o);
                     }
                 }
             }

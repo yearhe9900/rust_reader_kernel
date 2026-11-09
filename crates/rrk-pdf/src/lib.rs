@@ -208,7 +208,7 @@ impl PdfBook {
 
     /// 抽取单页文本（惰性 + 缓存）。
     fn page_text(&self, index: u32) -> String {
-        if let Some(t) = self.page_texts.lock().unwrap().get(&index) {
+        if let Some(t) = rrk_model::lock_recover(&self.page_texts).get(&index) {
             return t.clone();
         }
         let Some(page) = self.pages.get(index as usize) else {
@@ -222,7 +222,7 @@ impl PdfBook {
             }
         }
         let text = extract_text(&self.doc, &content, page.resources.as_ref());
-        self.page_texts.lock().unwrap().insert(index, text.clone());
+        rrk_model::lock_recover(&self.page_texts).insert(index, text.clone());
         text
     }
 

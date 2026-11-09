@@ -1072,12 +1072,12 @@ mod tests {
 
         let iid = k.bm25_open(handle).unwrap();
         let job = k.bm25_job(iid).unwrap();
-        let progress = job.lock().unwrap().step(10_000).unwrap();
+        let progress = rrk_model::lock_recover(&job).step(10_000).unwrap();
         assert!(progress.done, "应一次建完: {progress:?}");
         assert!(progress.terms > 0, "样例书应有词项");
-        let bytes = job.lock().unwrap().bytes().to_vec();
+        let bytes = rrk_model::lock_recover(&job).bytes().to_vec();
         assert!(!bytes.is_empty() && bytes.starts_with(b"RRKI"));
-        let before = job.lock().unwrap().index().unwrap().query("编码", 5);
+        let before = rrk_model::lock_recover(&job).index().unwrap().query("编码", 5);
 
         // 宿主落盘后交回内核
         let iid2 = k.bm25_load(&bytes).unwrap();

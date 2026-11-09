@@ -19,6 +19,23 @@ pub use layout::{
 };
 
 // ---------------------------------------------------------------------------
+// 并发纪律：锁中毒恢复（深审 C1）
+// ---------------------------------------------------------------------------
+
+/// `Mutex::lock()` 的**中毒恢复**封装：全 workspace 生产代码的统一取锁口径。
+///
+/// panic 被 `rrk-ffi` 的 `catch_unwind` 兜住后，持锁期间 panic 过的 Mutex 必然
+/// 中毒；Rust 内存模型下数据结构仍一致（无 UB），恢复继续用远好于「一次
+/// panic → 引擎永久瘫痪」。因此禁止在源码里写 `.lock().unwrap()`——
+/// 该口径由 `crates/rrk-model/tests/lock_discipline.rs` 机器校验。
+pub fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 标识与基础类型
 // ---------------------------------------------------------------------------
 
@@ -206,6 +223,18 @@ pub enum Inline {
     Image { key: ResourceKey },
 }
 
+impl Inline {
+    /// 变体名（诊断/测试用）。**无通配 match**：新增变体必须在此登记，
+    /// 同时会迫使各消费方（`rrk-layout` / `flatten_blocks` / `block_parts`）
+    /// 显式处理，不再静默丢弃（深审 C6）。
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Inline::Text { .. } => "Text",
+            Inline::Image { .. } => "Image",
+        }
+    }
+}
+
 /// 块级元素（所有格式的统一出口；排版层不感知格式）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
@@ -227,6 +256,20 @@ pub enum Block {
         blocks: Vec<Block>,
     },
     Divider,
+}
+
+impl Block {
+    /// 变体名（诊断/测试用）。**无通配 match**：新增变体必须在此登记并
+    /// 同步 `flatten_blocks` / `block_parts` / `rrk-layout` 的穷举分支（深审 C6）。
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Block::Heading { .. } => "Heading",
+            Block::Paragraph { .. } => "Paragraph",
+            Block::Image { .. } => "Image",
+            Block::Quote { .. } => "Quote",
+            Block::Divider => "Divider",
+        }
+    }
 }
 
 /// 正文内链区间：清洗后章文本的字节区间 → 目标 href。
@@ -677,6 +720,69 @@ pub fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 深审 C6：模型变体普查。新增 `Inline`/`Block` 变体会让 `variant_name`
+    /// 的无通配 match 编译失败；本测试再钉住「每个变体至少被一条降维管线
+    /// 消费」，防止新增变体被 `flatten_blocks` / `block_parts` 静默吞掉。
+    #[test]
+    fn every_model_variant_is_consumed_by_a_pipeline() {
+        let txt = Inline::Text { range: TextRange::new(0, 3), style: StyleFlags(0) };
+        let img = Inline::Image { key: ResourceKey("a.png".into()) };
+        let inline_variants = vec![txt.clone(), img.clone()];
+        assert_eq!(
+            inline_variants.iter().map(|i| i.variant_name()).collect::<Vec<_>>(),
+            vec!["Text", "Image"],
+            "Inline 变体清单变了：同步 variant_name 与所有消费方的穷举分支"
+        );
+        for i in &inline_variants {
+            let para = Block::Paragraph { inlines: vec![i.clone()], indent: false };
+            let plain = flatten_blocks("abc", &[para.clone()]);
+            assert_eq!(plain.len(), 1, "{} 应降维出一个块", i.variant_name());
+            let text = match &plain[0] {
+                PlainBlock::Paragraph { text, .. } | PlainBlock::Heading { text, .. } => text.clone(),
+                PlainBlock::Image { .. } => String::new(),
+            };
+            assert!(!text.is_empty(), "{} 变体被降维管线静默丢弃", i.variant_name());
+            let parts = block_parts(&[para]);
+            assert_eq!(parts.len(), 1);
+            let n = match &parts[0] {
+                PartBlock::Paragraph { parts, .. } | PartBlock::Heading { parts, .. } => parts.len(),
+                PartBlock::Image { .. } => 1,
+            };
+            assert!(n > 0, "{} 变体在部件流里丢失", i.variant_name());
+        }
+
+        let block_variants = vec![
+            Block::Heading { level: 1, inlines: vec![txt.clone()] },
+            Block::Paragraph { inlines: vec![txt.clone()], indent: false },
+            Block::Image { key: ResourceKey("b.jpg".into()), alt: None, size_hint: None },
+            Block::Quote {
+                blocks: vec![Block::Paragraph { inlines: vec![txt.clone()], indent: false }],
+            },
+            Block::Divider,
+        ];
+        assert_eq!(
+            block_variants.iter().map(|b| b.variant_name()).collect::<Vec<_>>(),
+            vec!["Heading", "Paragraph", "Image", "Quote", "Divider"],
+            "Block 变体清单变了：同步 variant_name 与所有消费方的穷举分支"
+        );
+        for b in &block_variants {
+            // Divider 是契约里唯一被显式丢弃的变体（其余必须各产出一个）
+            let expected = usize::from(b.variant_name() != "Divider");
+            assert_eq!(
+                flatten_blocks("abc", std::slice::from_ref(b)).len(),
+                expected,
+                "{} 降维结果异常",
+                b.variant_name()
+            );
+            assert_eq!(
+                block_parts(std::slice::from_ref(b)).len(),
+                expected,
+                "{} 部件流结果异常",
+                b.variant_name()
+            );
+        }
+    }
 
     /// 部件流口径与 flatten_blocks 逐字节一致（blocks JSON v9 的契约钉子）。
     #[test]

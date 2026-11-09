@@ -149,11 +149,18 @@ impl Layouter {
         spans_buf.clear();
         let mut base_offset: Option<u32> = None;
         for inline in inlines {
-            if let Inline::Text { range, style: flags } = inline {
-                base_offset = Some(base_offset.map_or(range.start, |b: u32| b.min(range.start)));
-                let start = text.len();
-                text.push_str(range.slice(&content.text));
-                spans_buf.push((start, text.len(), flags.is_bold(), flags.is_italic()));
+            // 深审 C6：不用 `if let`——无通配 match 保证新增 Inline 变体时
+            // 编译期就报错，杜绝「模型声明了变体、消费方静默丢弃」。
+            match inline {
+                Inline::Text { range, style: flags } => {
+                    base_offset = Some(base_offset.map_or(range.start, |b: u32| b.min(range.start)));
+                    let start = text.len();
+                    text.push_str(range.slice(&content.text));
+                    spans_buf.push((start, text.len(), flags.is_bold(), flags.is_italic()));
+                }
+                // 行内图暂不参与几何排版（批次 4 补保真）；显式分支是刻意的：
+                // 它必须被看见，而不是被 `_` 吞掉。
+                Inline::Image { .. } => {}
             }
         }
         let Some(base_offset) = base_offset else { return };

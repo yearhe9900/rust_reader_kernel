@@ -105,7 +105,7 @@ fn collect_raster_fonts(
             _ => None,
         };
         if let Some(num) = cached_num {
-            if let Some(f) = doc.font_cache.lock().unwrap().get(&num) {
+            if let Some(f) = rrk_model::lock_recover(&doc.font_cache).get(&num) {
                 fonts.insert(name.clone(), Arc::clone(f));
                 continue;
             }
@@ -178,7 +178,7 @@ fn collect_raster_fonts(
             cid_to_gid,
         });
         if let Some(num) = cached_num {
-            doc.font_cache.lock().unwrap().insert(num, Arc::clone(&built));
+            rrk_model::lock_recover(&doc.font_cache).insert(num, Arc::clone(&built));
         }
         fonts.insert(name.clone(), built);
     }
@@ -972,7 +972,7 @@ impl<'a> Rasterizer<'a> {
             _ => None,
         };
         if let Some(n) = num {
-            if let Some(c) = self.doc.image_cache.lock().unwrap().get(n) {
+            if let Some(c) = rrk_model::lock_recover(&self.doc.image_cache).get(n) {
                 self.blit_image(&c.rgba, c.w, c.h);
                 return;
             }
@@ -1001,7 +1001,7 @@ impl<'a> Rasterizer<'a> {
         }
         self.blit_image(&rgba, w, h);
         if let Some(n) = num {
-            self.doc.image_cache.lock().unwrap().put(
+            rrk_model::lock_recover(&self.doc.image_cache).put(
                 n,
                 Arc::new(CachedImage { w, h, rgba }),
             );

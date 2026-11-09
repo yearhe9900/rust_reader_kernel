@@ -186,7 +186,7 @@ impl Default for MemIndexCache {
 
 impl IndexCache for MemIndexCache {
     fn load(&self, key: &CacheKey) -> Option<Vec<u8>> {
-        let got = self.map.lock().unwrap().get(key).cloned();
+        let got = rrk_model::lock_recover(&self.map).get(key).cloned();
         if got.is_some() {
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
@@ -195,7 +195,7 @@ impl IndexCache for MemIndexCache {
         got
     }
     fn save(&self, key: &CacheKey, payload: &[u8]) {
-        self.map.lock().unwrap().insert(*key, payload.to_vec());
+        rrk_model::lock_recover(&self.map).insert(*key, payload.to_vec());
     }
 }
 
