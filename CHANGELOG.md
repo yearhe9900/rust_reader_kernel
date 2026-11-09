@@ -5,6 +5,35 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+**ABI 不变（仍为 11）**：以下三项都是内部行为修复，既有符号/签名/语义不变，
+布局与 open 索引缓存的 payload schema 也未变。但 `content_hash` 口径改变会让
+**已落盘的旧缓存自动失效重算一次**——这是预期行为，无需宿主迁移。
+
+### Fixed
+
+- **内容版本指纹全量化（深审 A1）**：`BookMeta::content_hash` 原先只取文件
+  前 1MB（EPUB 更极端：只取 OPF 前 64KB），而它同时是内容级缓存与五格式
+  open 索引磁盘缓存的 key → 修改书后半部分正文后重开会命中旧章表/旧章文本，
+  用户读到旧内容。现由 `rrk_format::content_fingerprint`（全量字节 + 长度前缀）
+  统一产出，EPUB/CBZ 也走同一口径（**不用** zip 中央目录 CRC：脏书可能不填或
+  不更新 CRC，会把「改正文但指纹不变」带回来）。新增 3 个回归测试：尾部字节
+  改动、长度歧义、「OPF 逐字节不变只改正文 → 指纹变且旧索引不命中」。
+- **hit_test 不再返回非法 UTF-8 边界（深审 A2）**：`run_offset_at` 按字节比例
+  插值会落在中文 3 字节 / emoji 4 字节字符中间，宿主拿去切字符串即 panic
+  （被 guard 兜成 2001）。现经内容级缓存三段式取章文本，把落点向下吸附到
+  `char boundary`；纯函数口径与 C ABI 均不变。新增中文/emoji 回归用例。
+  这是过渡方案：RLAY 带 cluster 边界数组后可去掉这次载章。
+- **EPUB/MOBI 正文首行缩进生效（深审 A3）**：`clean_xhtml` 的 flush 原先恒
+  `indent:false`，默认 `para_indent_em=2.0` 对 EPUB/MOBI 是摆设（只有 TXT/PDF
+  靠启发式猜出的块生效）。现正文块 `<p>/div/section/article` 带 `indent:true`，
+  列表/引用/代码/表格不带；`<br>` 与行内 `<img>` 切出的后续段自动不重复缩进。
+  不动 `Block` 模型（段落语义角色的彻底解留待 ABI 版本窗口）。
+
+验证：`cargo test --workspace` 全绿（33 测试单元），`cargo clippy -p rrk-ffi
+--no-deps -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic` 通过。
+
 ## [0.4.0] - 2026-11-04
 
 **ABI 10 → 11**（增量：新符号 `rrk_layout_cancel_book`，既有符号/语义不变）：
