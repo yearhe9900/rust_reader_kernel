@@ -753,16 +753,50 @@ mod tests {
             TextRun { line: 1, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 100.0, range: (60, 90) },
         ];
         let line0 = (0, 60);
+        let ascii = "a".repeat(90); // 纯 ASCII：每个字节都是合法边界，旧断言不变
         // run 内中点 → 区间中点（100px 宽 / 30 字节 → 半宽 15 字节）
-        assert_eq!(run_offset_at(50.0, &runs, 0, line0), 15);
+        assert_eq!(run_offset_at(50.0, &runs, 0, line0, &ascii), 15);
         // 跨 run：x=125 在第二 run 中点 → 30 + 15 = 45
-        assert_eq!(run_offset_at(125.0, &runs, 0, line0), 45);
+        assert_eq!(run_offset_at(125.0, &runs, 0, line0, &ascii), 45);
         // x 在行首前 → 行首；x 超最右 run → 行末
-        assert_eq!(run_offset_at(-5.0, &runs, 0, line0), 0);
-        assert_eq!(run_offset_at(9999.0, &runs, 0, line0), 60);
+        assert_eq!(run_offset_at(-5.0, &runs, 0, line0, &ascii), 0);
+        assert_eq!(run_offset_at(9999.0, &runs, 0, line0, &ascii), 60);
         // 无宽度（v1 旧缓存）：退化为 run 起点，不 panic 不越界
         let w0 = vec![TextRun { line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 0.0, range: (0, 30) }];
-        assert_eq!(run_offset_at(15.0, &w0, 0, (0, 30)), 0);
+        assert_eq!(run_offset_at(15.0, &w0, 0, (0, 30), &ascii), 0);
+    }
+
+    /// 回归（深审 A2）：按字节比例插值不得把落点放在 UTF-8 字符中间。
+    /// 中文 3 字节、emoji 4 字节——旧实现返回 5/16/29 这类非法边界，
+    /// 宿主拿来切片会 panic（被 guard 兜成 2001）。
+    #[test]
+    fn hit_test_snaps_to_utf8_char_boundary() {
+        use rrk_model::TextRun;
+        let text = "甲乙丙丁戊己庚辛壬癸"; // 10 个汉字 = 30 字节
+        assert_eq!(text.len(), 30);
+        let runs = vec![TextRun {
+            line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false,
+            italic: false, width: 90.0, range: (0, 30),
+        }];
+        // ratio = x/90 → off = x/3；向下吸附到 3 的倍数
+        assert_eq!(run_offset_at(15.0, &runs, 0, (0, 30), text), 3, "5 应回退到 3");
+        assert_eq!(run_offset_at(45.0, &runs, 0, (0, 30), text), 15, "15 已是边界");
+        assert_eq!(run_offset_at(50.0, &runs, 0, (0, 30), text), 15, "16 应回退到 15");
+        assert_eq!(run_offset_at(89.0, &runs, 0, (0, 30), text), 27, "29 应回退到 27");
+        // 行末与越界钳制也必须合法
+        assert_eq!(run_offset_at(9999.0, &runs, 0, (0, 30), text), 30);
+
+        // emoji 4 字节：任意落点都必须是合法边界
+        let emoji = "😀😀😀😀😀";
+        assert_eq!(emoji.len(), 20);
+        let eruns = vec![TextRun {
+            line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false,
+            italic: false, width: 100.0, range: (0, 20),
+        }];
+        for x in [1.0, 13.0, 27.0, 51.0, 77.0, 99.0] {
+            let off = run_offset_at(x, &eruns, 0, (0, 20), emoji);
+            assert!(emoji.is_char_boundary(off as usize), "x={x} → {off} 非字符边界");
+        }
     }
 
     /// 回归 §二.3：布局结束（drop）后从登记表移除，不泄漏。
@@ -1532,16 +1566,32 @@ pub unsafe extern "C" fn rrk_page_at(
     })
 }
 
+/// 把字节偏移向下吸附到最近的 UTF-8 字符边界。
+///
+/// 按字节比例插值时，中文 3 字节 / emoji 4 字节字符的中间字节会被当成
+/// 落点——宿主拿去切字符串即 panic（被 `guard` 兜成 2001）。`is_char_boundary`
+/// 是 O(1)，一个字符最多回退 3 字节；超出章文本长度的偏移先钳到末尾
+/// （末尾本身是合法边界）。
+fn snap_to_char_boundary(off: u32, text: &str) -> u32 {
+    let mut o = (off as usize).min(text.len());
+    while o > 0 && !text.is_char_boundary(o) {
+        o -= 1;
+    }
+    o as u32
+}
+
 /// 页内 x → 字节偏移（纯函数，供 `rrk_hit_test` 与单测共用）。
 ///
 /// 按 run 真实像素宽 `width` 比例插值到字节区间（旧实现硬编码 20px/字 +
 /// 3 字节/字——西文与非默认字号下选区落点全错）。越界钳制：
 /// x 在行首前 → 行首；x 在最右 run 之后 → 行末；y 越界由调用方钳行后传入。
+/// `text` 是章正文，返回值保证落在合法 UTF-8 字符边界上。
 fn run_offset_at(
     x: f32,
     runs: &[rrk_model::TextRun],
     hit_line: u32,
     hit_range: (u32, u32),
+    text: &str,
 ) -> u32 {
     let mut best = hit_range.0;
     let mut right_edge = f32::NEG_INFINITY;
@@ -1563,10 +1613,12 @@ fn run_offset_at(
             best = (r.range.0 + off.min(len)).min(hit_range.1);
         }
     }
-    if x > right_edge {
-        return hit_range.1; // x 在本行最右 run 之后 → 行末
-    }
-    best
+    let raw = if x > right_edge {
+        hit_range.1 // x 在本行最右 run 之后 → 行末
+    } else {
+        best
+    };
+    snap_to_char_boundary(raw, text)
 }
 
 /// 页内命中测试：(页内 x, y) → 语义偏移（run 级粒度 + run 内比例）。
@@ -1613,8 +1665,22 @@ pub unsafe extern "C" fn rrk_hit_test(
             }
             y_cursor += l.height;
         }
+        // 吸附到 UTF-8 字符边界需要章正文。走内容级缓存三段式（与
+        // `rrk_load_chapter` 同口径）：锁内查缓存 → miss 出锁载章 → 锁内回填，
+        // 不在内核锁内做 inflate/清洗。这是 RLAY 带 cluster 边界数组之前的
+        // 过渡方案；届时可去掉这次载章，改查页内边界表。
+        let (book, cached, key) =
+            with_kernel(|k| k.chapter_lookup(handle, chapter_id).map_err(set_kind))?;
+        let content = match cached {
+            Some(c) => c,
+            None => {
+                let c = book.load_chapter(chapter_id).map_err(set_kind)?;
+                with_kernel(|k| Ok(k.chapter_store(key, &c)))?;
+                c
+            }
+        };
         // run 内比例（纯函数抽取，单测钉住；见 run_offset_at 文档）
-        let best = run_offset_at(x, &page.runs, hit_line, hit_range);
+        let best = run_offset_at(x, &page.runs, hit_line, hit_range, &content.text);
         let mut out = String::with_capacity(64);
         out.push_str(&format!(
             "{{\"offset\":{},\"line\":{},\"range\":[{},{}]}}",
