@@ -8,6 +8,8 @@
 - **字符串入参**一律 `(ptr, len)` 两元组（UTF-8，不要求 NUL 结尾）；
 - **缓冲出参**一律 `(out_ptr, out_len)`：内核分配，调用方用完必须
   `rrk_buf_free(ptr, len)` 释放（JSON / 正文 / 位图 / 索引分块一视同仁）；
+- `rrk_open_bytes` 的整本书数据同样只在调用期间读取：内核**拷贝**到自有
+  `Arc<[u8]>` 后再返回，调用返回后宿主即可释放传入缓冲；
 - 传入的指针只在调用期间被读取，内核不持有、不释放宿主指针；
 - `rrk_buf_free(NULL, _)` 是安全的空操作；`rrk_buf_free` 可在任意线程调用。
 
@@ -25,8 +27,8 @@
 
 ## 3. 句柄模型
 
-- 句柄（`uint64_t`）从 `rrk_open` / `rrk_search_open` / `rrk_bm25_open` /
-  `rrk_bm25_load` 返回，`0` 永远非法；
+- 句柄（`uint64_t`）从 `rrk_open` / `rrk_open_bytes` / `rrk_search_open` /
+  `rrk_bm25_open` / `rrk_bm25_load` 返回，`0` 永远非法；
 - 句柄**不保证跨进程**；同一进程内可自由跨线程传递；
 - `rrk_close` 幂等语义：重复关闭同一句柄报 `InvalidParam`（1004），不崩溃；
 - 关闭后继续使用旧句柄 → `InvalidParam`，不会段错误（句柄表校验）。
@@ -59,10 +61,25 @@
 
 - 启动时先调 `rrk_abi_version()` 与宿主编译期常量**相等校验**（Dart 封装
   `RrkEngine.init` 已内置）；
-- 策略：**符号与语义只增不改**；删除/改签名只随大版本；
+- 策略：**同一 ABI 号内符号与语义只增不改**；删除 / 改签名 / 改输出格式
+  只随 ABI bump（v9 的 blocks 部件流即属此类）。`RrkEngine.init` 是相等
+  校验、不匹配直接抛错，因此 **ABI bump 时宿主封装与预编译原生库必须同时
+  升级**，没有灰度窗口；磁盘缓存 payload 因自带 schema 号可自动失效重算；
 - 错误码、图像格式码（`rrk_image_dimensions` 的 format）、页级 kind 码同样
   只增不改；
 - 缓存 payload 自带 schema 号，内核升级自动丢弃旧缓存重算（无需宿主迁移）。
+
+**缓存配置面（v12）**：
+
+| 出口 | 语义 |
+|------|------|
+| `rrk_cache_configure(dir, mem_bytes)` | 三要素布局缓存（C1 内存 LRU + C2 磁盘）；空路径 = 关闭 |
+| `rrk_content_cache_configure(dir, mem_bytes)` | 内容级缓存（目录 / 章文本 / 大纲）；空路径 = 关闭 |
+| `rrk_open_index_cache_configure(dir)` | **独立**的 open 索引缓存开关 / 目录；未调用时跟随内容级缓存（旧行为），调用后不再联动；空路径 = 显式关闭 |
+| `rrk_cache_set_disk_limit(max_bytes)` | 进程级磁盘配额，0 = 关闭裁剪；下次 `save` 起每个缓存目录按 mtime 裁剪到该上限。**惰性生效**，不主动扫描历史目录 |
+
+布局 / 内容级 / open 索引三类缓存默认均不落盘：内核不擅自创建缓存目录，
+落盘策略由宿主显式开启（红线）。配额出口只设上限、不会自己创建目录。
 
 ## 6. 坐标系速查
 

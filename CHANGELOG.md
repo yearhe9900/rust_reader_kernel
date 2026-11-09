@@ -7,9 +7,37 @@
 
 ## [Unreleased]
 
-**ABI 不变（仍为 11）**：以下三项都是内部行为修复，既有符号/签名/语义不变，
-布局与 open 索引缓存的 payload schema 也未变。但 `content_hash` 口径改变会让
-**已落盘的旧缓存自动失效重算一次**——这是预期行为，无需宿主迁移。
+**ABI 11 → 12**（增量：新符号 `rrk_open_bytes` / `rrk_open_index_cache_configure` /
+`rrk_cache_set_disk_limit`，既有符号与语义不变）：Dart 封装
+（`kRrkAbiVersion = 12`）、C 头文件与预编译原生库必须同步升级。
+
+批次 1 的三项是内部行为修复，布局与 open 索引缓存的 payload schema 未变；
+但 `content_hash` 口径改变会让**已落盘的旧缓存自动失效重算一次**——
+这是预期行为，无需宿主迁移。
+
+### Added
+
+- **内存开书（深审 B1）**：`rrk_open_bytes(data, len, name, name_len)` 把
+  `ContentSource::Bytes` 暴露到 C ABI，解锁 Android `content://`/SAF、
+  iOS security-scoped URL、网盘流、解密后字节等没有可用文件路径的接入场景。
+  数据拷贝进内核自有 `Arc<[u8]>`，内核不持有宿主指针。路径与内存两个入口
+  共用新的 `open_source` 内部函数，缓存口径 / 错误语义 / 句柄 generation
+  逐字一致。Dart 侧 `RrkEngine.openBookBytes`；回归测试对拍 meta/章表并
+  覆盖 name 省略。
+- **open 索引缓存独立开关（深审 B4）**：`Kernel::open_index_cache()` 原先直接
+  取 `content_cache` 的 store，导致关内容级缓存会连带关掉 open 索引、反之
+  无法只开 open 索引。新增 `open_index_override` 三态（未配置 → 跟随旧行为、
+  显式关闭、独立目录）与 `rrk_open_index_cache_configure`；**未配置的旧宿主
+  行为不变**，`open_hits` 统计不受影响。Dart 侧 `configureOpenIndexCache`。
+- **磁盘缓存配额（深审 B5）**：C2 原先只增不减（C1 早有 LRU + 保护窗口），
+  用户改字号/转屏就产生新 key。新增 `rrk_cache::set_disk_limit`（进程级全局，
+  0 = 关闭裁剪，默认零开销）与 `DiskStore::trim`（按 mtime 删最旧；跳过
+  `.tmp` 中间文件；删除失败不致命），`save` 后惰性裁剪。用**新出口**
+  `rrk_cache_set_disk_limit` 设置，不改 `rrk_cache_configure` 签名以免破 ABI。
+  Dart 侧 `setCacheDiskLimit`。
+- **Dart 启动时先查 ABI 再解析全部符号**：旧版原生库 + 新封装原先会在
+  `_Bindings` 构造里因新符号不存在抛 `ArgumentError`；现在给出明确的
+  `RrkException(1999, ABI 版本不匹配)`。
 
 ### Fixed
 
@@ -31,8 +59,11 @@
   列表/引用/代码/表格不带；`<br>` 与行内 `<img>` 切出的后续段自动不重复缩进。
   不动 `Block` 模型（段落语义角色的彻底解留待 ABI 版本窗口）。
 
-验证：`cargo test --workspace` 全绿（33 测试单元），`cargo clippy -p rrk-ffi
---no-deps -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic` 通过。
+验证：`cargo test --workspace` 全绿（新增 4 个回归：内存开书对拍 / 磁盘配额
+裁剪 / open 索引开关解绑 / 配额出口可调用）；FFI clippy 红线、
+`cbindgen --verify` 头文件漂移校验与 `dart analyze` 全部通过；
+`dart run example/smoke.dart` 在 Windows 上用 TXT / EPUB / CBZ 三种样张
+走通全链路，含 ABI 12 三个新出口与内存开书按扩展名嗅探。
 
 ## [0.4.0] - 2026-11-04
 
