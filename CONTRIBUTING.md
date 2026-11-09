@@ -8,9 +8,18 @@
 - 可选：Dart 3.4+ / Flutter stable（涉及 `bindings/` 与 `demo/` 时）
 
 ```sh
-cargo test          # 全量单测（28 套）
+cargo test          # 全量单测（含 200 章规模化语料回归）
 cargo run --release -p rrk-inspect -- fixtures/sample.epub
+bash scripts/check-abi.sh              # ABI 常量五处一致性
+bash scripts/corpus_check.sh <书...>   # 本地真书端到端（可选）
 ```
+
+**语料口径**：有版权的真书不入库。`crates/rrk-epub` 的 `corpus_scale` 用
+确定性生成的 200 章 / 10 卷嵌套目录 / 逐章内链合成大书跑
+`open → toc → 抽样 load_chapter → 偏移对拍 → open 索引缓存往返`，
+挡住小样张测不出的索引重建类回归。本地想补真书，把文件放进
+`fixtures/corpus/`（已 gitignore）后跑 `corpus_check.sh`；CI 检测到该目录
+会自动执行，否则跳过。
 
 ## 流程
 
@@ -35,6 +44,14 @@ cargo run --release -p rrk-inspect -- fixtures/sample.epub
 4. **字体策略**：重排类一律系统字体栈；书内嵌字体仅固定版式（PDF 原版页/CBZ）保真使用。
 5. **数据面不可变**：`LayoutPage` 为不可变产物，缓存 key = contentHash × styleHash ×
    viewportHash；变更缓存 payload 格式需同步升级 RLAY schema 号。
+6. **panic 红线的范围**：`unwrap`/`expect`/`panic!` 的 clippy `deny` **只作用于
+   `rrk-ffi`**（C ABI 出口一律 `guard`/`guard_val` + `catch_unwind`，panic 不得越界）；
+   其它 crate 不启用该 deny。但全 workspace **取锁必须走
+   `rrk_model::lock_recover`**，禁止 `.lock().unwrap()`——由
+   `crates/rrk-model/tests/lock_discipline.rs` 扫描源码校验。
+7. **ABI 常量五处同步**：`RRK_ABI_VERSION` / `kRrkAbiVersion` / `bindings/rrk.h` /
+   `CHANGELOG.md` / `docs/ROADMAP.md`；`bash scripts/check-abi.sh` 是 CI 门禁，
+   漏改即红（Dart `RrkEngine.init` 相等校验，没有灰度窗口）。
 
 ## 代码风格
 

@@ -38,6 +38,29 @@
 - **Dart 启动时先查 ABI 再解析全部符号**：旧版原生库 + 新封装原先会在
   `_Bindings` 构造里因新符号不存在抛 `ArgumentError`；现在给出明确的
   `RrkException(1999, ABI 版本不匹配)`。
+- **ABI 常量五处一致性门禁（深审 B3）**：`scripts/check-abi.sh` 比对
+  `RRK_ABI_VERSION` / `kRrkAbiVersion` / `bindings/rrk.h` / CHANGELOG /
+  ROADMAP，接在 CI 全量单测之前；漏同步即刻变红（`d40f59f` 曾漏过一次）。
+- **规模化语料回归（深审 C4）**：`rrk-epub::corpus_scale` 用确定性生成的
+  200 章 / 10 卷嵌套目录 / 逐章内链合成大书跑 `open → toc → 首中尾抽样
+  load_chapter → 内链偏移与 UTF-8 边界对拍 → open 索引缓存往返 → 尾部改动
+  失效`。有版权真书不入库；本地可用 `scripts/corpus_check.sh <书...>` 跑真书
+  端到端，把书放进 `fixtures/corpus/`（已 gitignore）后 CI 也会自动执行。
+- **模型变体普查（深审 C6）**：`Inline` / `Block` 新增无通配 `variant_name`；
+  `rrk-layout::layout_inlines` 改穷举 `match`（行内图显式分支，不再被
+  `if let` 静默丢弃）；新增单测钉住「每个变体至少被一条降维管线消费」。
+
+### Changed
+
+- **`rrk_buf_free(ptr, len)` 的 `len` 不再参与释放（深审 C2）**：内核在数据区
+  前自带 8 字节 header 记录长度，宿主传错/传 0/传旧值都不再造成错误布局释放
+  （UB）。C 签名不变、Dart 侧不变，参数保留仅为源码兼容。
+- **排版器池按空闲槽调度（深审 C3）**：从轮转起点 `try_lock` 找空闲槽，全忙
+  才排队；旧实现按调用次数取模，两个请求落到同槽仍串行。
+- **全 workspace 取锁统一 `rrk_model::lock_recover`（深审 C1）**：清掉 16 处
+  `.lock().unwrap()`（含测试模块），新增源码扫描测试禁止回潮；`CONTRIBUTING`
+  明确写清 **panic clippy 红线只作用于 `rrk-ffi`**，CI 另加全 workspace clippy
+  （不启用 FFI 专属红线），消除门禁口径歧义。
 
 ### Fixed
 
@@ -59,11 +82,14 @@
   列表/引用/代码/表格不带；`<br>` 与行内 `<img>` 切出的后续段自动不重复缩进。
   不动 `Block` 模型（段落语义角色的彻底解留待 ABI 版本窗口）。
 
-验证：`cargo test --workspace` 全绿（新增 4 个回归：内存开书对拍 / 磁盘配额
-裁剪 / open 索引开关解绑 / 配额出口可调用）；FFI clippy 红线、
-`cbindgen --verify` 头文件漂移校验与 `dart analyze` 全部通过；
-`dart run example/smoke.dart` 在 Windows 上用 TXT / EPUB / CBZ 三种样张
-走通全链路，含 ABI 12 三个新出口与内存开书按扩展名嗅探。
+验证：`cargo test --workspace` 全绿（Unreleased 累计新增 11 个回归测试：
+内存开书对拍 / 磁盘配额裁剪 / open 索引开关解绑 / 配额出口可调用 /
+缓冲长度自记（2 例）/ 忙槽跳过 / 锁纪律与红线声明扫描（2 例）/
+模型变体普查 / 200 章规模化语料）；FFI clippy 红线、全 workspace clippy、`cbindgen --verify` 头文件漂移校验、`dart analyze`、
+`bash scripts/check-abi.sh` 全部通过；`dart run example/smoke.dart` 在 Windows
+上用 TXT / EPUB / CBZ 三种样张走通全链路，含 ABI 12 三个新出口与内存开书按
+扩展名嗅探。`scripts/corpus_check.sh` 另在 7.1MB / 1152 章真实 EPUB 上实跑
+首 / 中 / 尾章抽样通过。
 
 ## [0.4.0] - 2026-11-04
 

@@ -31,7 +31,7 @@
 |----|------|------|
 | Fuzz CI | cargo-fuzz 目标（zip/清洗/PDF 对象/图片头）+ 每晚 workflow | ✅ 已落地（实跑由 CI 验证） |
 | Bench CI | 补 bench_markup/bench_search/bench_ffi 盲区 + workflow 阈值护栏 | ✅ 已落地 |
-| 排版器池 | 多窗口并行排版 | ✅ 已落地（ABI 9：min(并行度,4) 台轮转） |
+| 排版器池 | 多窗口并行排版 | ✅ 已落地（ABI 9 引入；v12 改 `try_lock` 空闲槽调度，min(并行度,4) 台） |
 | blocks JSON 只带偏移区间 | 正文跨 FFI 传两遍的带宽优化；**ABI 契约变更** | ✅ 已落地（ABI 9 部件流） |
 | 章级/页级缓存持久化扩展 | open 期重建的索引（entries/pages/toc_raw）以内容 key 持久化 | ✅ 已落地（缓存句柄经 `IndexCache` 下沉 adapter：`open_cached` 带缓存入参；五格式 open 索引内容级落盘，重开命中免重建；与 issue #12 访问器缓存并行互补） |
 | PDF 渲染深化 | XObject 解码缓存、裁剪 bbox | ✅ 已落地（`Stream.data`→`Arc` 深拷贝优化让位于解码缓存，收益等价） |
