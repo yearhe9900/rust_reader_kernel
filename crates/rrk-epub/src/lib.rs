@@ -1320,4 +1320,142 @@ mod tests {
         );
         assert_eq!((cache.hits(), cache.misses()), (0, 2), "改过内容不得命中旧 open 索引");
     }
+
+    // -----------------------------------------------------------------------
+    // 深审 C4：规模化语料回归（确定性生成，不入库有版权真书）
+    // -----------------------------------------------------------------------
+
+    const CORPUS_CHAPTERS: usize = 200;
+    const CORPUS_PER_VOLUME: usize = 20;
+
+    /// 每章带标题、多段中文正文与一条跨章内链；`extra` 用于构造"只改尾部"变体。
+    fn corpus_chapter(i: usize, extra: &str) -> String {
+        let next = (i + 1) % CORPUS_CHAPTERS;
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<h1 id="ch{i}">第{i}章 标题</h1>
+<p>这是第 {i} 章的正文，用于规模化回归测试。{extra}</p>
+<p>下一段包含<a href="ch{next}.xhtml#note{next}">内部链接</a>与更多中文文本，用来检验字节偏移与内链区间。</p>
+<p id="note{i}">注释段落。</p>
+</body></html>"#
+        )
+    }
+
+    /// 生成 200 章 / 10 卷嵌套 nav 的完整 EPUB 字节（STORED，无外部依赖）。
+    fn corpus_zip(last_extra: &str) -> Vec<u8> {
+        let mut manifest = String::from(
+            r#"<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>"#,
+        );
+        let mut spine = String::new();
+        for i in 0..CORPUS_CHAPTERS {
+            manifest.push_str(&format!(
+                r#"<item id="c{i}" href="text/ch{i}.xhtml" media-type="application/xhtml+xml"/>"#
+            ));
+            spine.push_str(&format!(r#"<itemref idref="c{i}"/>"#));
+        }
+        let opf = format!(
+            r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>规模化语料</dc:title></metadata>
+  <manifest>{manifest}</manifest>
+  <spine>{spine}</spine>
+</package>"#
+        );
+
+        let mut nav = String::from(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol>"#,
+        );
+        for v in 0..CORPUS_CHAPTERS / CORPUS_PER_VOLUME {
+            let first = v * CORPUS_PER_VOLUME;
+            nav.push_str(&format!(
+                r#"<li><a href="text/ch{first}.xhtml">第{}卷</a><ol>"#,
+                v + 1
+            ));
+            for c in 0..CORPUS_PER_VOLUME {
+                let i = first + c;
+                nav.push_str(&format!(
+                    r#"<li><a href="text/ch{i}.xhtml">第{i}章</a></li>"#
+                ));
+            }
+            nav.push_str("</ol></li>");
+        }
+        nav.push_str("</ol></nav></body></html>");
+
+        let mut owned: Vec<(String, Vec<u8>)> = vec![
+            ("META-INF/container.xml".into(), CONTAINER.as_bytes().to_vec()),
+            ("OEBPS/content.opf".into(), opf.into_bytes()),
+            ("OEBPS/nav.xhtml".into(), nav.into_bytes()),
+        ];
+        for i in 0..CORPUS_CHAPTERS {
+            let extra = if i == CORPUS_CHAPTERS - 1 { last_extra } else { "" };
+            owned.push((
+                format!("OEBPS/text/ch{i}.xhtml"),
+                corpus_chapter(i, extra).into_bytes(),
+            ));
+        }
+        let files: Vec<(&str, &[u8])> = owned
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        build_zip(&files)
+    }
+
+    fn corpus_src(bytes: Vec<u8>) -> ContentSource {
+        ContentSource::from_bytes(
+            Some("corpus.epub".to_string()),
+            Arc::<[u8]>::from(bytes.into_boxed_slice()),
+        )
+    }
+
+    /// 200 章合成大书：`open → toc → 抽样 load_chapter → 偏移/内链对拍 →
+    /// open 索引缓存往返 → 尾部改动失效`。小样张测不出的「href→章映射 /
+    /// 索引重建 / 多章偏移」回归在这里变红。
+    #[test]
+    fn corpus_scale_open_toc_chapters_and_offsets() {
+        let src = corpus_src(corpus_zip(""));
+        let cache = rrk_format::MemIndexCache::new();
+        let book = EpubBook::parse_with_cache(&src, &cache).unwrap();
+
+        let chapters = book.chapters().unwrap();
+        assert_eq!(chapters.len(), CORPUS_CHAPTERS, "章表必须覆盖全部 spine 条目");
+        assert!(chapters.iter().enumerate().all(|(i, e)| e.id as usize == i));
+
+        let toc = book.toc().unwrap();
+        assert_eq!(toc.len(), CORPUS_CHAPTERS / CORPUS_PER_VOLUME, "顶层应为卷");
+        assert!(toc.iter().all(|n| n.children.len() == CORPUS_PER_VOLUME));
+        assert_eq!(
+            toc[3].children[0].chapter,
+            (3 * CORPUS_PER_VOLUME) as u32,
+            "卷内首章的 href→章映射错位"
+        );
+
+        for id in [0usize, 1, CORPUS_CHAPTERS / 2, CORPUS_CHAPTERS - 1] {
+            let c = book.load_chapter(id as u32).unwrap();
+            assert!(c.text.contains(&format!("第 {id} 章的正文")), "章 #{id} 正文错位");
+            assert!(!c.link_ranges.is_empty(), "章 #{id} 应有内链区间");
+            for l in &c.link_ranges {
+                let (s, e) = (l.range.start as usize, l.range.end as usize);
+                assert!(s <= e && e <= c.text.len(), "章 #{id} 内链区间越界: {s}..{e}");
+                assert!(
+                    c.text.is_char_boundary(s) && c.text.is_char_boundary(e),
+                    "章 #{id} 内链区间落在非法 UTF-8 边界: {s}..{e}"
+                );
+                assert!(l.href.contains(".xhtml"), "href 归一化异常: {}", l.href);
+            }
+            assert!(c.blocks.iter().any(|b| matches!(b, Block::Paragraph { .. })));
+        }
+
+        // open 索引缓存往返：重开命中，章表 / 目录树与冷构建逐字一致
+        let warm = EpubBook::parse_with_cache(&src, &cache).unwrap();
+        assert_eq!(cache.hits(), 1, "重开应命中 open 索引");
+        assert_eq!(book.entries, warm.entries, "缓存章表与冷构建不一致");
+        assert_eq!(book.toc_raw, warm.toc_raw, "缓存目录树与冷构建不一致");
+
+        // 只改最后一章：指纹必须变、缓存必须 miss（A1 在规模化语料上的复核）
+        let misses_before = cache.misses();
+        let tail = EpubBook::parse_with_cache(&corpus_src(corpus_zip("改动尾部")), &cache).unwrap();
+        assert_ne!(book.meta().content_hash, tail.meta().content_hash);
+        assert_eq!(cache.misses(), misses_before + 1, "尾部改动不得命中旧索引");
+    }
 }
