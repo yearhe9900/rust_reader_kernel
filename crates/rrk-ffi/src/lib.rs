@@ -43,8 +43,10 @@ use rrk_model::{
 /// v10 = `rrk_load_headings`（issue #13：章标题块轻量出口，另 EPUB 无 TOC 书
 ///       open 期自动回填首个最小级标题）；
 /// v11 = `rrk_layout_cancel_book`（按书取消在飞排版；并发契约加固：per-request
-///       取消令牌、句柄 generation 防 ABA、锁中毒自恢复、重活出锁）。
-pub const RRK_ABI_VERSION: u32 = 11;
+///       取消令牌、句柄 generation 防 ABA、锁中毒自恢复、重活出锁）；
+/// v12 = `rrk_open_bytes`（内存开书）/ `rrk_open_index_cache_configure`
+///       （open 索引缓存独立开关）/ `rrk_cache_set_disk_limit`（磁盘配额）。
+pub const RRK_ABI_VERSION: u32 = 12;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -466,6 +468,29 @@ fn write_parts(parts: &[rrk_model::TextPart], s: &mut String) {
 // 书生命周期与查询
 // ---------------------------------------------------------------------------
 
+/// 开书公共段：锁外三段式（锁内取 open 索引缓存句柄 → 锁外嗅探/解析/索引
+/// 重建 → 锁内登记句柄）。路径与内存字节两个入口共用，保证缓存口径、
+/// 错误语义、句柄 generation 逐字一致。
+fn open_source(src: rrk_format::ContentSource) -> u64 {
+    let store = match with_kernel(|k| Ok::<_, u32>(k.open_index_cache())) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let idx = OpenIndexStore::new(store);
+    let book: Arc<dyn rrk_format::BookSource> =
+        match shared_registry().open_cached(&src, &idx) {
+            Ok(b) => Arc::from(b),
+            Err(e) => {
+                set_kind(e);
+                return 0;
+            }
+        };
+    match with_kernel(|k| Ok(k.register_book(book, idx.hits(), idx.misses()))) {
+        Ok(h) => h,
+        Err(_) => 0,
+    }
+}
+
 /// 打开一本书（UTF-8 路径）；成功返回句柄（≥1），失败返回 0。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_open(path: *const u8, path_len: usize) -> u64 {
@@ -482,26 +507,45 @@ pub unsafe extern "C" fn rrk_open(path: *const u8, path_len: usize) -> u64 {
                 return 0;
             }
         };
-        // 锁外开书三段式（§二.4）：段 1 拿 open 索引缓存句柄（锁内，微秒级）→
-        // 段 2 嗅探+解析+索引重建（锁外，重活）→ 段 3 登记句柄（锁内，微秒级）。
-        let store = match with_kernel(|k| Ok::<_, u32>(k.open_index_cache())) {
-            Ok(s) => s,
-            Err(_) => return 0,
-        };
-        let idx = OpenIndexStore::new(store);
-        let src = rrk_format::ContentSource::from_path(&path);
-        let book: Arc<dyn rrk_format::BookSource> =
-            match shared_registry().open_cached(&src, &idx) {
-                Ok(b) => Arc::from(b),
+        open_source(rrk_format::ContentSource::from_path(&path))
+    })
+}
+
+/// 打开一本**内存中的书**（additive，ABI 12）。
+///
+/// 解锁 Android `content://`/SAF、iOS security-scoped URL、网盘流、
+/// 解密后的内存字节等「没有可用文件路径」的接入场景——宿主不必先把书
+/// 落盘。`data` 会被**拷贝**进内核自有的 `Arc<[u8]>`：内核不持有宿主指针，
+/// 本调用返回后宿主即可释放传入缓冲。
+///
+/// `name` 仅用于格式嗅探（可传 NULL/长度 0）；建议带原始扩展名，
+/// 例如 `"book.epub"`。其余语义与 [`rrk_open`] 完全一致。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_open_bytes(
+    data_ptr: *const u8,
+    data_len: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> u64 {
+    guard_val(0, || {
+        if data_ptr.is_null() || data_len == 0 {
+            set_last_error(RrkErrorKind::InvalidParam.code(), "书数据为空");
+            return 0;
+        }
+        let data = std::slice::from_raw_parts(data_ptr, data_len);
+        let name = if name_ptr.is_null() || name_len == 0 {
+            None
+        } else {
+            match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
+                Ok(s) => Some(s.to_string()),
                 Err(e) => {
-                    set_kind(e);
+                    set_last_error(RrkErrorKind::InvalidParam.code(), format!("书名非 UTF-8: {e}"));
                     return 0;
                 }
-            };
-        match with_kernel(|k| Ok(k.register_book(book, idx.hits(), idx.misses()))) {
-            Ok(h) => h,
-            Err(_) => 0,
-        }
+            }
+        };
+        let src = rrk_format::ContentSource::from_bytes(name, Arc::<[u8]>::from(data));
+        open_source(src)
     })
 }
 
@@ -938,6 +982,56 @@ mod tests {
         assert_eq!(rrk_last_error_code(), ERR_PANIC);
     }
 
+    /// 深审 B1：`rrk_open_bytes` 与 `rrk_open` 必须走同一条链路
+    ///（meta / 章表逐字一致），且 name 可省略。
+    #[test]
+    fn open_bytes_matches_open_path() {
+        fn query(f: unsafe extern "C" fn(u64, *mut *mut u8, *mut usize) -> u32, h: u64) -> String {
+            let mut p = std::ptr::null_mut::<u8>();
+            let mut n = 0usize;
+            assert_eq!(unsafe { f(h, &mut p, &mut n) }, 0);
+            let s = unsafe {
+                String::from_utf8_lossy(std::slice::from_raw_parts(p, n)).into_owned()
+            };
+            unsafe { rrk_buf_free(p, n) };
+            s
+        }
+
+        let path = write_big_txt("bytes", 3, 90);
+        let path_bytes = path.to_str().unwrap().as_bytes().to_vec();
+        let data = std::fs::read(&path).unwrap();
+        // 传与路径一致的文件名，避免 meta.title 因 src.name() 不同而失配
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let name_bytes = name.as_bytes();
+
+        let h_path = unsafe { rrk_open(path_bytes.as_ptr(), path_bytes.len()) };
+        let h_bytes = unsafe {
+            rrk_open_bytes(data.as_ptr(), data.len(), name_bytes.as_ptr(), name_bytes.len())
+        };
+        assert_ne!(h_path, 0, "路径开书应成功");
+        assert_ne!(h_bytes, 0, "内存开书应成功");
+        assert_ne!(h_path, h_bytes, "两次 open 应拿到不同句柄");
+        assert_eq!(query(rrk_meta_json, h_path), query(rrk_meta_json, h_bytes));
+        assert_eq!(query(rrk_chapters_json, h_path), query(rrk_chapters_json, h_bytes));
+
+        let h_noname = unsafe {
+            rrk_open_bytes(data.as_ptr(), data.len(), std::ptr::null(), 0)
+        };
+        assert_ne!(h_noname, 0, "name 可省略（TXT 靠内容嗅探）");
+        rrk_close(h_path);
+        rrk_close(h_bytes);
+        rrk_close(h_noname);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 深审 B5：磁盘配额出口可调用；设 0 = 关闭裁剪（默认，不改全局状态，
+    /// 避免并行测试互相干扰）。裁剪逻辑本身的回归在 rrk-cache 单测。
+    #[test]
+    fn disk_limit_export_is_callable() {
+        assert_eq!(rrk_cache_set_disk_limit(0), 0);
+        assert_eq!(rrk_cache::disk_limit(), 0);
+    }
+
     /// 红线门禁：扫描本文件源码，逐个 C ABI 导出校验 catch_unwind 兜底存在——
     /// 新增出口漏兜底即红（人工 review 之外的机器门禁）。
     #[test]
@@ -1220,6 +1314,47 @@ pub unsafe extern "C" fn rrk_content_cache_configure(
             k.configure_content_cache(&dir, mem_bytes).map_err(set_kind)?;
             Ok(0)
         })
+    })
+}
+
+/// 独立配置 **open 索引缓存**（additive，ABI 12；深审 B4）。
+///
+/// 未调用本出口时，open 索引缓存跟随内容级缓存的目录（旧宿主行为不变）；
+/// 调用后开关与目录完全独立——可只开 open 索引不缓存章文本，或关掉内容级
+/// 缓存仍保留 open 索引。空路径 = 显式关闭 open 索引持久化。
+/// open 索引只走 C2 磁盘层、不占 C1 内存 LRU，故没有 mem_bytes 参数。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_open_index_cache_configure(
+    dir_ptr: *const u8,
+    dir_len: usize,
+) -> u32 {
+    guard(|| {
+        let dir = if dir_ptr.is_null() || dir_len == 0 {
+            String::new()
+        } else {
+            match std::str::from_utf8(std::slice::from_raw_parts(dir_ptr, dir_len)) {
+                Ok(s) => s.to_string(),
+                Err(e) => return Err(set_kind(RrkError::invalid(format!("缓存目录非 UTF-8: {e}")))),
+            }
+        };
+        with_kernel(|k| {
+            k.configure_open_index_cache(&dir).map_err(set_kind)?;
+            Ok(0)
+        })
+    })
+}
+
+/// 设置磁盘缓存配额（additive，ABI 12；深审 B5）。
+///
+/// `max_bytes = 0` = 关闭裁剪（默认，保持旧行为）。设置后每个 `DiskStore`
+/// 在下次 `save` 时按自身目录独立裁剪到该上限（按 mtime 删最旧）。
+/// **惰性生效**：已存在的超限目录在下一次写入时才裁剪。进程级全局，
+/// 布局缓存 / 内容级缓存 / open 索引缓存同时受约束。
+#[no_mangle]
+pub extern "C" fn rrk_cache_set_disk_limit(max_bytes: u64) -> u32 {
+    guard(|| {
+        rrk_cache::set_disk_limit(max_bytes);
+        Ok(0)
     })
 }
 

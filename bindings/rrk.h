@@ -16,8 +16,10 @@
 // v10 = `rrk_load_headings`（issue #13：章标题块轻量出口，另 EPUB 无 TOC 书
 //       open 期自动回填首个最小级标题）；
 // v11 = `rrk_layout_cancel_book`（按书取消在飞排版；并发契约加固：per-request
-//       取消令牌、句柄 generation 防 ABA、锁中毒自恢复、重活出锁）。
-#define RRK_ABI_VERSION 11
+//       取消令牌、句柄 generation 防 ABA、锁中毒自恢复、重活出锁）；
+// v12 = `rrk_open_bytes`（内存开书）/ `rrk_open_index_cache_configure`
+//       （open 索引缓存独立开关）/ `rrk_cache_set_disk_limit`（磁盘配额）。
+#define RRK_ABI_VERSION 12
 
 // panic 被捕获时的错误码。
 #define ERR_PANIC 2001
@@ -52,6 +54,20 @@ uint32_t rrk_last_error_code(void);
 
 // 打开一本书（UTF-8 路径）；成功返回句柄（≥1），失败返回 0。
 uint64_t rrk_open(const uint8_t *path, uintptr_t path_len);
+
+// 打开一本**内存中的书**（additive，ABI 12）。
+//
+// 解锁 Android `content://`/SAF、iOS security-scoped URL、网盘流、
+// 解密后的内存字节等「没有可用文件路径」的接入场景——宿主不必先把书
+// 落盘。`data` 会被**拷贝**进内核自有的 `Arc<[u8]>`：内核不持有宿主指针，
+// 本调用返回后宿主即可释放传入缓冲。
+//
+// `name` 仅用于格式嗅探（可传 NULL/长度 0）；建议带原始扩展名，
+// 例如 `"book.epub"`。其余语义与 [`rrk_open`] 完全一致。
+uint64_t rrk_open_bytes(const uint8_t *data_ptr,
+                        uintptr_t data_len,
+                        const uint8_t *name_ptr,
+                        uintptr_t name_len);
 
 // 关闭一本书；0 = 成功。
 uint32_t rrk_close(BookHandle handle);
@@ -118,6 +134,23 @@ uint32_t rrk_cache_configure(const uint8_t *dir_ptr, uintptr_t dir_len, uintptr_
 uint32_t rrk_content_cache_configure(const uint8_t *dir_ptr,
                                      uintptr_t dir_len,
                                      uintptr_t mem_bytes);
+
+// 独立配置 **open 索引缓存**（additive，ABI 12；深审 B4）。
+//
+// 未调用本出口时，open 索引缓存跟随内容级缓存的目录（旧宿主行为不变）；
+// 调用后开关与目录完全独立——可只开 open 索引不缓存章文本，或关掉内容级
+// 缓存仍保留 open 索引。空路径 = 显式关闭 open 索引持久化。
+// open 索引只走 C2 磁盘层、不占 C1 内存 LRU，故没有 mem_bytes 参数。
+uint32_t rrk_open_index_cache_configure(const uint8_t *dir_ptr,
+                                        uintptr_t dir_len);
+
+// 设置磁盘缓存配额（additive，ABI 12；深审 B5）。
+//
+// `max_bytes = 0` = 关闭裁剪（默认，保持旧行为）。设置后每个 `DiskStore`
+// 在下次 `save` 时按自身目录独立裁剪到该上限（按 mtime 删最旧）。
+// **惰性生效**：已存在的超限目录在下一次写入时才裁剪。进程级全局，
+// 布局缓存 / 内容级缓存 / open 索引缓存同时受约束。
+uint32_t rrk_cache_set_disk_limit(uint64_t max_bytes);
 
 // 内容级缓存命中统计 JSON（issue #12：可观测性）：
 // `{"toc":{"hits","misses"},"chapter":{…},"outline":{…},"open":{…}}`。
