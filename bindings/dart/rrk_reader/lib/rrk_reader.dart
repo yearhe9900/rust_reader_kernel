@@ -16,8 +16,10 @@ import 'package:ffi/ffi.dart';
 /// v8 = rrk_last_error_code / rrk_content_cache_*（issue #11、#12）；
 /// v9 = blocks JSON 改部件流（文本区间+图片 key，不再内嵌正文）等接入面扩充；
 /// v10 = rrk_load_headings（issue #13：章标题块轻量出口）；
-/// v11 = rrk_layout_cancel_book（按书取消；并发契约加固 + hit_test 精度）。
-const int kRrkAbiVersion = 11;
+/// v11 = rrk_layout_cancel_book（按书取消；并发契约加固 + hit_test 精度）；
+/// v12 = rrk_open_bytes（内存开书）/ rrk_open_index_cache_configure
+///       （open 索引缓存独立开关）/ rrk_cache_set_disk_limit（磁盘配额）。
+const int kRrkAbiVersion = 12;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -34,6 +36,17 @@ class RrkException implements Exception {
 
 typedef _OpenNative = Uint64 Function(Pointer<Utf8>, IntPtr);
 typedef _OpenDart = int Function(Pointer<Utf8>, int);
+// ABI 12：内存开书（数据 + 可选文件名）
+typedef _OpenBytesNative = Uint64 Function(
+    Pointer<Uint8>, IntPtr, Pointer<Utf8>, IntPtr);
+typedef _OpenBytesDart = int Function(
+    Pointer<Uint8>, int, Pointer<Utf8>, int);
+// ABI 12：open 索引缓存独立开关
+typedef _OpenIndexCfgNative = Uint32 Function(Pointer<Utf8>, IntPtr);
+typedef _OpenIndexCfgDart = int Function(Pointer<Utf8>, int);
+// ABI 12：磁盘配额
+typedef _DiskLimitNative = Uint32 Function(Uint64);
+typedef _DiskLimitDart = int Function(int);
 typedef _CloseNative = Uint32 Function(Uint64);
 typedef _CloseDart = int Function(int);
 typedef _QueryNative = Uint32 Function(Uint64, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
@@ -142,6 +155,13 @@ typedef _Bm25QueryDart = int Function(
 class _Bindings {
   _Bindings(DynamicLibrary lib)
       : open = lib.lookupFunction<_OpenNative, _OpenDart>('rrk_open'),
+        openBytes =
+            lib.lookupFunction<_OpenBytesNative, _OpenBytesDart>('rrk_open_bytes'),
+        openIndexCacheConfigure =
+            lib.lookupFunction<_OpenIndexCfgNative, _OpenIndexCfgDart>(
+                'rrk_open_index_cache_configure'),
+        setDiskLimit = lib.lookupFunction<_DiskLimitNative, _DiskLimitDart>(
+            'rrk_cache_set_disk_limit'),
         close = lib.lookupFunction<_CloseNative, _CloseDart>('rrk_close'),
         metaJson = lib.lookupFunction<_QueryNative, _QueryDart>('rrk_meta_json'),
         tocJson = lib.lookupFunction<_QueryNative, _QueryDart>('rrk_toc_json'),
@@ -199,6 +219,9 @@ class _Bindings {
         bm25Close = lib.lookupFunction<_IdNative, _IdDart>('rrk_bm25_close');
 
   final _OpenDart open;
+  final _OpenBytesDart openBytes;
+  final _OpenIndexCfgDart openIndexCacheConfigure;
+  final _DiskLimitDart setDiskLimit;
   final _CloseDart close;
   final _QueryDart metaJson;
   final _QueryDart tocJson;
@@ -276,12 +299,14 @@ class RrkEngine {
     } else {
       lib = DynamicLibrary.open(_defaultLibName());
     }
-    final b = _Bindings(lib);
-    final abi = b.abiVersion();
+    // 先单独查版本再解析全部符号：加载旧版原生库时给出明确的 ABI 不匹配
+    // 错误，而不是在 _Bindings 构造里因「新符号不存在」抛 ArgumentError。
+    final abiFn = lib.lookupFunction<_AbiNative, _AbiDart>('rrk_abi_version');
+    final abi = abiFn();
     if (abi != kRrkAbiVersion) {
       throw RrkException(1999, 'ABI 版本不匹配：内核=$abi，封装=$kRrkAbiVersion');
     }
-    _b = b;
+    _b = _Bindings(lib);
   }
 
   /// 未显式指定库路径时的平台默认库名。
@@ -341,6 +366,32 @@ class RrkEngine {
     }
   }
 
+  /// 独立配置 **open 索引缓存**（ABI 12）。
+  ///
+  /// 不调用时 open 索引缓存跟随内容级缓存目录（旧行为）；调用后开关独立：
+  /// 可只开 open 索引而不缓存章文本，或关掉内容级缓存仍保留 open 索引。
+  /// 空路径 = 显式关闭 open 索引持久化。
+  static void configureOpenIndexCache(String dir) {
+    final b = _bindings;
+    final p = dir.toNativeUtf8();
+    try {
+      final code = b.openIndexCacheConfigure(p, utf8.encode(dir).length);
+      if (code != 0) throw _lastError(b);
+    } finally {
+      malloc.free(p);
+    }
+  }
+
+  /// 设置磁盘缓存配额（ABI 12，字节；0 = 关闭裁剪）。
+  ///
+  /// 进程级生效，布局 / 内容级 / open 索引三类缓存目录各自按 mtime 裁剪到
+  /// 该上限。惰性生效：已存在的超限目录在下一次写入时才裁剪。
+  static void setCacheDiskLimit(int bytes) {
+    final b = _bindings;
+    final code = b.setDiskLimit(bytes < 0 ? 0 : bytes);
+    if (code != 0) throw _lastError(b);
+  }
+
   /// 内容级缓存命中统计（原始 JSON：toc/chapter/outline/open 各 hits/misses）。
   /// issue #12 + open 索引持久化（ROADMAP 章级/页级缓存持久化）。
   static String contentCacheStatsJson() {
@@ -369,6 +420,37 @@ class RrkEngine {
       return RrkBook._(handle);
     } finally {
       malloc.free(pathPtr);
+    }
+  }
+
+  /// 打开一本**内存中的书**（ABI 12）。
+  ///
+  /// 用于 Android `content://`/SAF、iOS security-scoped URL、网盘流、
+  /// 解密后字节等没有可用文件路径的场景。数据会被拷贝进内核自有缓冲，
+  /// 本方法返回后 [data] 即可释放。[name] 仅用于格式嗅探，建议带扩展名
+  /// （如 `book.epub`）；省略时靠内容嗅探。
+  static RrkBook openBookBytes(Uint8List data, {String? name}) {
+    if (data.isEmpty) {
+      throw RrkException(1004, '书数据为空');
+    }
+    final b = _bindings;
+    final buf = malloc<Uint8>(data.length);
+    final Pointer<Utf8> namePtr = name == null ? nullptr : name.toNativeUtf8();
+    try {
+      buf.asTypedList(data.length).setAll(0, data);
+      final handle = b.openBytes(
+        buf,
+        data.length,
+        namePtr,
+        name == null ? 0 : utf8.encode(name).length,
+      );
+      if (handle == 0) {
+        throw _lastError(b);
+      }
+      return RrkBook._(handle);
+    } finally {
+      malloc.free(buf);
+      if (name != null) malloc.free(namePtr);
     }
   }
 
