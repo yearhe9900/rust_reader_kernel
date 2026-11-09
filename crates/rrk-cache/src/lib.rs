@@ -13,12 +13,31 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rrk_model::{fnv1a64, RrkResult};
 
 /// 磁盘容器 magic + schema（schema 变更 = 全部失效重建，损坏≠判据失效）。
 const MAGIC: &[u8; 4] = b"RRKC";
 const SCHEMA: u32 = 1;
+
+/// 全局磁盘配额上限（字节）；**0 = 不裁剪**（默认，保持旧行为）。
+///
+/// 宿主通过 `rrk_cache_set_disk_limit` 设置。C1 内存层早有 LRU + 保护窗口，
+/// C2 原先只增不减——用户每改一次字号/旋转一次屏幕就产生一批新 key，
+/// 移动端磁盘会被慢慢吃满。每个 `DiskStore` 在 `save` 后按自身目录独立
+/// 裁剪到该上限（多目录时各自不超过上限）。
+static DISK_LIMIT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// 设置全局磁盘配额（0 = 关闭裁剪）。**惰性生效**：下一次 `save` 起裁剪。
+pub fn set_disk_limit(bytes: u64) {
+    DISK_LIMIT_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// 当前全局磁盘配额。
+pub fn disk_limit() -> u64 {
+    DISK_LIMIT_BYTES.load(Ordering::Relaxed)
+}
 
 /// 产物种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -260,6 +279,8 @@ impl DiskStore {
         let tmp = self.root.join(format!("{}.tmp", key.file_name()));
         std::fs::write(&tmp, &buf)?;
         std::fs::rename(&tmp, &path)?;
+        // 配额裁剪（limit=0 时零成本短路）；失败不致命，下次 save 再试。
+        let _ = self.trim(disk_limit());
         Ok(())
     }
 
@@ -288,6 +309,49 @@ impl DiskStore {
             let entry = entry?;
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
                 std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// 按 mtime 从最旧开始删，直到目录内缓存文件总大小 ≤ `max_bytes`。
+    ///
+    /// `max_bytes = 0` 表示不裁剪（默认），直接短路、不读目录。原子写的
+    /// `.tmp` 中间文件跳过，避免删掉别的线程正在写的临时文件；删除失败
+    /// （权限/并发）跳过而非中断——缓存写入永不因裁剪而失败。
+    pub fn trim(&self, max_bytes: u64) -> std::io::Result<usize> {
+        if max_bytes == 0 {
+            return Ok(0);
+        }
+        let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let md = entry.metadata()?;
+            if !md.is_file()
+                || entry.path().extension() == Some(std::ffi::OsStr::new("tmp"))
+            {
+                continue;
+            }
+            total = total.saturating_add(md.len());
+            files.push((
+                entry.path(),
+                md.len(),
+                md.modified().unwrap_or(std::time::UNIX_EPOCH),
+            ));
+        }
+        if total <= max_bytes {
+            return Ok(0);
+        }
+        files.sort_by_key(|(_, _, mtime)| *mtime);
+        let mut removed = 0;
+        for (path, len, _) in files {
+            if total <= max_bytes {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total = total.saturating_sub(len);
                 removed += 1;
             }
         }
@@ -381,6 +445,35 @@ mod tests {
         assert_eq!(n, 1);
         assert!(store.load(&key()).is_none());
         assert!(store.load(&CacheKey::new(9, 0, 0, CacheKind::Structure)).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 深审 B5：C2 磁盘层按配额裁剪（C1 早有 LRU，磁盘层原先只增不减）。
+    /// 只断言「总大小 ≤ 上限」与「超限才删」，不断言具体删哪个文件——
+    /// 文件系统 mtime 精度可能打平，避免 CI 假红。
+    #[test]
+    fn disk_limit_trims_to_budget() {
+        let dir = std::env::temp_dir().join(format!("rrk-cache-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = DiskStore::open(&dir).unwrap();
+        let payload = vec![7u8; 1000];
+        for i in 1..=4 {
+            store.save(&CacheKey::new(i, 0, 0, CacheKind::Structure), &payload).unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4, "默认不裁剪");
+        assert_eq!(store.trim(0).unwrap(), 0, "0 = 关闭裁剪");
+        assert_eq!(store.trim(10_000_000).unwrap(), 0, "未超限不删");
+        // 每文件约 1061 字节；2200 预算约留 2 个
+        let removed = store.trim(2200).unwrap();
+        assert!(removed >= 2, "应删掉超预算的旧文件: {removed}");
+        let total: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+        assert!(total <= 2200, "裁剪后目录总大小应不超上限: {total}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
