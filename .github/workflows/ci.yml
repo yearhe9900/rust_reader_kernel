@@ -17,17 +17,32 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: ABI 常量五处一致（深审 B3）
+        # Rust / Dart / 头文件 / CHANGELOG / ROADMAP 漏同步即刻变红
+        run: bash scripts/check-abi.sh
       - name: 全量单测
         run: cargo test --workspace
       - name: FFI 红线（panic 不跨界：clippy 禁 unwrap/expect/panic）
         # --no-deps：红线只对 rrk-ffi 生效（不外溢到工作区路径依赖）
         run: cargo clippy -p rrk-ffi --no-deps -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic
+      - name: 全 workspace clippy（不启用 FFI 专属红线，口径见 CONTRIBUTING §架构约束 6）
+        run: cargo clippy --workspace --no-deps
       - name: rrk-inspect 冒烟（样张）
         run: |
           cargo build --release -p rrk-inspect
           ./target/release/rrk-inspect fixtures/sample.epub >/dev/null
           ./target/release/rrk-inspect fixtures/sample.cbz >/dev/null
           ./target/release/rrk-inspect fixtures/sample.pdf >/dev/null
+      - name: 规模化语料回归（深审 C4：200 章嵌套目录 + 内链 + 索引往返）
+        # 有版权真书不入库；本测试用确定性生成的合成大书挡索引重建类回归
+        run: cargo test -p rrk-epub corpus_scale -- --nocapture
+      - name: 真书语料（可选，放入 fixtures/corpus/ 才跑）
+        run: |
+          if [ -d fixtures/corpus ]; then
+            bash scripts/corpus_check.sh fixtures/corpus/*
+          else
+            echo "未提供真书语料（版权文件不入库），跳过"
+          fi
       - name: 安装 cbindgen（头文件漂移校验）
         run: cargo install cbindgen --locked
       - name: C 头文件与源码一致（cbindgen --verify）
