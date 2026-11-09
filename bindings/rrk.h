@@ -39,6 +39,10 @@ extern "C" {
 #endif // __cplusplus
 
 // 释放内核分配的缓冲（Dart 侧用完必调）。
+//
+// `ptr` 必须是本内核 `alloc_buf` 返回的数据区指针；`len` **被忽略**（保留
+// 参数只为不破 C ABI / 旧宿主源码兼容），长度由 ptr 前置 header 自记。
+// `rrk_buf_free(NULL, _)` 仍为安全空操作。
 void rrk_buf_free(uint8_t *ptr, uintptr_t len);
 
 // 返回 ABI 版本号。

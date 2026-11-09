@@ -31,8 +31,8 @@ pub type SearchId = u64;
 /// BM25 索引会话句柄（0 = 非法）。
 pub type IndexId = u64;
 use rrk_model::{
-    Block, BookMeta, ChapterEntry, LinkRange, PagedContent, ResourceKey, RrkError, RrkErrorKind,
-    TocNode,
+    lock_recover, Block, BookMeta, ChapterEntry, LinkRange, PagedContent, ResourceKey, RrkError,
+    RrkErrorKind, TocNode,
 };
 
 /// ABI 版本号（Dart 启动校验；只增不改语义）。
@@ -52,18 +52,35 @@ pub const RRK_ABI_VERSION: u32 = 12;
 pub const ERR_PANIC: u32 = 2001;
 
 static KERNEL: Mutex<Option<Kernel>> = Mutex::new(None);
-/// 排版器（粗粒度共享一份；parley FontContext 重量级）。
 /// 排版器池（ROADMAP：多窗口并行排版）：每台独立 parley FontContext，
-/// 轮转取用——并行排版吞吐随池大小叠加；池大小 = min(可用并行度, 4)，
-/// 惰性创建（每台 FontContext 数 MB，不预热）。
-fn layouter_slot() -> &'static Mutex<Option<rrk_layout::Layouter>> {
+/// 惰性创建（每台 FontContext 数 MB，不预热）；池大小 = min(可用并行度, 4)。
+///
+/// 深审 C3：旧实现按调用次数取模轮转，而整章排版是**持槽锁跑完**的，
+/// 两个请求落到同槽仍串行。现在从轮转起点开始 `try_lock` 找空闲槽，
+/// 全忙才回退到起点排队（不自旋、不饿死；起点每次推进避免固定抢 0 号）。
+fn acquire_layouter() -> MutexGuard<'static, Option<rrk_layout::Layouter>> {
     static POOL: OnceLock<Vec<Mutex<Option<rrk_layout::Layouter>>>> = OnceLock::new();
     static RR: AtomicUsize = AtomicUsize::new(0);
-    let pool = POOL.get_or_init(|| {
+    let pool: &'static [Mutex<Option<rrk_layout::Layouter>>] = POOL.get_or_init(|| {
         let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4);
         (0..n).map(|_| Mutex::new(None)).collect()
     });
-    &pool[RR.fetch_add(1, Ordering::Relaxed) % pool.len()]
+    let start = RR.fetch_add(1, Ordering::Relaxed) % pool.len();
+    acquire_free_slot(pool, start)
+}
+
+/// 从 `start` 起环形找第一个空闲槽（中毒槽就地恢复，不跳过）；全忙才阻塞。
+fn acquire_free_slot<'a, T>(pool: &'a [Mutex<T>], start: usize) -> MutexGuard<'a, T> {
+    debug_assert!(!pool.is_empty(), "排版器池至少 1 槽");
+    for i in 0..pool.len() {
+        let idx = (start + i) % pool.len();
+        match pool[idx].try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+    }
+    lock_recover(&pool[start % pool.len()])
 }
 /// 排版取消令牌：每次布局请求独立一个（同一请求 = 同一 `Arc`）。
 ///
@@ -111,17 +128,6 @@ fn set_last_error(code: u32, msg: impl Into<String>) {
     LAST_ERROR.with(|e| *e.borrow_mut() = (code, msg.into()));
 }
 
-/// 锁获取（中毒恢复）：panic 被 `catch_unwind` 兤住后 Mutex 必然中毒——
-/// 但 Rust 内存模型下数据结构仍一致（无 UB），恢复继续用远好于
-/// 「一次 panic → 引擎永久瘫痪」（深审 §二.1；错误码表里也不该
-/// 出现「锁中毒」这种宿主无法自救的内部状态）。
-fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    }
-}
-
 fn with_kernel<T>(f: impl FnOnce(&mut Kernel) -> Result<T, u32>) -> Result<T, u32> {
     let mut guard = lock_recover(&KERNEL);
     let kernel = guard.get_or_insert_with(Kernel::new);
@@ -166,11 +172,21 @@ fn guard(f: impl FnOnce() -> Result<u32, u32>) -> u32 {
 // 缓冲管理
 // ---------------------------------------------------------------------------
 
+/// 自记长度缓冲的 header 字节数：紧跟 `u64` 小端的数据长度。
+///
+/// 深审 C2：原实现释放时靠宿主回传的 `len` 重建 `Box<[u8]>`，len 传错即
+/// UB（内核无法防御）。现在把长度写在数据区前，`rrk_buf_free` 自己读回来，
+/// 宿主传的 `len` 降级为**仅为源码兼容保留的忽略参数**。
+const BUF_HEADER: usize = 8;
+
 fn alloc_buf(bytes: Vec<u8>) -> (*mut u8, usize) {
-    let boxed = bytes.into_boxed_slice();
-    let len = boxed.len();
-    let ptr = Box::into_raw(boxed) as *mut u8;
-    (ptr, len)
+    let len = bytes.len();
+    let mut boxed: Box<[u8]> = vec![0u8; BUF_HEADER + len].into_boxed_slice();
+    boxed[..BUF_HEADER].copy_from_slice(&(len as u64).to_le_bytes());
+    boxed[BUF_HEADER..].copy_from_slice(&bytes);
+    let base = Box::into_raw(boxed) as *mut u8;
+    // wrapping_add 是安全的裸指针算术（不越界：boxed 长度 = HEADER + len）
+    (base.wrapping_add(BUF_HEADER), len)
 }
 
 unsafe fn write_buf(bytes: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) {
@@ -180,13 +196,26 @@ unsafe fn write_buf(bytes: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) 
 }
 
 /// 释放内核分配的缓冲（Dart 侧用完必调）。
+///
+/// `ptr` 必须是本内核 `alloc_buf` 返回的数据区指针；`len` **被忽略**（保留
+/// 参数只为不破 C ABI / 旧宿主源码兼容），长度由 ptr 前置 header 自记。
+/// `rrk_buf_free(NULL, _)` 仍为安全空操作。
 #[no_mangle]
 pub unsafe extern "C" fn rrk_buf_free(ptr: *mut u8, len: usize) {
+    let _ = len; // 仅为不破 C 签名 / 旧宿主源码兼容而保留
     if ptr.is_null() {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
+        let base = ptr.wrapping_sub(BUF_HEADER);
+        let mut head = [0u8; BUF_HEADER];
+        std::ptr::copy_nonoverlapping(base, head.as_mut_ptr(), BUF_HEADER);
+        let len = u64::from_le_bytes(head) as usize;
+        let Some(total) = BUF_HEADER.checked_add(len) else {
+            return;
+        };
+        let raw = std::ptr::slice_from_raw_parts_mut(base, total);
+        drop(Box::from_raw(raw));
     }));
 }
 
@@ -686,6 +715,31 @@ pub unsafe extern "C" fn rrk_cover(
 mod tests {
     use super::*;
 
+    /// 深审 C3：忙槽必须被跳过——起点槽被占用时，`try_lock` 要拿到别的槽，
+    /// 而不是像旧轮转那样阻塞在起点。用通道超时兜底，避免实现退化时测试挂死。
+    #[test]
+    fn layouter_pool_skips_busy_slot() {
+        let pool: &'static [Mutex<u8>] =
+            Box::leak(vec![Mutex::new(0), Mutex::new(0), Mutex::new(0)].into_boxed_slice());
+        let busy = lock_recover(&pool[0]); // 占住 0 号槽
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let mut g = acquire_free_slot(pool, 0); // 旧策略会卡在 0 号槽
+            *g = 9;
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("起点槽忙时应 try_lock 到空闲槽，而不是排队等待");
+        t.join().unwrap();
+        drop(busy);
+        assert_eq!(*lock_recover(&pool[0]), 0, "不得占用起点槽");
+        assert_eq!(
+            *lock_recover(&pool[1]) + *lock_recover(&pool[2]),
+            9,
+            "应落到某个空闲槽"
+        );
+    }
+
     /// #4 对拍：blocks_json 与 flatten_blocks 同源——引用摊平、分割线不出现。
     #[test]
     fn blocks_json_uses_flatten_contract() {
@@ -1030,6 +1084,39 @@ mod tests {
     fn disk_limit_export_is_callable() {
         assert_eq!(rrk_cache_set_disk_limit(0), 0);
         assert_eq!(rrk_cache::disk_limit(), 0);
+    }
+
+    /// 深审 C2：缓冲长度自记——宿主回传的 len 不再参与释放布局。
+    /// 旧实现 `Box::from_raw(slice(ptr, len))`，len 传错即 UB；现在 header
+    /// 里记的长度才是唯一真值，传 0 / 传错 / 传超大值都不得影响释放。
+    #[test]
+    fn alloc_buf_self_records_length() {
+        let (p, n) = alloc_buf(b"hello rrk".to_vec());
+        assert_eq!(n, 9);
+        assert!(!p.is_null());
+        assert_eq!(unsafe { std::slice::from_raw_parts(p, n) }, b"hello rrk");
+        unsafe { rrk_buf_free(p, 0) }; // 故意传错
+
+        let (z, zn) = alloc_buf(Vec::new());
+        assert_eq!(zn, 0);
+        assert!(!z.is_null(), "零长缓冲也必须返回可释放的非空指针");
+        unsafe { rrk_buf_free(z, usize::MAX) };
+        unsafe { rrk_buf_free(std::ptr::null_mut(), usize::MAX) }; // NULL 仍安全
+    }
+
+    /// 深审 C2：真实 FFI 出口拿到的缓冲同样带 header，且数据区偏移正确。
+    #[test]
+    fn ffi_buffer_survives_wrong_host_len() {
+        unsafe {
+            assert_eq!(rrk_open_bytes(std::ptr::null(), 0, std::ptr::null(), 0), 0);
+            let mut p = std::ptr::null_mut::<u8>();
+            let mut n = 0usize;
+            assert_eq!(rrk_last_error(&mut p, &mut n), 0);
+            assert!(!p.is_null() && n > 0);
+            let msg = String::from_utf8_lossy(std::slice::from_raw_parts(p, n)).into_owned();
+            assert!(msg.contains("书数据为空"), "数据区偏移错位: {msg}");
+            rrk_buf_free(p, n + 4096);
+        }
     }
 
     /// 红线门禁：扫描本文件源码，逐个 C ABI 导出校验 catch_unwind 兜底存在——
@@ -1623,7 +1710,7 @@ fn layout_pages_cached(
     let content = book.load_chapter(chapter_id).map_err(set_kind)?;
     let pages = {
         let run = LayoutRun::begin(handle);
-        let mut guard = lock_recover(&layouter_slot());
+        let mut guard = acquire_layouter();
         let layouter = guard.get_or_insert_with(rrk_layout::Layouter::new);
         layouter
             .layout_cancellable(&content, style, vp, &run.token)
