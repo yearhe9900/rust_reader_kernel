@@ -23,7 +23,7 @@ use rrk_cache::{CacheKey, CacheKind};
 use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache};
 use rrk_markup::{attr, clean_xhtml, local_name, tokenize, CleanResult, Token};
 use rrk_model::{
-    fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
+    Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     Resource, ResourceKey, RrkError, RrkErrorKind, RrkResult, TocNode,
 };
 use rrk_txt::match_heading;
@@ -418,10 +418,12 @@ impl MobiBook {
     /// 装配 inflate 仍需逐次做，章内容切片依赖文本本体）。
     pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
         let bytes = src.read_all()?;
+        // 指纹取自原始文件全量（parse::parse 会按值消耗 bytes），
+        // 不再取「装配正文前 1MB」——后者漏掉后半部分改动。
+        let content_hash = rrk_format::content_fingerprint(&bytes);
         let container = parse::parse(bytes)?;
         let raw = assemble_text(&container)?;
         let raw_arc: Arc<[u8]> = Arc::from(raw);
-        let content_hash = fnv1a64(&raw_arc[..raw_arc.len().min(1024 * 1024)]);
 
         let key = CacheKey::content(content_hash, CacheKind::OpenMobi);
         let (spans, entries, toc) = match cache

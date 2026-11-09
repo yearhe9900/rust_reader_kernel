@@ -12,7 +12,7 @@ use rrk_cache::{CacheKey, CacheKind};
 use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache};
 use rrk_markup::{attr, clean_xhtml, local_name, tokenize, Token};
 use rrk_model::{
-    fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
+    Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     Inline, Resource, ResourceKey, RrkError, RrkResult, TocNode,
 };
 use rrk_zip::{ZipArchive, ZipEntry};
@@ -140,6 +140,10 @@ impl EpubBook {
     /// nav/NCX 解析、标题回填与正文前缀探测（open 期免重建）。
     pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
         let bytes = src.read_all()?;
+        // 内容版本指纹须在 bytes 被 ZipArchive::parse 消耗前，取原始文件全量：
+        // 旧口径只哈希 OPF 前 64KB，正文改动不会让持久化缓存失效，
+        // 重开会命中旧章表/旧章文本（用户读到旧内容）。
+        let content_hash = rrk_format::content_fingerprint(&bytes);
         let zip = Arc::new(ZipArchive::parse(bytes)?);
 
         // DRM 探测：正文被加密 → 明确拒绝（字体伪装除外，P0 一律拒绝 EncryptedData）
@@ -167,7 +171,6 @@ impl EpubBook {
         };
 
         let opf = parse_opf(&opf_xml);
-        let content_hash = fnv1a64(&opf_xml.as_bytes()[..opf_xml.len().min(64 * 1024)]);
 
         // spine 章 href 序（建索引不搬内容；同时是缓存章表的校验基线）
         let mut spine_hrefs = Vec::new();
@@ -1279,5 +1282,42 @@ mod tests {
         let items = parse_nav_toc(xml);
         let titles: Vec<_> = items.iter().map(|i| i.title.as_str()).collect();
         assert_eq!(titles, vec!["第一章", "无type宽容"], "landmarks/page-list 应被过滤: {titles:?}");
+    }
+
+    /// 回归（深审 A1）：**OPF 逐字节不变、只改章节正文**时，内容版本指纹必须改变。
+    /// 旧口径只哈希 OPF 前 64KB，两本书会同 key → 重开命中上一本的 open 索引
+    /// 与章文本缓存，用户读到旧内容。
+    #[test]
+    fn body_edit_changes_fingerprint_and_cache_key() {
+        use rrk_format::MemIndexCache;
+
+        fn epub_with_body(body: &str) -> Vec<u8> {
+            let ch1 = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>{body}</p></body></html>"#
+            );
+            build_zip(&[
+                ("META-INF/container.xml", CONTAINER.as_bytes()),
+                ("OEBPS/content.opf", OPF.as_bytes()), // 两本书完全相同
+                ("OEBPS/text/ch1.xhtml", ch1.as_bytes()),
+                ("OEBPS/images/pic.png", b"\x89PNG-fake"),
+                ("OEBPS/images/cover.jpg", b"\xff\xd8\xff-fake"),
+            ])
+        }
+
+        let cache = MemIndexCache::new();
+        let mk = |bytes: Vec<u8>| {
+            ContentSource::from_bytes(
+                Some("t.epub".to_string()),
+                Arc::<[u8]>::from(bytes.into_boxed_slice()),
+            )
+        };
+        let a = EpubBook::parse_with_cache(&mk(epub_with_body("原文内容")), &cache).unwrap();
+        let b = EpubBook::parse_with_cache(&mk(epub_with_body("改动之后的正文内容")), &cache).unwrap();
+        assert_ne!(
+            a.meta().content_hash, b.meta().content_hash,
+            "OPF 不变、正文改动也必须让 content_hash 改变"
+        );
+        assert_eq!((cache.hits(), cache.misses()), (0, 2), "改过内容不得命中旧 open 索引");
     }
 }

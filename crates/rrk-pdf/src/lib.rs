@@ -24,7 +24,7 @@ use objects::{Object, PdfDocument};
 use rrk_cache::{CacheKey, CacheKind};
 use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache, PagedSource};
 use rrk_model::{
-    fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
+    Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     Inline, PageEntry, PageKind, PagedContent, RenderResult, Resource, RrkError, RrkResult,
     TextRange, TocNode,
 };
@@ -112,7 +112,7 @@ impl PdfBook {
     /// Catalog 扫描、页面树遍历、逐页权重解引用与 outline 构建（open 期免重建）。
     pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
         let bytes = src.read_all()?;
-        let content_hash = fnv1a64(&bytes[..bytes.len().min(1024 * 1024)]);
+        let content_hash = rrk_format::content_fingerprint(&bytes);
         let doc = PdfDocument::open(bytes)?;
 
         // open 索引缓存（校验：页面源对象须在当前文档解出字典）

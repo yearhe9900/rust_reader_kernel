@@ -11,7 +11,7 @@ use std::sync::Arc;
 use rrk_cache::{CacheKey, CacheKind};
 use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndexCache, PagedSource};
 use rrk_model::{
-    fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
+    Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     PageEntry, PageKind, PagedContent, Resource, ResourceKey, RrkError, RrkResult, TocNode,
 };
 use rrk_zip::{ZipArchive, ZipEntry};
@@ -223,7 +223,9 @@ impl CbzBook {
     /// `collect_pages`（归一化/去重/自然序）与逐页尺寸头探测（限流 inflate）。
     pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
         let bytes = src.read_all()?;
-        let content_hash = fnv1a64(&bytes[..bytes.len().min(1024 * 1024)]);
+        // 全量内容版本指纹（含所有页字节）：只取前 1MB 时，改后面的页
+        // 不会让持久化页表缓存失效。
+        let content_hash = rrk_format::content_fingerprint(&bytes);
         let zip = Arc::new(ZipArchive::parse(bytes)?);
 
         let key = CacheKey::content(content_hash, CacheKind::OpenCbz);

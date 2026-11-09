@@ -12,7 +12,7 @@ use rrk_format::{BookSource, ContentSource, FormatAdapter, IndexCache, NullIndex
 
 mod codec;
 use rrk_model::{
-    fnv1a64, Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
+    Block, BookMeta, ChapterContent, ChapterEntry, ChapterId, ChapterKind, FormatId,
     Inline, Resource, ResourceKey, RrkError, RrkResult, StyleFlags, TextRange, TocNode,
 };
 
@@ -335,7 +335,7 @@ impl TxtBook {
             .map(|n| n.rsplit_once('.').map(|(s, _)| s).unwrap_or(n).to_string())
             .unwrap_or_else(|| "未命名".to_string());
 
-        let content_hash = fnv1a64(&bytes[..bytes.len().min(1024 * 1024)]);
+        let content_hash = rrk_format::content_fingerprint(&bytes);
         let entries = {
             let key = CacheKey::content(content_hash, CacheKind::OpenTxt);
             cache
@@ -856,7 +856,7 @@ mod tests {
         );
         let cache = MemIndexCache::new();
         let bytes = src.read_all().unwrap();
-        let key = CacheKey::content(fnv1a64(&bytes), CacheKind::OpenTxt);
+        let key = CacheKey::content(rrk_format::content_fingerprint(&bytes), CacheKind::OpenTxt);
         cache.save(&key, b"garbage-not-a-payload");
         let book = TxtBook::parse_with_cache(&src, &cache).unwrap();
         assert!(!book.entries.is_empty(), "损坏载荷应丢弃重算");
