@@ -235,6 +235,45 @@ impl Inline {
     }
 }
 
+/// 段落语义角色（深审 C5，ABI 13）：解析层只声明「这一段是什么」，
+/// **是否首行缩进由排版层按角色 + `StyleSpec.para_indent_em` 决定**。
+/// 取代原先解析层硬塞的 `indent: bool`（TXT/PDF/EPUB 三套启发式互不统一，
+/// 用户设置管不着它们）。新增角色只加枚举变体，不改 C 签名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParagraphRole {
+    /// 普通正文（默认参与首行缩进）。
+    #[default]
+    Body,
+    /// 章节/小节开首段；`<br>`、行内图片切段后的续段也归此类（不重复缩进）。
+    FirstOfSection,
+    Quote,
+    Verse,
+    /// 预格式化（保留换行、等宽、不缩进）。
+    Pre,
+    List,
+    Caption,
+}
+
+impl ParagraphRole {
+    /// 部件流 JSON 的稳定标签（只增不改；宿主未知值按 Body 兜底）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParagraphRole::Body => "body",
+            ParagraphRole::FirstOfSection => "first",
+            ParagraphRole::Quote => "quote",
+            ParagraphRole::Verse => "verse",
+            ParagraphRole::Pre => "pre",
+            ParagraphRole::List => "list",
+            ParagraphRole::Caption => "caption",
+        }
+    }
+
+    /// 默认是否吃 `para_indent_em`。排版层可据此叠加样式决策。
+    pub fn indentable(self) -> bool {
+        self == ParagraphRole::Body
+    }
+}
+
 /// 块级元素（所有格式的统一出口；排版层不感知格式）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
@@ -244,8 +283,8 @@ pub enum Block {
     },
     Paragraph {
         inlines: Vec<Inline>,
-        /// 首行缩进（CJK 习惯）。
-        indent: bool,
+        /// 语义角色（不直接等于「是否缩进」）。
+        role: ParagraphRole,
     },
     Image {
         key: ResourceKey,
@@ -311,7 +350,7 @@ pub const INLINE_IMAGE_MARKER: char = '\u{FFFC}';
 /// 扁平块：块树降维后的宿主可直接消费形态（引用块摊平、分割线丢弃）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlainBlock {
-    Paragraph { text: String, indent: bool },
+    Paragraph { text: String, role: ParagraphRole },
     Heading { level: u8, text: String },
     Image { key: ResourceKey, alt: Option<String> },
 }
@@ -417,11 +456,11 @@ fn flatten_impl(text: &str, blocks: &[Block], want_spans: bool) -> Vec<PlainText
     fn walk(text: &str, blocks: &[Block], want_spans: bool, out: &mut Vec<PlainTextBlock>) {
         for b in blocks {
             match b {
-                Block::Paragraph { inlines, indent } => {
+                Block::Paragraph { inlines, role } => {
                     let mut plain = String::new();
                     let spans = spans_of(text, inlines, &mut plain, want_spans);
                     out.push(PlainTextBlock {
-                        block: PlainBlock::Paragraph { text: plain, indent: *indent },
+                        block: PlainBlock::Paragraph { text: plain, role: *role },
                         spans,
                     });
                 }
@@ -510,7 +549,7 @@ pub enum TextPart {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartBlock {
     Heading { level: u8, parts: Vec<TextPart> },
-    Paragraph { indent: bool, parts: Vec<TextPart> },
+    Paragraph { role: ParagraphRole, parts: Vec<TextPart> },
     Image { key: ResourceKey, alt: Option<String> },
 }
 
@@ -520,8 +559,8 @@ pub fn block_parts(blocks: &[Block]) -> Vec<PartBlock> {
     fn walk(blocks: &[Block], out: &mut Vec<PartBlock>) {
         for b in blocks {
             match b {
-                Block::Paragraph { inlines, indent } => {
-                    out.push(PartBlock::Paragraph { indent: *indent, parts: parts_of(inlines) });
+                Block::Paragraph { inlines, role } => {
+                    out.push(PartBlock::Paragraph { role: *role, parts: parts_of(inlines) });
                 }
                 Block::Heading { level, inlines } => {
                     out.push(PartBlock::Heading { level: *level, parts: parts_of(inlines) });
@@ -735,7 +774,7 @@ mod tests {
             "Inline 变体清单变了：同步 variant_name 与所有消费方的穷举分支"
         );
         for i in &inline_variants {
-            let para = Block::Paragraph { inlines: vec![i.clone()], indent: false };
+            let para = Block::Paragraph { inlines: vec![i.clone()], role: ParagraphRole::FirstOfSection };
             let plain = flatten_blocks("abc", &[para.clone()]);
             assert_eq!(plain.len(), 1, "{} 应降维出一个块", i.variant_name());
             let text = match &plain[0] {
@@ -754,10 +793,10 @@ mod tests {
 
         let block_variants = vec![
             Block::Heading { level: 1, inlines: vec![txt.clone()] },
-            Block::Paragraph { inlines: vec![txt.clone()], indent: false },
+            Block::Paragraph { inlines: vec![txt.clone()], role: ParagraphRole::FirstOfSection },
             Block::Image { key: ResourceKey("b.jpg".into()), alt: None, size_hint: None },
             Block::Quote {
-                blocks: vec![Block::Paragraph { inlines: vec![txt.clone()], indent: false }],
+                blocks: vec![Block::Paragraph { inlines: vec![txt.clone()], role: ParagraphRole::FirstOfSection }],
             },
             Block::Divider,
         ];
@@ -795,8 +834,8 @@ mod tests {
             style: StyleFlags(0),
         };
         let blocks = vec![
-            Block::Paragraph { inlines: vec![txt(0, 9), img("a.png"), txt(9, 15)], indent: false },
-            Block::Quote { blocks: vec![Block::Paragraph { inlines: vec![txt(0, 6)], indent: true }] },
+            Block::Paragraph { inlines: vec![txt(0, 9), img("a.png"), txt(9, 15)], role: ParagraphRole::FirstOfSection },
+            Block::Quote { blocks: vec![Block::Paragraph { inlines: vec![txt(0, 6)], role: ParagraphRole::Body }] },
             Block::Divider,
             Block::Heading { level: 2, inlines: vec![txt(9, 12)] },
             Block::Image { key: ResourceKey("b.jpg".into()), alt: Some("图2".into()), size_hint: None },
@@ -807,10 +846,10 @@ mod tests {
         for (p, b) in parts.iter().zip(plain.iter()) {
             let rebuilt = match (p, b) {
                 (
-                    PartBlock::Paragraph { indent: pi, parts: pp },
-                    PlainBlock::Paragraph { indent: bi, .. },
+                    PartBlock::Paragraph { role: pr, parts: pp },
+                    PlainBlock::Paragraph { role: br, .. },
                 ) => {
-                    assert_eq!(pi, bi);
+                    assert_eq!(pr, br);
                     rebuild(&text, pp)
                 }
                 (
@@ -880,7 +919,7 @@ mod tests {
                 Inline::Image { key: ResourceKey("img1.png".into()) },
                 Inline::Text { range: TextRange::new(6, 18), style: StyleFlags(0) },
             ],
-            indent: true,
+            role: ParagraphRole::Body,
         }];
         let traced = flatten_blocks_spans(&text, &blocks);
         assert_eq!(traced.len(), 1);
@@ -917,14 +956,14 @@ mod tests {
                 level: 2,
                 inlines: vec![Inline::Text { range: TextRange::new(0, 6), style: StyleFlags(0) }],
             },
-            Block::Paragraph { inlines: para_inlines, indent: true },
+            Block::Paragraph { inlines: para_inlines, role: ParagraphRole::Body },
             Block::Quote {
                 blocks: vec![Block::Paragraph {
                     inlines: vec![Inline::Text {
                         range: TextRange::new(0, 6),
                         style: StyleFlags(0),
                     }],
-                    indent: false,
+                    role: ParagraphRole::FirstOfSection,
                 }],
             },
             Block::Divider,
@@ -941,8 +980,8 @@ mod tests {
             vec!["h", "p", "p", "img"]
         );
         match &flat[1] {
-            PlainBlock::Paragraph { text: t, indent } => {
-                assert!(*indent);
+            PlainBlock::Paragraph { text: t, role } => {
+                assert_eq!(*role, ParagraphRole::Body);
                 assert_eq!(t, "标题正文\u{FFFC}img1.png\u{FFFC}尾巴");
             }
             _ => panic!("第二块应为段落"),

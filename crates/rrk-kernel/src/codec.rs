@@ -11,7 +11,7 @@ use rrk_model::{
 use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"RRKM";
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2; // v2: Block::Paragraph 的 indent:bool → 语义角色标签
 
 // ---------------------------------------------------------------------------
 // 写端
@@ -220,13 +220,39 @@ fn read_inlines(r: &mut R) -> Option<Vec<Inline>> {
     Some(out)
 }
 
+/// 段落语义角色 ↔ payload 标签（只增不改；未知标签按 Body 兜底）。
+fn role_code(r: rrk_model::ParagraphRole) -> u8 {
+    match r {
+        rrk_model::ParagraphRole::Body => 0,
+        rrk_model::ParagraphRole::FirstOfSection => 1,
+        rrk_model::ParagraphRole::Quote => 2,
+        rrk_model::ParagraphRole::Verse => 3,
+        rrk_model::ParagraphRole::Pre => 4,
+        rrk_model::ParagraphRole::List => 5,
+        rrk_model::ParagraphRole::Caption => 6,
+    }
+}
+
+fn decode_role(v: u8) -> Option<rrk_model::ParagraphRole> {
+    Some(match v {
+        0 => rrk_model::ParagraphRole::Body,
+        1 => rrk_model::ParagraphRole::FirstOfSection,
+        2 => rrk_model::ParagraphRole::Quote,
+        3 => rrk_model::ParagraphRole::Verse,
+        4 => rrk_model::ParagraphRole::Pre,
+        5 => rrk_model::ParagraphRole::List,
+        6 => rrk_model::ParagraphRole::Caption,
+        _ => return None,
+    })
+}
+
 fn write_blocks(w: &mut W, blocks: &[Block]) {
     w.u32(blocks.len() as u32);
     for b in blocks {
         match b {
-            Block::Paragraph { inlines, indent } => {
+            Block::Paragraph { inlines, role } => {
                 w.u8(0);
-                w.bool(*indent);
+                w.u8(role_code(*role));
                 write_inlines(w, inlines);
             }
             Block::Heading { level, inlines } => {
@@ -265,9 +291,9 @@ fn read_blocks(r: &mut R) -> Option<Vec<Block>> {
     for _ in 0..n {
         match r.u8()? {
             0 => {
-                let indent = r.bool()?;
+                let role = decode_role(r.u8()?)?;
                 let inlines = read_inlines(r)?;
-                out.push(Block::Paragraph { inlines, indent });
+                out.push(Block::Paragraph { inlines, role });
             }
             1 => {
                 let level = r.u8()?;
@@ -408,7 +434,7 @@ mod tests {
                     Inline::Text { range: TextRange::new(0, 15), style: StyleFlags(1) },
                     Inline::Image { key: ResourceKey("img/a.png".to_string()) },
                 ],
-                indent: true,
+                role: rrk_model::ParagraphRole::Body,
             },
             Block::Heading { level: 2, inlines: vec![Inline::Text { range: TextRange::new(15, 21), style: StyleFlags(0) }] },
             Block::Quote { blocks: vec![Block::Divider, Block::Image { key: ResourceKey("img/b.jpg".to_string()), alt: Some("图 b".to_string()), size_hint: Some((100, 50)) }] },

@@ -496,20 +496,24 @@ fn ends_paragraph(line: &str) -> bool {
 ///
 /// 段落边界：空行，或行尾句读（中文 TXT 常见「一行一段」）；
 /// 否则视为硬折行并入同段。
+fn para_role(indent: bool) -> rrk_model::ParagraphRole {
+    if indent { rrk_model::ParagraphRole::Body } else { rrk_model::ParagraphRole::FirstOfSection }
+}
+
 fn build_blocks(body: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut para_start: Option<usize> = None;
     let mut para_end: usize = 0;
     let mut indent = false;
 
-    let flush = |blocks: &mut Vec<Block>, s: usize, e: usize, indent: bool| {
+    let flush = |blocks: &mut Vec<Block>, s: usize, e: usize, role: rrk_model::ParagraphRole| {
         if e > s {
             blocks.push(Block::Paragraph {
                 inlines: vec![Inline::Text {
                     range: TextRange::new(s as u32, e as u32),
                     style: StyleFlags::default(),
                 }],
-                indent,
+                role,
             });
         }
     };
@@ -532,7 +536,7 @@ fn build_blocks(body: &str) -> Vec<Block> {
         let content = trimmed.trim_start();
         if content.is_empty() {
             if let Some(s) = para_start.take() {
-                flush(&mut blocks, s, para_end, indent);
+                flush(&mut blocks, s, para_end, para_role(indent));
             }
             continue;
         }
@@ -540,7 +544,7 @@ fn build_blocks(body: &str) -> Vec<Block> {
         if para_start.is_some() {
             // 同段续行（硬折行）：并入
             para_end = le;
-            indent = indent || line_indent;
+            indent = indent || line_indent; // 段内任一缩进行即标记 Body
         } else {
             para_start = Some(ls + (trimmed.len() - content.len()));
             para_end = le;
@@ -549,12 +553,12 @@ fn build_blocks(body: &str) -> Vec<Block> {
         // 行尾句读 = 段落收尾（一行一段的常见中文排版）
         if ends_paragraph(line) {
             if let Some(s) = para_start.take() {
-                flush(&mut blocks, s, para_end, indent);
+                flush(&mut blocks, s, para_end, para_role(indent));
             }
         }
     }
     if let Some(s) = para_start.take() {
-        flush(&mut blocks, s, para_end, indent);
+        flush(&mut blocks, s, para_end, para_role(indent));
     }
     blocks
 }

@@ -29,7 +29,7 @@ pub struct StyleSpec {
     pub line_height: f32,
     /// 首行缩进，单位 em（基准 = `font_size`；CJK 习惯 2）。
     ///
-    /// 仅对 `Block::Paragraph { indent: true }` 生效；0 = 不缩进。
+    /// 仅对语义角色为 `Body` 的段落生效（由排版层判定）；0 = 不缩进。
     /// 该值已进 `style_hash`，改动即精确失效布局缓存。
     pub para_indent_em: f32,
     /// 对齐方式（见 [`Align`]）。
@@ -85,6 +85,12 @@ pub struct TextRun {
     pub width: f32,
     /// 文本范围（章文本 UTF-8 字节偏移）。
     pub range: (u32, u32),
+    /// cluster 边界表：`(章文本 UTF-8 字节偏移, 相对 run.x 的像素 x)`，按 x 升序。
+    ///
+    /// 深审 A2 彻底解（schema 3）：偏移全部是 parley 给出的字素边界，天然合法
+    /// UTF-8 char boundary；`hit_test` 直接查表即可定位，不再为吸附边界而载章。
+    /// 旧 schema 缓存解码时会被整体丢弃重算，故本字段恒非空（空 run 除外）。
+    pub clusters: Vec<(u32, f32)>,
 }
 
 /// 图片占位。
@@ -124,7 +130,7 @@ pub enum RenderResult {
 // ---------------------------------------------------------------------------
 
 const RLAY_MAGIC: &[u8; 4] = b"RLAY";
-const RLAY_SCHEMA: u32 = 2; // v2: 新增 TextRun.width（v1 解码器不认 → 丢弃重算，安全）
+const RLAY_SCHEMA: u32 = 3; // v3: TextRun 新增 cluster 边界表；旧 payload 整体丢弃重算
 
 struct W(Vec<u8>);
 impl W {
@@ -193,6 +199,11 @@ pub fn encode_pages(pages: &[LayoutPage]) -> Vec<u8> {
             w.u32(r.range.0);
             w.u32(r.range.1);
             w.f32(r.width);
+            w.u32(r.clusters.len() as u32);
+            for &(off, cx) in &r.clusters {
+                w.u32(off);
+                w.f32(cx);
+            }
         }
         w.u32(p.images.len() as u32);
         for im in &p.images {
@@ -215,7 +226,8 @@ pub fn decode_pages(data: &[u8]) -> Option<Vec<LayoutPage>> {
     }
     r.p = 4;
     let schema = r.u32()?;
-    if schema != 1 && schema != RLAY_SCHEMA {
+    // 旧 schema 一律丢弃重算（缓存自带版本隔离，无需向后兼容解码）
+    if schema != RLAY_SCHEMA {
         return None;
     }
     let n = r.u32()? as usize;
@@ -254,8 +266,15 @@ pub fn decode_pages(data: &[u8]) -> Option<Vec<LayoutPage>> {
             let font_size = r.f32()?;
             let flags = r.u8()?;
             let range = (r.u32()?, r.u32()?);
-            // v2 新增字段；v1 缺省为 0（调用方需容错）
-            let width = if schema >= 2 { r.f32()? } else { 0.0 };
+            let width = r.f32()?;
+            let nc = r.u32()? as usize;
+            if nc > 1_000_000 {
+                return None;
+            }
+            let mut clusters = Vec::with_capacity(nc);
+            for _ in 0..nc {
+                clusters.push((r.u32()?, r.f32()?));
+            }
             runs.push(TextRun {
                 line,
                 x,
@@ -265,6 +284,7 @@ pub fn decode_pages(data: &[u8]) -> Option<Vec<LayoutPage>> {
                 italic: flags & 1 != 0,
                 width,
                 range,
+                clusters,
             });
         }
         let ni = r.u32()? as usize;
@@ -352,6 +372,7 @@ mod tests {
                 italic: false,
                 range: (10, 50),
                 width: 40.0,
+                clusters: vec![(10, 0.0), (30, 20.0), (50, 40.0)],
             }],
             images: vec![PlacedImage {
                 key: ResourceKey("img/1.png".into()),

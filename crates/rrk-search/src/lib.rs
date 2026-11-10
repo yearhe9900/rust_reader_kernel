@@ -566,7 +566,7 @@ mod tests {
                 text: Arc::clone(&t),
                 blocks: vec![Block::Paragraph {
                     inlines: vec![Inline::Text { range: TextRange::new(0, len), style: StyleFlags(0) }],
-                    indent: true,
+                    role: rrk_model::ParagraphRole::Body,
                 }],
                 link_ranges: Vec::new(),
             })
@@ -676,11 +676,11 @@ mod tests {
                     Inline::Image { key: ResourceKey("pic9.png".into()) },
                     Inline::Text { range: TextRange::new(0, 6), style: StyleFlags(0) },
                 ],
-                indent: false,
+                role: rrk_model::ParagraphRole::FirstOfSection,
             },
             Block::Paragraph {
                 inlines: vec![Inline::Text { range: TextRange::new(6, 12), style: StyleFlags(0) }],
-                indent: false,
+                role: rrk_model::ParagraphRole::FirstOfSection,
             },
             Block::Image { key: ResourceKey("body.png".into()), alt: None, size_hint: None },
         ];

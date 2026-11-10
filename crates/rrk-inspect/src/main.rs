@@ -149,8 +149,8 @@ fn run() -> Result<(), String> {
                 Block::Heading { level, inlines } => {
                     println!("  [{i:>3}] H{level} {}", preview_inline(&content.text, inlines, 60));
                 }
-                Block::Paragraph { inlines, indent } => {
-                    let mark = if *indent { "¶*" } else { "¶ " };
+                Block::Paragraph { inlines, role } => {
+                    let mark = if role.indentable() { "¶*" } else { "¶ " };
                     println!("  [{i:>3}] {mark} {}", preview_inline(&content.text, inlines, 60));
                 }
                 Block::Image { key, size_hint, .. } => {

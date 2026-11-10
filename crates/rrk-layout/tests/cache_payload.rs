@@ -23,6 +23,7 @@ fn layout_payload_survives_disk_cache() {
             italic: false,
             width: 42.0,
             range: (0, 42),
+            clusters: vec![(0, 0.0), (42, 42.0)],
         }],
         images: vec![],
         height: 842.0,

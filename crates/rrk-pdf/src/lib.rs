@@ -289,7 +289,11 @@ fn paragraphs_to_blocks(text: &str) -> Vec<Block> {
                 range: TextRange::new(s as u32, e as u32),
                 style: Default::default(),
             }],
-            indent: trimmed.starts_with('　') || trimmed.starts_with("  "),
+            role: if trimmed.starts_with('　') || trimmed.starts_with("  ") {
+                rrk_model::ParagraphRole::Body
+            } else {
+                rrk_model::ParagraphRole::FirstOfSection
+            },
         });
     }
     blocks

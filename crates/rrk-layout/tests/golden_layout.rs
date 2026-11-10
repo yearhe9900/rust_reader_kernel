@@ -62,7 +62,12 @@ impl ChapterBuilder {
                 ),
             });
         }
-        self.blocks.push(Block::Paragraph { inlines, indent });
+        let role = if indent {
+            rrk_model::ParagraphRole::Body
+        } else {
+            rrk_model::ParagraphRole::FirstOfSection
+        };
+        self.blocks.push(Block::Paragraph { inlines, role });
         self
     }
 
@@ -92,7 +97,7 @@ impl ChapterBuilder {
                     range: TextRange::new(start, self.text.len() as u32),
                     style: StyleFlags::default(),
                 }],
-                indent: false,
+                role: rrk_model::ParagraphRole::FirstOfSection,
             }],
         });
         self

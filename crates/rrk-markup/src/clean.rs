@@ -59,7 +59,8 @@ struct Cleaner {
     /// 当前块是否允许首行缩进（正文 `<p>/div/section/article` 为 true；
     /// 列表/引用/代码/表格为 false）。**flush 一次即清零**：`<br>` 与行内
     /// `<img>` 会把同一段切成多个 Paragraph，后续切片不得重复缩进。
-    block_indent: bool,
+    /// 当前块的语义角色（`flush` 一次后归 FirstOfSection，避免续段重复缩进）。
+    block_role: rrk_model::ParagraphRole,
 }
 
 impl Cleaner {
@@ -108,10 +109,10 @@ impl Cleaner {
 
     fn flush(&mut self) {
         self.last_was_ws = false;
-        // 一个块只缩进一次：取走即清零，`<br>` / 行内 `<img>` 切出的
-        // 后续 Paragraph 不会重复缩进。
-        let indent = self.block_indent;
-        self.block_indent = false;
+        // 一个块只声明一次语义角色；`<br>` / 行内 `<img>` 切出的续段
+        // 归 FirstOfSection，排版层据此不再二次缩进。
+        let role = self.block_role;
+        self.block_role = rrk_model::ParagraphRole::FirstOfSection;
         if self.pending.is_empty() {
             self.has_content = false;
             return;
@@ -130,7 +131,7 @@ impl Cleaner {
         }
         let block = match self.heading_level.take() {
             Some(level) => Block::Heading { level, inlines },
-            None => Block::Paragraph { inlines, indent },
+            None => Block::Paragraph { inlines, role },
         };
         self.out.blocks.push(block);
     }
@@ -152,7 +153,7 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
         has_content: false,
         last_was_ws: false,
         link_stack: Vec::new(),
-        block_indent: false,
+        block_role: rrk_model::ParagraphRole::FirstOfSection,
     };
 
     for token in tokenize(html) {
@@ -231,20 +232,24 @@ pub fn clean_xhtml(html: &str) -> CleanResult {
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                         c.flush();
                         c.heading_level = Some(n[1..2].parse().unwrap_or(1));
-                        c.block_indent = false;
+                        c.block_role = rrk_model::ParagraphRole::FirstOfSection;
                     }
-                    // 正文块：首行缩进交给 `StyleSpec.para_indent_em`（用户可调）。
-                    // 旧实现 flush 恒 `indent:false`，EPUB/MOBI 正文永远不吃该设置，
-                    // 只有 TXT/PDF 靠启发式猜出来的块能生效。
+                    // 正文块：只声明「Body」，是否首行缩进由排版层按
+                    // StyleSpec.para_indent_em 决定（深审 C5）。
                     "p" | "div" | "section" | "article" => {
                         c.flush();
-                        c.block_indent = true;
+                        c.block_role = rrk_model::ParagraphRole::Body;
                     }
-                    // 列表/引用/代码/表格：不做首行缩进（保真度细化属深审 C5/C6）。
+                    // 列表/引用/代码/表格：各自带语义角色，排版层默认不缩进。
                     "li" | "tr" | "td" | "blockquote" | "header" | "footer" | "pre"
                     | "table" | "ul" | "ol" => {
                         c.flush();
-                        c.block_indent = false;
+                        c.block_role = match n {
+                            "li" | "ul" | "ol" => rrk_model::ParagraphRole::List,
+                            "blockquote" => rrk_model::ParagraphRole::Quote,
+                            "pre" => rrk_model::ParagraphRole::Pre,
+                            _ => rrk_model::ParagraphRole::Caption,
+                        };
                     }
                     "strong" | "b" => c.bold_depth += 1,
                     "em" | "i" => c.italic_depth += 1,
@@ -438,7 +443,7 @@ mod tests {
                 .blocks
                 .iter()
                 .filter_map(|b| match b {
-                    Block::Paragraph { indent, .. } => Some(*indent),
+                    Block::Paragraph { role, .. } => Some(role.indentable()),
                     _ => None,
                 })
                 .collect()

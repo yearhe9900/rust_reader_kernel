@@ -89,8 +89,8 @@ impl Layouter {
                 return Err(RrkError::new(RrkErrorKind::Cancelled, "排版已取消"));
             }
             match block {
-                Block::Paragraph { inlines, indent } => {
-                    self.layout_inlines(content, inlines, style, false, *indent, width, 1.0, &mut flat);
+                Block::Paragraph { inlines, role } => {
+                    self.layout_inlines(content, inlines, style, false, *role, width, 1.0, &mut flat);
                 }
                 Block::Heading { level, inlines } => {
                     // 只缩放字号（旧实现 clone 整个 StyleSpec：每次标题一次字体族 String 分配）
@@ -99,7 +99,7 @@ impl Layouter {
                         inlines,
                         style,
                         true,
-                        false,
+                        rrk_model::ParagraphRole::FirstOfSection,
                         width,
                         heading_scale(*level),
                         &mut flat,
@@ -116,8 +116,8 @@ impl Layouter {
                 }
                 Block::Quote { blocks } => {
                     for b in blocks {
-                        if let Block::Paragraph { inlines, .. } = b {
-                            self.layout_inlines(content, inlines, style, false, true, width, 1.0, &mut flat);
+                        if let Block::Paragraph { inlines, role } = b {
+                            self.layout_inlines(content, inlines, style, false, *role, width, 1.0, &mut flat);
                         }
                     }
                 }
@@ -137,7 +137,7 @@ impl Layouter {
         inlines: &[Inline],
         style: &StyleSpec,
         is_heading: bool,
-        indent: bool,
+        role: rrk_model::ParagraphRole,
         width: f32,
         scale: f32,
         out: &mut Vec<FlatLine>,
@@ -169,6 +169,9 @@ impl Layouter {
         }
         let font_size = style.font_size * scale;
 
+        // 深审 C5：缩进是**排版层决策**——解析层只给语义角色，
+        // 这里按角色 + 用户设置的 para_indent_em 决定是否插入前缀。
+        let indent = role.indentable() && style.para_indent_em > 0.0;
         // 首行缩进：em → 前缀空格（全角 1em / 半角 en space 0.5em），
         // 让断行宽度真实扣除缩进；同时记下缩进像素宽，供 run.x 补偿（见下）。
         let (prefix, indent_px) = if indent {
@@ -234,6 +237,24 @@ impl Layouter {
                     let x = if at_para_head { gr.offset() + indent_px } else { gr.offset() };
                     let (bold_mask, italic_mask) =
                         FlatRun::style_masks(range.start, range.end, spans_buf);
+                    // 深审 A2：从 parley 的 cluster 直接取字素边界 + 累加 advance，
+                    // 得到「像素 x → 合法 UTF-8 字节偏移」表；hit_test 查表即准，
+                    // 不再需要载章做 is_char_boundary 吸附。
+                    // cluster.text_range() 以 full（含缩进前缀）为坐标，需扣掉 shift；
+                    // 首个正文 cluster 的 x 归零，让后续位置相对 run.x 起算。
+                    let mut cx = 0.0f32;
+                    let mut origin: Option<f32> = None;
+                    let mut clusters: Vec<(u32, f32)> = Vec::new();
+                    for cl in run.visual_clusters() {
+                        let tr = cl.text_range();
+                        if tr.start >= shift as usize {
+                            let off = base_offset + (tr.start as u32).saturating_sub(shift);
+                            let o = *origin.get_or_insert(cx);
+                            clusters.push((off, cx - o));
+                        }
+                        cx += cl.advance();
+                    }
+                    clusters.sort_by(|a, b| a.1.total_cmp(&b.1));
                     runs.push(FlatRun {
                         x,
                         // parley 的 metrics.baseline 是布局坐标系（累计）——
@@ -243,6 +264,7 @@ impl Layouter {
                         start: base_offset + (range.start as u32).saturating_sub(shift),
                         end: base_offset + (range.end as u32).saturating_sub(shift),
                         width: run.advance(),
+                        clusters,
                         bold_mask,
                         italic_mask,
                     });
@@ -325,6 +347,8 @@ struct FlatRun {
     end: u32,
     /// run 像素宽度（parley advance），供 hit_test 按比例定位光标。
     width: f32,
+    /// cluster 边界表（章文本字节偏移, 相对 run.x 的像素 x），按 x 升序。
+    clusters: Vec<(u32, f32)>,
     /// 逐字节样式覆盖：真值当且仅当该字节落在某个粗体/斜体 span 内
     /// （span 输入已知；parley 的 Run 不暴露样式，故用覆盖而非读回）。
     bold_mask: Vec<bool>,
@@ -407,6 +431,7 @@ fn paginate(flat: Vec<FlatLine>, chapter: ChapterId, page_height: f32) -> Vec<La
                         italic,
                         range: (r.start, r.end),
                         width: r.width,
+                        clusters: r.clusters.clone(),
                     });
                 }
                 cur.end = SemanticPos { chapter, char_offset: end };
@@ -479,14 +504,14 @@ mod tests {
                     range: TextRange::new(0, long.len() as u32),
                     style: StyleFlags::default(),
                 }],
-                indent: true,
+                role: rrk_model::ParagraphRole::Body,
             },
             Block::Paragraph {
                 inlines: vec![Inline::Text {
                     range: TextRange::new(long.len() as u32, text.len() as u32),
                     style: StyleFlags::default(),
                 }],
-                indent: true,
+                role: rrk_model::ParagraphRole::Body,
             },
         ];
         ChapterContent { id: 0, text, blocks, link_ranges: Vec::new() }
@@ -533,7 +558,7 @@ mod tests {
                 },
                 Inline::Text { range: TextRange::new(i1 as u32, text.len() as u32), style: StyleFlags::default() },
             ],
-            indent: false,
+            role: rrk_model::ParagraphRole::FirstOfSection,
         }];
         let c = ChapterContent { id: 0, text, blocks, link_ranges: Vec::new() };
         let vp = Viewport { width: 390.0, height: 400.0, dpr: 3.0 };

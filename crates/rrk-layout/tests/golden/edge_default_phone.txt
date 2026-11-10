@@ -1,15 +1,14 @@
 == edge_default_phone ==
 pages: 1
-page 0 [0..307) lines=9 runs=15 images=0 height=842.000
+page 0 [0..307) lines=8 runs=14 images=0 height=842.000
   line 0 [0..12) h=46.080 para=1
   line 1 [12..69) h=29.000 para=1
   line 2 [69..108) h=29.000 para=0
   line 3 [108..109) h=29.000 para=1
   line 4 [109..144) h=29.000 para=1
   line 5 [144..190) h=29.000 para=0
-  line 6 [190..247) h=29.000 para=1
-  line 7 [247..253) h=29.000 para=0
-  line 8 [253..307) h=29.000 para=1
+  line 6 [190..253) h=29.000 para=1
+  line 7 [253..307) h=29.000 para=1
     run l=0 x=0.000 base=35.000 fs=28.800 [0..12)
     run l=1 x=36.000 base=68.080 fs=18.000 [12..12)
     run l=1 x=36.000 base=68.080 fs=18.000 [12..27)
@@ -22,6 +21,5 @@ page 0 [0..307) lines=9 runs=15 images=0 height=842.000
     run l=5 x=0.000 base=184.080 fs=18.000 [144..145)
     run l=5 x=9.990 base=184.080 fs=18.000 [145..165)
     run l=5 x=152.154 base=184.080 fs=18.000 [165..190)
-    run l=6 x=36.000 base=213.080 fs=18.000 [190..247)
-    run l=7 x=0.000 base=242.080 fs=18.000 [247..253)
-    run l=8 x=36.000 base=271.080 fs=18.000 [253..307)
+    run l=6 x=0.000 base=213.080 fs=18.000 [190..253)
+    run l=7 x=36.000 base=242.080 fs=18.000 [253..307)
