@@ -70,9 +70,9 @@ fn assemble_text(c: &MobiContainer) -> RrkResult<Vec<u8>> {
         return Err(RrkError::unsupported("MOBI: 加密书籍不支持"));
     }
     let mut huff = if c.compression == COMPRESSION_HUFF_CDIC {
-        let mut h = HuffCdic::load_huff(c.record(c.huffcdic as usize)?)?;
+        let mut h = HuffCdic::load_huff(&c.record(c.huffcdic as usize)?)?;
         for i in 1..c.num_huffcdic as usize {
-            h.load_cdic(c.record(c.huffcdic as usize + i)?)?;
+            h.load_cdic(&c.record(c.huffcdic as usize + i)?)?;
         }
         Some(h)
     } else {
@@ -83,7 +83,7 @@ fn assemble_text(c: &MobiContainer) -> RrkResult<Vec<u8>> {
     let mut decoded = Vec::new();
     for i in 0..c.text_record_count as usize {
         let raw = c.record(i + 1)?;
-        let raw = remove_trailing_entries(raw, c.trailing_flags);
+        let raw = remove_trailing_entries(&raw, c.trailing_flags);
         raw_concat.extend_from_slice(raw);
         let chunk = match c.compression {
             COMPRESSION_NONE => raw.to_vec(),
@@ -417,20 +417,12 @@ impl MobiBook {
     /// 分段扫描、逐章清洗推导标题与 filepos 锚点扫描（open 期免重建；正文
     /// 装配 inflate 仍需逐次做，章内容切片依赖文本本体）。
     pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
-        // 批次 5：内容版本指纹走流式全量哈希（峰值 1 MiB，与整包哈希同值，
-        // 路径/内存源共享缓存键）。MOBI 解析需全文（PDB 结构 + 资源记录 +
-        // 装配全文），故内容仍整包读入——读取与指纹统一走 to_source()/
-        // SourceReader 按需读路径。
+        // 批次 5 深改：内容版本指纹走流式全量哈希（峰值 1 MiB，与整包哈希同值，
+        // 路径/内存源共享缓存键）；MOBI 解析改走按需读——parse::parse(src)
+        // 只驻留 header 字段 + 装配全文，原始字节（含资源记录）按需读、读完即弃，
+        // 不再整包驻留（实测 2× 内容驻留降到 ~1×）。
         let content_hash = src.content_fingerprint()?;
-        let source = src.to_source()?;
-        // 读入解析所需全部字节（SourceReader 按需读路径）。
-        let mut buf = Vec::with_capacity(source.len() as usize);
-        {
-            let mut reader = rrk_source::SourceReader::new(source);
-            std::io::Read::read_to_end(&mut reader, &mut buf)?;
-        }
-        let bytes = Arc::<[u8]>::from(buf);
-        let container = parse::parse(bytes)?;
+        let container = parse::parse(src.to_source()?)?;
         let raw = assemble_text(&container)?;
         let raw_arc: Arc<[u8]> = Arc::from(raw);
 
@@ -483,7 +475,7 @@ impl MobiBook {
                 let ncx = container
                     .exth_uint(121)
                     .and_then(|rec| container.record(rec as usize).ok())
-                    .map(|r| parse_ncx_toc(&parse::decode_text(r, container.text_encoding)))
+                    .map(|r| parse_ncx_toc(&parse::decode_text(&r, container.text_encoding)))
                     .filter(|v| !v.is_empty())
                     .unwrap_or_default();
                 let items: Vec<(usize, String, usize)> = if ncx.is_empty() {
@@ -574,7 +566,7 @@ impl MobiBook {
     }
 
     /// 资源记录号 → 记录切片。
-    fn resource_record(&self, index: u32) -> RrkResult<&[u8]> {
+    fn resource_record(&self, index: u32) -> RrkResult<Vec<u8>> {
         self.container.record(index as usize)
     }
 
@@ -584,7 +576,7 @@ impl MobiBook {
         let total = self.container.record_offsets.len();
         for i in start..total {
             if let Ok(d) = self.container.record(i) {
-                if looks_like_image(d) {
+                if looks_like_image(&d) {
                     return Some(i as u32);
                 }
             }
@@ -700,7 +692,7 @@ impl BookSource for MobiBook {
         let data = self.resource_record(index)?;
         Ok(Resource {
             key: key.clone(),
-            mime: sniff_mime(data).to_string(),
+            mime: sniff_mime(&data).to_string(),
             data: Arc::from(data),
         })
     }

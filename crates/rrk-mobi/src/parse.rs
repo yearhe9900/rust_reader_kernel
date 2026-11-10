@@ -8,14 +8,20 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rrk_model::{RrkError, RrkResult};
+use rrk_source::ByteSource;
 
 pub const COMPRESSION_NONE: u16 = 1;
 pub const COMPRESSION_PALMDOC: u16 = 2;
 pub const COMPRESSION_HUFF_CDIC: u16 = 17_480;
 
 /// MOBI/PalmDB 容器（只读视图：不解压、不切分）。
+///
+/// 批次 5 深改：原先持整包 `bytes: Arc<[u8]>`（供 `record()` 切片），
+/// 现改为按需读取的 `src: Arc<dyn ByteSource>`——`record()` 按偏移从源
+/// 拉取，**不再整包驻留**。原始字节（含资源记录）按需读、读完即弃；
+/// 稳态内存只剩 header 字段 + 装配全文（供章切片）。
 pub struct MobiContainer {
-    pub bytes: Arc<[u8]>,
+    pub src: Arc<dyn ByteSource>,
     pub compression: u16,
     pub text_length: u32,
     pub text_record_count: u16,
@@ -52,8 +58,11 @@ fn opt32(r0: &[u8], off: usize) -> u32 {
 }
 
 impl MobiContainer {
-    /// 记录 [index] 的字节切片。
-    pub fn record(&self, index: usize) -> RrkResult<&[u8]> {
+    /// 记录 [index] 的字节（**按需从源读取**，返回 owned `Vec<u8>`）。
+    ///
+    /// 批次 5 深改：原先返回 `&[u8]`（借自整包 `bytes`），现按偏移从
+    /// `src.read_at` 拉取——**不驻留整包**，读完即弃。峰值内存 = 单条记录。
+    pub fn record(&self, index: usize) -> RrkResult<Vec<u8>> {
         let start = *self
             .record_offsets
             .get(index)
@@ -62,11 +71,11 @@ impl MobiContainer {
             .record_offsets
             .get(index + 1)
             .map(|&x| x as usize)
-            .unwrap_or(self.bytes.len());
-        if end <= start || end > self.bytes.len() {
+            .unwrap_or(self.src.len() as usize);
+        if end <= start || end as u64 > self.src.len() {
             return Err(RrkError::corrupt(format!("MOBI: 记录范围非法 {index}")));
         }
-        Ok(&self.bytes[start..end])
+        self.src.read_at(start as u64, end - start)
     }
 
     /// EXTH 文本值（UTF-8 优先，失败退 latin1）。
@@ -92,22 +101,44 @@ impl MobiContainer {
 }
 
 /// 解析 PalmDB 记录表 + 头结构；`magic` 已由嗅探把关，这里做结构校验。
-pub fn parse(bytes: Arc<[u8]>) -> RrkResult<MobiContainer> {
-    if bytes.len() < 100 {
+pub fn parse(src: Arc<dyn ByteSource>) -> RrkResult<MobiContainer> {
+    let total = src.len();
+    if total < 100 {
         return Err(RrkError::corrupt("MOBI: 文件过小"));
     }
-    let record_count = be16(&bytes, 76) as usize;
-    if record_count == 0 || 78 + record_count * 8 > bytes.len() {
+    // PalmDB 头（0..78）：记录数在偏移 76（按需读，不驻留整包）
+    let hdr = src.read_at(0, 78)?;
+    if hdr.len() < 78 {
+        return Err(RrkError::corrupt("MOBI: PDB 头截断"));
+    }
+    let record_count = be16(&hdr, 76) as usize;
+    if record_count == 0 || 78 + record_count * 8 > total as usize {
         return Err(RrkError::corrupt("MOBI: PDB 记录表越界"));
     }
+    // 记录偏移表（按需读）
+    let off_table = src.read_at(78, record_count * 8)?;
+    if off_table.len() < record_count * 8 {
+        return Err(RrkError::corrupt("MOBI: PDB 记录表截断"));
+    }
     let record_offsets: Vec<u32> = (0..record_count)
-        .map(|i| be32(&bytes, 78 + i * 8))
+        .map(|i| be32(&off_table, i * 8))
         .collect();
     let record_zero = record_offsets[0] as usize;
-    if record_zero + 24 > bytes.len() {
+    if record_zero + 24 > total as usize {
         return Err(RrkError::corrupt("MOBI: 记录 0 越界"));
     }
-    let r0 = &bytes[record_zero..];
+    // 记录 0（PalmDOC/MOBI 头 + EXTH）：按需读；r0 保持 &[u8] 视图，
+    // 字段提取逻辑与旧实现逐字一致（EXTH 在记录 0 内）。
+    let r0_len = record_offsets
+        .get(1)
+        .map(|&x| (x as usize).saturating_sub(record_zero))
+        .unwrap_or((total as usize).saturating_sub(record_zero))
+        .max(24);
+    let r0_vec = src.read_at(record_zero as u64, r0_len)?;
+    if r0_vec.len() < 24 {
+        return Err(RrkError::corrupt("MOBI: 记录 0 过短"));
+    }
+    let r0: &[u8] = &r0_vec;
 
     let compression = be16(r0, 0);
     let text_length = be32(r0, 4);
@@ -130,11 +161,13 @@ pub fn parse(bytes: Arc<[u8]>) -> RrkResult<MobiContainer> {
     let exth_flags = opt32(r0, 128);
     let trailing_flags = opt32(r0, 240);
 
-    let title_end = record_zero.saturating_add(title_offset).saturating_add(title_length);
-    let full_name = if title_offset > 0 && title_length > 0 && title_end <= bytes.len() {
-        let raw = &bytes[record_zero + title_offset..title_end];
+    // 标题：按需读（fullNameOffset 相对记录 0，可能跨记录边界，直接从源拉取）
+    let title_start = (record_zero as u64) + (title_offset as u64);
+    let title_end = title_start + (title_length as u64);
+    let full_name = if title_offset > 0 && title_length > 0 && title_end <= total {
+        let raw = src.read_at(title_start, title_length)?;
         // 真实书 titleLength 常含尾部 NUL——不剔会把 "书名\0" 直接交给 UI
-        Some(decode_text(raw, text_encoding).trim_end_matches('\0').to_string())
+        Some(decode_text(&raw, text_encoding).trim_end_matches('\0').to_string())
     } else {
         None
     };
@@ -169,7 +202,7 @@ pub fn parse(bytes: Arc<[u8]>) -> RrkResult<MobiContainer> {
         .map(|delta| resource_start.saturating_add(delta));
 
     Ok(MobiContainer {
-        bytes,
+        src,
         compression,
         text_length,
         text_record_count,
@@ -226,7 +259,7 @@ mod tests {
     #[test]
     fn short_record0_defaults_not_panic() {
         // 回归（审计 #1）：原实现在 record0 < 244B 时仍按偏移 240 直读 → 越界 panic。
-        let c = parse(Arc::from(mini_pdb(24))).unwrap();
+        let c = parse(Arc::new(rrk_source::MemSource::new(Arc::from(mini_pdb(24))))).unwrap();
         assert_eq!(c.trailing_flags, 0);
         assert_eq!(c.text_encoding, 0);
         assert!(c.full_name.is_none());
@@ -234,7 +267,7 @@ mod tests {
 
     #[test]
     fn record0_too_short_errors() {
-        assert!(parse(Arc::from(mini_pdb(16))).is_err());
+        assert!(parse(Arc::new(rrk_source::MemSource::new(Arc::from(mini_pdb(16))))).is_err());
     }
 
     #[test]
@@ -253,7 +286,7 @@ mod tests {
         b[e + 12..e + 16].copy_from_slice(&201u32.to_be_bytes());
         b[e + 16..e + 20].copy_from_slice(&12u32.to_be_bytes());
         b[e + 20..e + 24].copy_from_slice(&0x200u32.to_be_bytes());
-        let c = parse(Arc::from(b)).unwrap();
+        let c = parse(Arc::new(rrk_source::MemSource::new(Arc::from(b)))).unwrap();
         // 0xFFFFFF00 + 0x200 饱和到 0xFFFFFFFF；裸 u32 加法在 debug 构建会
         // 直接 panic、release 会回绕成 0x100（错记录号）——本断言守饱和语义。
         assert_eq!(c.cover_record, Some(0xFFFF_FFFF));

@@ -37,7 +37,7 @@
 | PDF 渲染深化 | XObject 解码缓存、裁剪 bbox | ✅ 已落地（`Stream.data`→`Arc` 深拷贝优化让位于解码缓存，收益等价） |
 | cbindgen + 头文件校验 | 自动生成 C 头 + CI 漂移/语法校验 | ✅ 已落地 |
 | CI 产物签名/发布自动化 | tag → 三平台构建 + Release 附件 | ✅ 已落地（GPG 签 SHA256SUMS 已接；平台证书签名——Apple Developer / Azure Trusted Signing——待主体验证与证书托管） |
-| 流式 IO / 按需读取 | **深审 B1 ②**：zip 只驻留中央目录、条目按需读；路径源不再 `std::fs::read` 整包；内容指纹流式哈希 | ✅ EPUB/CBZ 已落地（新增 `rrk-source` crate；37 MiB CBZ 开书 RSS 增量 0.72%）；✅ TXT/MOBI 已迁 `to_source()`/流式指纹（解析需全文驻留，内存不变，重在统一 IO/哈希口径；MOBI 实测 2× 驻留，深改 container→ByteSource 可砍到 ~1× 待做）；⏳ PDF 暂保留整包（顺序扫全文件，留待后续批次） |
+| 流式 IO / 按需读取 | **深审 B1 ②**：zip 只驻留中央目录、条目按需读；路径源不再 `std::fs::read` 整包；内容指纹流式哈希 | ✅ EPUB/CBZ 已落地（新增 `rrk-source` crate；37 MiB CBZ 开书 RSS 增量 0.72%）；✅ MOBI 深改 container→ByteSource（23 MiB 书 RSS 从 200%→100%，`record()` 按需读不驻留原始字节）；✅ TXT 已迁 to_source/流式指纹（解码需全文，内存不变，统一口径）；⏳ PDF 暂保留整包（顺序扫全文件，留待后续批次） |
 
 ## 语义承诺（对接方可依赖）
 
