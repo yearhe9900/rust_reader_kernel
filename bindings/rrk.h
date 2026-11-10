@@ -19,7 +19,7 @@
 //       取消令牌、句柄 generation 防 ABA、锁中毒自恢复、重活出锁）；
 // v12 = `rrk_open_bytes`（内存开书）/ `rrk_open_index_cache_configure`
 //       （open 索引缓存独立开关）/ `rrk_cache_set_disk_limit`（磁盘配额）。
-#define RRK_ABI_VERSION 12
+#define RRK_ABI_VERSION 13
 
 // panic 被捕获时的错误码。
 #define ERR_PANIC 2001
@@ -27,6 +27,12 @@
 // 书句柄（0 = 非法）。本地定义（与 `rrk_kernel::BookHandle` 透明等价）：
 // cbindgen `parse_deps=false` 看不到依赖 crate 里的别名，必须在本 crate 可见。
 typedef uint64_t BookHandle;
+
+// 样式句柄（0 = 无效）。
+typedef uint64_t StyleHandle;
+
+// 视口句柄（0 = 无效）。
+typedef uint64_t ViewportHandle;
 
 // 检索会话句柄（0 = 非法）。
 typedef uint64_t SearchId;
@@ -128,6 +134,44 @@ uint32_t rrk_load_resource(BookHandle handle,
                            uint8_t **out_ptr,
                            uintptr_t *out_len);
 
+// 创建样式句柄（一次性传全部初始字段；之后用 setter 改）。
+uint64_t rrk_style_create(const uint8_t *font_ptr,
+                          uintptr_t font_len,
+                          float font_size,
+                          float line_height,
+                          float para_indent_em,
+                          uint32_t align);
+
+// 释放样式句柄（槽位标记代数 0 = 空闲，可复用）。
+uint32_t rrk_style_destroy(StyleHandle handle);
+
+// 设置字体族（UTF-8；传空串 = 恢复默认系统字体栈）。
+uint32_t rrk_style_set_font_family(StyleHandle handle, const uint8_t *font_ptr, uintptr_t font_len);
+
+// 设置字号（pt）。
+uint32_t rrk_style_set_font_size(StyleHandle handle, float font_size);
+
+// 设置行高倍数。
+uint32_t rrk_style_set_line_height(StyleHandle handle, float line_height);
+
+// 设置首行缩进 em 数（0 = 不缩进）。
+uint32_t rrk_style_set_para_indent_em(StyleHandle handle, float para_indent_em);
+
+// 设置对齐（0=Start 1=Center 2=End 3=Justify）。
+uint32_t rrk_style_set_align(StyleHandle handle, uint32_t align);
+
+// 创建视口句柄（CSS 像素尺寸 + dpr）。
+uint64_t rrk_viewport_create(float width, float height, float dpr);
+
+// 释放视口句柄。
+uint32_t rrk_viewport_destroy(ViewportHandle handle);
+
+// 更新视口尺寸（窗口旋转 / 分屏；dpr 不变）。
+uint32_t rrk_viewport_set_size(ViewportHandle handle, float width, float height);
+
+// 更新视口 dpr。
+uint32_t rrk_viewport_set_dpr(ViewportHandle handle, float dpr);
+
 // 配置三要素缓存（目录 + 内存上限字节；传空路径 = 关闭磁盘缓存）。
 uint32_t rrk_cache_configure(const uint8_t *dir_ptr, uintptr_t dir_len, uintptr_t mem_bytes);
 
@@ -207,15 +251,8 @@ uint32_t rrk_load_headings(BookHandle handle,
 // 排版一章 → 页 JSON（三要素缓存口径：命中免排版；miss 排完落盘 + 保护窗口）。
 uint32_t rrk_pages_json(BookHandle handle,
                         uint32_t chapter_id,
-                        const uint8_t *font_ptr,
-                        uintptr_t font_len,
-                        float font_size,
-                        float line_height,
-                        float para_indent_em,
-                        uint32_t align,
-                        float width,
-                        float height,
-                        float dpr,
+                        StyleHandle style,
+                        ViewportHandle viewport,
                         uint8_t **out_ptr,
                         uintptr_t *out_len);
 
@@ -223,15 +260,8 @@ uint32_t rrk_pages_json(BookHandle handle,
 uint32_t rrk_page_at(BookHandle handle,
                      uint32_t chapter_id,
                      uint32_t char_offset,
-                     const uint8_t *font_ptr,
-                     uintptr_t font_len,
-                     float font_size,
-                     float line_height,
-                     float para_indent_em,
-                     uint32_t align,
-                     float width,
-                     float height,
-                     float dpr,
+                     StyleHandle style,
+                     ViewportHandle viewport,
                      uint32_t *out_page);
 
 // 页内命中测试：(页内 x, y) → 语义偏移（run 级粒度 + run 内比例）。
@@ -240,15 +270,8 @@ uint32_t rrk_hit_test(BookHandle handle,
                       uint32_t page_index,
                       float x,
                       float y,
-                      const uint8_t *font_ptr,
-                      uintptr_t font_len,
-                      float font_size,
-                      float line_height,
-                      float para_indent_em,
-                      uint32_t align,
-                      float width,
-                      float height,
-                      float dpr,
+                      StyleHandle style,
+                      ViewportHandle viewport,
                       uint8_t **out_ptr,
                       uintptr_t *out_len);
 
@@ -266,15 +289,8 @@ uint32_t rrk_layout_cancel_book(BookHandle handle);
 // 远跳预取：预热本章布局 + 保护窗口（当前章 + 相邻章）。
 uint32_t rrk_prefetch(BookHandle handle,
                       uint32_t chapter_id,
-                      const uint8_t *font_ptr,
-                      uintptr_t font_len,
-                      float font_size,
-                      float line_height,
-                      float para_indent_em,
-                      uint32_t align,
-                      float width,
-                      float height,
-                      float dpr);
+                      StyleHandle style,
+                      ViewportHandle viewport);
 
 // 只读图片头取尺寸：成功 → `{"width","height","format","mime"}` + code 0；
 // 无法识别（含空指针/畸形）→ code 2，不产出缓冲。

@@ -46,7 +46,7 @@ use rrk_model::{
 ///       取消令牌、句柄 generation 防 ABA、锁中毒自恢复、重活出锁）；
 /// v12 = `rrk_open_bytes`（内存开书）/ `rrk_open_index_cache_configure`
 ///       （open 索引缓存独立开关）/ `rrk_cache_set_disk_limit`（磁盘配额）。
-pub const RRK_ABI_VERSION: u32 = 12;
+pub const RRK_ABI_VERSION: u32 = 13;
 
 /// panic 被捕获时的错误码。
 pub const ERR_PANIC: u32 = 2001;
@@ -166,6 +166,19 @@ fn guard_val<T>(fallback: T, f: impl FnOnce() -> T) -> T {
 /// 统一 panic 兜底（u32 出口）：任何 panic → 2001 + 线程局部错误。
 fn guard(f: impl FnOnce() -> Result<u32, u32>) -> u32 {
     guard_val(ERR_PANIC, || f().unwrap_or_else(|code| code))
+}
+
+/// 统一 panic 兜底（u64 出口：句柄类）。句柄出口的失败约定是 **0 = 无效**
+/// （错误详情仍经 `rrk_last_error` 取），故 panic 兜底也返回 0。
+fn guard_handle(f: impl FnOnce() -> Result<u64, u32>) -> u64 {
+    guard_val(0u64, || match f() {
+        Ok(v) => v,
+        Err(code) => {
+            // 错误码已由 set_kind 写入 LAST_ERROR；句柄出口返回 0 表示无效
+            let _ = code;
+            0
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +442,7 @@ fn chapters_json(entries: &[ChapterEntry]) -> Vec<u8> {
 /// `\u{FFFC}key\u{FFFC}` 标记），与旧格式的 `text` 逐字节一致（rrk-model 单测钉死）：
 ///
 /// ```json
-/// [{"type":"p","indent":true,"parts":[[0,24],["img/a.png"],[24,36]]},
+/// [{"type":"p","indent":true,"role":"body","parts":[[0,24],["img/a.png"],[24,36]]},
 ///  {"type":"h","level":2,"parts":[[0,10]]},
 ///  {"type":"img","key":"img/b.jpg","alt":null}]
 /// ```
@@ -449,9 +462,13 @@ fn blocks_json(_text: &str, blocks: &[Block]) -> Vec<u8> {
                 write_parts(parts, &mut s);
                 s.push('}');
             }
-            rrk_model::PartBlock::Paragraph { indent, parts } => {
+            rrk_model::PartBlock::Paragraph { role, parts } => {
+                // ABI 13：新增语义角色；`indent` 仍由排版层判定后透出，
+                // 旧宿主读它不受影响（只增字段，不改语义）。
                 s.push_str("{\"type\":\"p\",\"indent\":");
-                s.push_str(if *indent { "true" } else { "false" });
+                s.push_str(if role.indentable() { "true" } else { "false" });
+                s.push_str(",\"role\":");
+                json_str(role.as_str(), &mut s);
                 s.push_str(",\"parts\":");
                 write_parts(parts, &mut s);
                 s.push('}');
@@ -752,7 +769,7 @@ mod tests {
                         range: TextRange::new(0, 12),
                         style: StyleFlags(0),
                     }],
-                    indent: false,
+                    role: rrk_model::ParagraphRole::FirstOfSection,
                 }],
             },
             Block::Divider,
@@ -818,10 +835,19 @@ mod tests {
         assert_eq!(ok, Ok(7u32), "锁中毒后引擎不得永久瘫痪（必须自动恢复）");
     }
 
+    /// 全局布局登记表的**测试串行锁**。
+    ///
+    /// `rrk_layout_cancel()` 是「取消全部」语义，会清掉登记表里**所有**在飞布局
+    /// ——包括别的测试刚登记的。两个用例都碰这张表时，并发跑会互相误杀
+    /// （`cancel_book_scoped_to_one_book` 的 B 会被另一用例的全局取消打掉），
+    /// 表现为偶发红。故涉及该表的用例统一取这把锁串行执行。
+    static LAYOUT_TABLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// 回归 §二.3（转正）：另一布局的启动不得吞掉在飞布局 A 的取消——
     /// per-request 令牌下 B 的登记不影响 A（原全局 swap 复现已不存在）。
     #[test]
     fn cancel_token_not_eaten_by_other_layout_start() {
+        let _g = lock_recover(&LAYOUT_TABLE_TEST_LOCK);
         let a = LayoutRun::begin(1);
         let _b = LayoutRun::begin(2); // B 启动（登记）
         rrk_layout_cancel(); // 宿主取消全部
@@ -833,6 +859,7 @@ mod tests {
     /// 不误杀其它窗口/预取。
     #[test]
     fn cancel_book_scoped_to_one_book() {
+        let _g = lock_recover(&LAYOUT_TABLE_TEST_LOCK);
         let a = LayoutRun::begin(11);
         let b = LayoutRun::begin(22);
         assert_eq!(rrk_layout_cancel_book(11), 0);
@@ -840,61 +867,127 @@ mod tests {
         assert!(!b.token.load(Ordering::Relaxed), "cancel_book(11) 不得误杀他书布局");
     }
 
-    /// 回归 §三（hit_test 精度）：定位数学纯函数——按真实 run 宽比例插值，
+    /// 回归 §三（hit_test 精度）：定位数学纯函数——查页内 cluster 边界表，
     /// 越界钳制正确（旧实现硬编码 20px/字、3 字节/字，西文/其它字号全错）。
+    ///
+    /// 深审 A2 彻底解后口径从「按字节比例插值」换成「查 cluster 表」：
+    /// cluster 表本身就是合法 UTF-8 边界表，命中即精确，不再二次吸附。
     #[test]
-    fn hit_test_run_offset_interpolates_by_width() {
+    fn hit_test_run_offset_uses_cluster_table() {
         use rrk_model::TextRun;
+        // ASCII 30 字节、每 10 字节一个 cluster（x 间隔 10px）
+        let ascii_clusters: Vec<(u32, f32)> = (0..30).step_by(10).map(|i| (i, i as f32)).collect();
         let runs = vec![
-            TextRun { line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 100.0, range: (0, 30) },
-            TextRun { line: 0, x: 100.0, baseline: 0.0, font_size: 16.0, bold: true, italic: false, width: 50.0, range: (30, 60) },
-            TextRun { line: 1, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 100.0, range: (60, 90) },
+            TextRun { line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 100.0, range: (0, 30), clusters: ascii_clusters.clone() },
+            TextRun { line: 0, x: 100.0, baseline: 0.0, font_size: 16.0, bold: true, italic: false, width: 50.0, range: (30, 60), clusters: vec![(30, 0.0), (45, 25.0), (60, 50.0)] },
+            TextRun { line: 1, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 100.0, range: (60, 90), clusters: vec![] },
         ];
         let line0 = (0, 60);
-        let ascii = "a".repeat(90); // 纯 ASCII：每个字节都是合法边界，旧断言不变
-        // run 内中点 → 区间中点（100px 宽 / 30 字节 → 半宽 15 字节）
-        assert_eq!(run_offset_at(50.0, &runs, 0, line0, &ascii), 15);
-        // 跨 run：x=125 在第二 run 中点 → 30 + 15 = 45
-        assert_eq!(run_offset_at(125.0, &runs, 0, line0, &ascii), 45);
+        // run 内：x=55 → 最后一个 cx<=55 的 cluster 是 (20, 50) → 偏移 20
+        assert_eq!(run_offset_at(55.0, &runs, 0, line0), 20);
+        // 跨 run：x=125 在第二 run（x=100 起）→ x_rel=25 → cluster (45,25) → 45
+        assert_eq!(run_offset_at(125.0, &runs, 0, line0), 45);
         // x 在行首前 → 行首；x 超最右 run → 行末
-        assert_eq!(run_offset_at(-5.0, &runs, 0, line0, &ascii), 0);
-        assert_eq!(run_offset_at(9999.0, &runs, 0, line0, &ascii), 60);
-        // 无宽度（v1 旧缓存）：退化为 run 起点，不 panic 不越界
-        let w0 = vec![TextRun { line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 0.0, range: (0, 30) }];
-        assert_eq!(run_offset_at(15.0, &w0, 0, (0, 30), &ascii), 0);
+        assert_eq!(run_offset_at(-5.0, &runs, 0, line0), 0);
+        assert_eq!(run_offset_at(9999.0, &runs, 0, line0), 60);
+        // 无 cluster 表（防御性路径）：退化为 run 起点，不 panic 不越界
+        let w0 = vec![TextRun { line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false, italic: false, width: 0.0, range: (0, 30), clusters: vec![] }];
+        assert_eq!(run_offset_at(15.0, &w0, 0, (0, 30)), 0);
     }
 
-    /// 回归（深审 A2）：按字节比例插值不得把落点放在 UTF-8 字符中间。
+    /// 回归（深审 A2）：查 cluster 表不得把落点放在 UTF-8 字符中间。
     /// 中文 3 字节、emoji 4 字节——旧实现返回 5/16/29 这类非法边界，
     /// 宿主拿来切片会 panic（被 guard 兜成 2001）。
     #[test]
-    fn hit_test_snaps_to_utf8_char_boundary() {
+    fn hit_test_cluster_offsets_are_char_boundaries() {
         use rrk_model::TextRun;
         let text = "甲乙丙丁戊己庚辛壬癸"; // 10 个汉字 = 30 字节
         assert_eq!(text.len(), 30);
+        // cluster 表：每个汉字一个边界（偏移 i*3，x = i*9，即每字 9px 宽）
+        let clusters: Vec<(u32, f32)> = (0..10).map(|i| (i as u32 * 3, i as f32 * 9.0)).collect();
         let runs = vec![TextRun {
             line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false,
-            italic: false, width: 90.0, range: (0, 30),
+            italic: false, width: 90.0, range: (0, 30), clusters: clusters.clone(),
         }];
-        // ratio = x/90 → off = x/3；向下吸附到 3 的倍数
-        assert_eq!(run_offset_at(15.0, &runs, 0, (0, 30), text), 3, "5 应回退到 3");
-        assert_eq!(run_offset_at(45.0, &runs, 0, (0, 30), text), 15, "15 已是边界");
-        assert_eq!(run_offset_at(50.0, &runs, 0, (0, 30), text), 15, "16 应回退到 15");
-        assert_eq!(run_offset_at(89.0, &runs, 0, (0, 30), text), 27, "29 应回退到 27");
+        // x=15 落在第 2 个字内（x 9..18）→ 落点左侧最近的合法边界 = 偏移 3
+        assert_eq!(run_offset_at(15.0, &runs, 0, (0, 30)), 3);
+        // x=45 正落在第 6 个字起点（x=45）→ 偏移 15
+        assert_eq!(run_offset_at(45.0, &runs, 0, (0, 30)), 15);
         // 行末与越界钳制也必须合法
-        assert_eq!(run_offset_at(9999.0, &runs, 0, (0, 30), text), 30);
+        assert_eq!(run_offset_at(9999.0, &runs, 0, (0, 30)), 30);
 
         // emoji 4 字节：任意落点都必须是合法边界
         let emoji = "😀😀😀😀😀";
         assert_eq!(emoji.len(), 20);
+        let eclusters: Vec<(u32, f32)> = (0..5).map(|i| (i as u32 * 4, i as f32 * 20.0)).collect();
         let eruns = vec![TextRun {
             line: 0, x: 0.0, baseline: 0.0, font_size: 16.0, bold: false,
-            italic: false, width: 100.0, range: (0, 20),
+            italic: false, width: 100.0, range: (0, 20), clusters: eclusters,
         }];
         for x in [1.0, 13.0, 27.0, 51.0, 77.0, 99.0] {
-            let off = run_offset_at(x, &eruns, 0, (0, 20), emoji);
+            let off = run_offset_at(x, &eruns, 0, (0, 20));
             assert!(emoji.is_char_boundary(off as usize), "x={x} → {off} 非字符边界");
         }
+    }
+
+    /// 回归（深审 B2，ABI 13）：样式/视口句柄——
+    /// 创建 → setter 改字段 → 排版出口读到改后的值 → 释放后句柄失效。
+    #[test]
+    fn style_and_viewport_handles_roundtrip() {
+        // 创建：字号 18、行高 1.6、缩进 2em、Start 对齐
+        let h = unsafe { rrk_style_create(std::ptr::null(), 0, 18.0, 1.6, 2.0, 0) };
+        assert_ne!(h, 0, "样式句柄创建失败");
+        let spec = style_spec_of(h).expect("句柄应可解析");
+        assert_eq!(spec.font_size, 18.0);
+        assert_eq!(spec.line_height, 1.6);
+        assert_eq!(spec.para_indent_em, 2.0);
+        assert_eq!(spec.align, rrk_model::Align::Start);
+
+        // setter 生效（不重建句柄 = ABI 13 的核心收益）
+        assert_eq!(rrk_style_set_font_size(h, 24.0), 0);
+        assert_eq!(rrk_style_set_line_height(h, 2.0), 0);
+        assert_eq!(rrk_style_set_para_indent_em(h, 0.0), 0);
+        assert_eq!(rrk_style_set_align(h, 3), 0);
+        let spec = style_spec_of(h).expect("句柄应仍有效");
+        assert_eq!(spec.font_size, 24.0);
+        assert_eq!(spec.line_height, 2.0);
+        assert_eq!(spec.para_indent_em, 0.0);
+        assert_eq!(spec.align, rrk_model::Align::Justify);
+
+        // 视口句柄：创建 → 改尺寸/dpr
+        let v = rrk_viewport_create(390.0, 842.0, 3.0);
+        assert_ne!(v, 0, "视口句柄创建失败");
+        assert_eq!(viewport_of(v).unwrap().width, 390.0);
+        assert_eq!(rrk_viewport_set_size(v, 768.0, 500.0), 0);
+        assert_eq!(rrk_viewport_set_dpr(v, 2.0), 0);
+        let vp = viewport_of(v).unwrap();
+        assert_eq!((vp.width, vp.height, vp.dpr), (768.0, 500.0, 2.0));
+
+        // 释放后句柄失效（代数不匹配 → 报错，不是读到脏数据）
+        assert_eq!(rrk_style_destroy(h), 0);
+        assert!(style_spec_of(h).is_err(), "释放后的样式句柄必须失效");
+        assert_eq!(rrk_viewport_destroy(v), 0);
+        assert!(viewport_of(v).is_err(), "释放后的视口句柄必须失效");
+
+        // 句柄 0 = 无效
+        assert!(style_spec_of(0).is_err());
+        assert!(viewport_of(0).is_err());
+    }
+
+    /// 回归（深审 B2）：销毁后复用槽位，旧句柄不得「复活」读到新样式
+    /// （代数防 ABA）。
+    #[test]
+    fn style_handle_generation_prevents_stale_reuse() {
+        let a = unsafe { rrk_style_create(std::ptr::null(), 0, 18.0, 1.6, 2.0, 0) };
+        assert_ne!(a, 0);
+        assert_eq!(rrk_style_destroy(a), 0);
+        // 新句柄会复用同一槽位，但代数不同 → 旧句柄仍失效
+        let b = unsafe { rrk_style_create(std::ptr::null(), 0, 30.0, 1.6, 2.0, 0) };
+        assert_ne!(b, 0);
+        assert_ne!(a, b, "代数不同 → 句柄值必不同");
+        assert!(style_spec_of(a).is_err(), "旧句柄不得因槽位复用而复活");
+        assert_eq!(style_spec_of(b).unwrap().font_size, 30.0);
+        assert_eq!(rrk_style_destroy(b), 0);
     }
 
     /// 回归 §二.3：布局结束（drop）后从登记表移除，不泄漏。
@@ -1139,6 +1232,7 @@ mod tests {
             assert!(
                 body.contains("guard(")
                     || body.contains("guard_val(")
+                    || body.contains("guard_handle(")
                     || body.contains("catch_unwind"),
                 "导出函数 {name}（第 {} 行）缺 catch_unwind 兜底",
                 i + 1
@@ -1323,6 +1417,322 @@ fn style_of(
     st.para_indent_em = para_indent_em.max(0.0);
     st.align = align_of(align);
     st
+}
+
+// ---------------------------------------------------------------------------
+// 样式 / 视口句柄（ABI 13：排版参数句柄化）
+// ---------------------------------------------------------------------------
+//
+// 深审 B2：旧版四个排版出口（pages_json / page_at / hit_test / prefetch）各自
+// 重复 9 个排版参数（font_ptr/font_len/font_size/line_height/para_indent_em/
+// align/width/height/dpr）。加一个样式字段（如 letter_spacing）要同步改
+// 4 个 C 签名 + 头文件 + 全部宿主调用点——演进成本全压在边界上。
+//
+// 现在改成**不透明句柄**：
+//   - `rrk_style_create(...)` → StyleHandle（宿主可复用同一份样式，免重复传参）
+//   - `rrk_style_set_*(handle, ...)` → 以后加样式字段 = 加 setter，**签名不动**
+//   - `rrk_viewport_create(...)` → ViewportHandle（视口随窗口尺寸变化，独立生命周期）
+//   - 四个排版出口只接 (style, viewport) 两个句柄
+//
+// 句柄是**纯值**（u64 索引 + 代数防 ABA），不透明：宿主不解释其内部。
+
+/// 样式句柄（0 = 无效）。
+pub type StyleHandle = u64;
+/// 视口句柄（0 = 无效）。
+pub type ViewportHandle = u64;
+
+/// 样式/视口句柄表（进程级；样式与视口都是小对象，宿主按需创建）。
+struct StyleSlot {
+    generation: u64,
+    spec: rrk_model::StyleSpec,
+}
+
+struct ViewportSlot {
+    generation: u64,
+    vp: rrk_model::Viewport,
+}
+
+static STYLES: OnceLock<Mutex<Vec<StyleSlot>>> = OnceLock::new();
+static VIEWPORTS: OnceLock<Mutex<Vec<ViewportSlot>>> = OnceLock::new();
+static STYLE_NEXT_GEN: AtomicU64 = AtomicU64::new(1);
+static VIEWPORT_NEXT_GEN: AtomicU64 = AtomicU64::new(1);
+
+fn styles_table() -> &'static Mutex<Vec<StyleSlot>> {
+    STYLES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn viewports_table() -> &'static Mutex<Vec<ViewportSlot>> {
+    VIEWPORTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 句柄编码：低 32 位 = 槽位下标，高 32 位 = 代数（防 ABA：槽位复用后旧句柄失效）。
+fn encode_slot(index: usize, generation: u64) -> u64 {
+    ((generation as u64) << 32) | (index as u64 & 0xFFFF_FFFF)
+}
+
+/// 样式句柄 → StyleSpec（拷贝一份交给调用方，避免持锁跨排版）。
+fn style_spec_of(handle: StyleHandle) -> Result<rrk_model::StyleSpec, u32> {
+    if handle == 0 {
+        return Err(set_kind(RrkError::invalid("样式句柄为 0")));
+    }
+    let index = (handle & 0xFFFF_FFFF) as usize;
+    let generation = handle >> 32;
+    let table = lock_recover(styles_table());
+    let slot = table.get(index).ok_or_else(|| set_kind(RrkError::invalid("样式句柄越界")))?;
+    if slot.generation != generation {
+        return Err(set_kind(RrkError::invalid("样式句柄已失效（代数不匹配）")));
+    }
+    Ok(slot.spec.clone())
+}
+
+/// 视口句柄 → Viewport（拷贝）。
+fn viewport_of(handle: ViewportHandle) -> Result<rrk_model::Viewport, u32> {
+    if handle == 0 {
+        return Err(set_kind(RrkError::invalid("视口句柄为 0")));
+    }
+    let index = (handle & 0xFFFF_FFFF) as usize;
+    let generation = handle >> 32;
+    let table = lock_recover(viewports_table());
+    let slot = table.get(index).ok_or_else(|| set_kind(RrkError::invalid("视口句柄越界")))?;
+    if slot.generation != generation {
+        return Err(set_kind(RrkError::invalid("视口句柄已失效（代数不匹配）")));
+    }
+    Ok(slot.vp)
+}
+
+/// 创建样式句柄（一次性传全部初始字段；之后用 setter 改）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_style_create(
+    font_ptr: *const u8,
+    font_len: usize,
+    font_size: f32,
+    line_height: f32,
+    para_indent_em: f32,
+    align: u32,
+) -> u64 {
+    guard_handle(|| {
+        let font_family = if font_ptr.is_null() || font_len == 0 {
+            String::new()
+        } else {
+            match std::str::from_utf8(std::slice::from_raw_parts(font_ptr, font_len)) {
+                Ok(s) => s.to_string(),
+                Err(e) => return Err(set_kind(RrkError::invalid(format!("字体名非 UTF-8: {e}")))),
+            }
+        };
+        let spec = style_of(&font_family, font_size, line_height, para_indent_em, align);
+        let generation = STYLE_NEXT_GEN.fetch_add(1, Ordering::Relaxed);
+        let mut table = lock_recover(styles_table());
+        // 优先复用空槽（释放过的），否则追加
+        let index = match table.iter().position(|s| s.generation == 0) {
+            Some(i) => i,
+            None => {
+                table.push(StyleSlot { generation: 0, spec: spec.clone() });
+                table.len() - 1
+            }
+        };
+        table[index] = StyleSlot { generation, spec };
+        Ok(encode_slot(index, generation))
+    })
+}
+
+/// 释放样式句柄（槽位标记代数 0 = 空闲，可复用）。
+#[no_mangle]
+pub extern "C" fn rrk_style_destroy(handle: StyleHandle) -> u32 {
+    guard(|| {
+        if handle == 0 {
+            return Ok(0);
+        }
+        let index = (handle & 0xFFFF_FFFF) as usize;
+        let generation = handle >> 32;
+        let mut table = lock_recover(styles_table());
+        if let Some(slot) = table.get_mut(index) {
+            if slot.generation == generation {
+                slot.generation = 0;
+            }
+        }
+        Ok(0)
+    })
+}
+
+/// 设置字体族（UTF-8；传空串 = 恢复默认系统字体栈）。
+#[no_mangle]
+pub unsafe extern "C" fn rrk_style_set_font_family(
+    handle: StyleHandle,
+    font_ptr: *const u8,
+    font_len: usize,
+) -> u32 {
+    guard(|| {
+        let font_family = if font_ptr.is_null() || font_len == 0 {
+            String::new()
+        } else {
+            match std::str::from_utf8(std::slice::from_raw_parts(font_ptr, font_len)) {
+                Ok(s) => s.to_string(),
+                Err(e) => return Err(set_kind(RrkError::invalid(format!("字体名非 UTF-8: {e}")))),
+            }
+        };
+        let mut table = lock_recover(styles_table());
+        let index = (handle & 0xFFFF_FFFF) as usize;
+        let generation = handle >> 32;
+        let slot = table
+            .get_mut(index)
+            .ok_or_else(|| set_kind(RrkError::invalid("样式句柄越界")))?;
+        if slot.generation != generation {
+            return Err(set_kind(RrkError::invalid("样式句柄已失效（代数不匹配）")));
+        }
+        slot.spec.font_family = font_family;
+        Ok(0)
+    })
+}
+
+/// 设置字号（pt）。
+#[no_mangle]
+pub extern "C" fn rrk_style_set_font_size(handle: StyleHandle, font_size: f32) -> u32 {
+    guard(|| {
+        let mut table = lock_recover(styles_table());
+        let index = (handle & 0xFFFF_FFFF) as usize;
+        let generation = handle >> 32;
+        let slot = table
+            .get_mut(index)
+            .ok_or_else(|| set_kind(RrkError::invalid("样式句柄越界")))?;
+        if slot.generation != generation {
+            return Err(set_kind(RrkError::invalid("样式句柄已失效（代数不匹配）")));
+        }
+        slot.spec.font_size = font_size;
+        Ok(0)
+    })
+}
+
+/// 设置行高倍数。
+#[no_mangle]
+pub extern "C" fn rrk_style_set_line_height(handle: StyleHandle, line_height: f32) -> u32 {
+    guard(|| {
+        let mut table = lock_recover(styles_table());
+        let index = (handle & 0xFFFF_FFFF) as usize;
+        let generation = handle >> 32;
+        let slot = table
+            .get_mut(index)
+            .ok_or_else(|| set_kind(RrkError::invalid("样式句柄越界")))?;
+        if slot.generation != generation {
+            return Err(set_kind(RrkError::invalid("样式句柄已失效（代数不匹配）")));
+        }
+        slot.spec.line_height = line_height;
+        Ok(0)
+    })
+}
+
+/// 设置首行缩进 em 数（0 = 不缩进）。
+#[no_mangle]
+pub extern "C" fn rrk_style_set_para_indent_em(handle: StyleHandle, para_indent_em: f32) -> u32 {
+    guard(|| {
+        let mut table = lock_recover(styles_table());
+        let index = (handle & 0xFFFF_FFFF) as usize;
+        let generation = handle >> 32;
+        let slot = table
+            .get_mut(index)
+            .ok_or_else(|| set_kind(RrkError::invalid("样式句柄越界")))?;
+        if slot.generation != generation {
+            return Err(set_kind(RrkError::invalid("样式句柄已失效（代数不匹配）")));
+        }
+        slot.spec.para_indent_em = para_indent_em.max(0.0);
+        Ok(0)
+    })
+}
+
+/// 设置对齐（0=Start 1=Center 2=End 3=Justify）。
+#[no_mangle]
+pub extern "C" fn rrk_style_set_align(handle: StyleHandle, align: u32) -> u32 {
+    guard(|| {
+        let mut table = lock_recover(styles_table());
+        let index = (handle & 0xFFFF_FFFF) as usize;
+        let generation = handle >> 32;
+        let slot = table
+            .get_mut(index)
+            .ok_or_else(|| set_kind(RrkError::invalid("样式句柄越界")))?;
+        if slot.generation != generation {
+            return Err(set_kind(RrkError::invalid("样式句柄已失效（代数不匹配）")));
+        }
+        slot.spec.align = align_of(align);
+        Ok(0)
+    })
+}
+
+/// 创建视口句柄（CSS 像素尺寸 + dpr）。
+#[no_mangle]
+pub extern "C" fn rrk_viewport_create(width: f32, height: f32, dpr: f32) -> u64 {
+    guard_handle(|| {
+        let vp = rrk_model::Viewport { width, height, dpr };
+        let generation = VIEWPORT_NEXT_GEN.fetch_add(1, Ordering::Relaxed);
+        let mut table = lock_recover(viewports_table());
+        let index = match table.iter().position(|s| s.generation == 0) {
+            Some(i) => i,
+            None => {
+                table.push(ViewportSlot { generation: 0, vp });
+                table.len() - 1
+            }
+        };
+        table[index] = ViewportSlot { generation, vp };
+        Ok(encode_slot(index, generation))
+    })
+}
+
+/// 释放视口句柄。
+#[no_mangle]
+pub extern "C" fn rrk_viewport_destroy(handle: ViewportHandle) -> u32 {
+    guard(|| {
+        if handle == 0 {
+            return Ok(0);
+        }
+        let index = (handle & 0xFFFF_FFFF) as usize;
+        let generation = handle >> 32;
+        let mut table = lock_recover(viewports_table());
+        if let Some(slot) = table.get_mut(index) {
+            if slot.generation == generation {
+                slot.generation = 0;
+            }
+        }
+        Ok(0)
+    })
+}
+
+/// 更新视口尺寸（窗口旋转 / 分屏；dpr 不变）。
+#[no_mangle]
+pub extern "C" fn rrk_viewport_set_size(
+    handle: ViewportHandle,
+    width: f32,
+    height: f32,
+) -> u32 {
+    guard(|| {
+        let mut table = lock_recover(viewports_table());
+        let index = (handle & 0xFFFF_FFFF) as usize;
+        let generation = handle >> 32;
+        let slot = table
+            .get_mut(index)
+            .ok_or_else(|| set_kind(RrkError::invalid("视口句柄越界")))?;
+        if slot.generation != generation {
+            return Err(set_kind(RrkError::invalid("视口句柄已失效（代数不匹配）")));
+        }
+        slot.vp.width = width;
+        slot.vp.height = height;
+        Ok(0)
+    })
+}
+
+/// 更新视口 dpr。
+#[no_mangle]
+pub extern "C" fn rrk_viewport_set_dpr(handle: ViewportHandle, dpr: f32) -> u32 {
+    guard(|| {
+        let mut table = lock_recover(viewports_table());
+        let index = (handle & 0xFFFF_FFFF) as usize;
+        let generation = handle >> 32;
+        let slot = table
+            .get_mut(index)
+            .ok_or_else(|| set_kind(RrkError::invalid("视口句柄越界")))?;
+        if slot.generation != generation {
+            return Err(set_kind(RrkError::invalid("视口句柄已失效（代数不匹配）")));
+        }
+        slot.vp.dpr = dpr;
+        Ok(0)
+    })
 }
 
 /// FFI `align` 整数 → 模型枚举（0=Start 1=Center 2=End 3=Justify，越界按 Start）。
@@ -1645,25 +2055,6 @@ pub unsafe extern "C" fn rrk_load_headings(
     })
 }
 /// 从 FFI 原始参数构造样式（字体名非 UTF-8 → Invalid 参数错误）。
-unsafe fn style_from_raw(
-    font_ptr: *const u8,
-    font_len: usize,
-    font_size: f32,
-    line_height: f32,
-    para_indent_em: f32,
-    align: u32,
-) -> Result<rrk_model::StyleSpec, u32> {
-    let font_family = if font_ptr.is_null() || font_len == 0 {
-        String::new()
-    } else {
-        match std::str::from_utf8(std::slice::from_raw_parts(font_ptr, font_len)) {
-            Ok(s) => s.to_string(),
-            Err(e) => return Err(set_kind(RrkError::invalid(format!("字体名非 UTF-8: {e}")))),
-        }
-    };
-    Ok(style_of(&font_family, font_size, line_height, para_indent_em, align))
-}
-
 /// 排版一章 → 结构化页（三要素缓存口径：C1 内存 → C2 磁盘 → 排版落盘 + 保护窗口）。
 ///
 /// **锁纪律**：先取 `Arc<dyn BookSource>` 出内核锁再干活——载章（解压/清洗）、排版、
@@ -1731,15 +2122,8 @@ fn layout_pages_cached(
 pub unsafe extern "C" fn rrk_pages_json(
     handle: BookHandle,
     chapter_id: u32,
-    font_ptr: *const u8,
-    font_len: usize,
-    font_size: f32,
-    line_height: f32,
-    para_indent_em: f32,
-    align: u32,
-    width: f32,
-    height: f32,
-    dpr: f32,
+    style: StyleHandle,
+    viewport: ViewportHandle,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> u32 {
@@ -1747,8 +2131,8 @@ pub unsafe extern "C" fn rrk_pages_json(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        let style = style_from_raw(font_ptr, font_len, font_size, line_height, para_indent_em, align)?;
-        let vp = rrk_model::Viewport { width, height, dpr };
+        let style = style_spec_of(style)?;
+        let vp = viewport_of(viewport)?;
         let pages = layout_pages_cached(handle, chapter_id, &style, &vp)?;
         write_buf(pages_to_json(&pages), out_ptr, out_len);
         Ok(0)
@@ -1761,15 +2145,8 @@ pub unsafe extern "C" fn rrk_page_at(
     handle: BookHandle,
     chapter_id: u32,
     char_offset: u32,
-    font_ptr: *const u8,
-    font_len: usize,
-    font_size: f32,
-    line_height: f32,
-    para_indent_em: f32,
-    align: u32,
-    width: f32,
-    height: f32,
-    dpr: f32,
+    style: StyleHandle,
+    viewport: ViewportHandle,
     out_page: *mut u32,
 ) -> u32 {
     guard(|| {
@@ -1777,8 +2154,8 @@ pub unsafe extern "C" fn rrk_page_at(
             return Err(set_kind(RrkError::invalid("空指针")));
         }
         // 复用同一排版链路（含缓存），直连结构化数据——不再整章 JSON 序列化后再回扫
-        let style = style_from_raw(font_ptr, font_len, font_size, line_height, para_indent_em, align)?;
-        let vp = rrk_model::Viewport { width, height, dpr };
+        let style = style_spec_of(style)?;
+        let vp = viewport_of(viewport)?;
         let pages = layout_pages_cached(handle, chapter_id, &style, &vp)?;
         let idx =
             rrk_layout::page_at(&pages, rrk_model::SemanticPos { chapter: chapter_id, char_offset })
@@ -1788,35 +2165,28 @@ pub unsafe extern "C" fn rrk_page_at(
     })
 }
 
-/// 把字节偏移向下吸附到最近的 UTF-8 字符边界。
-///
-/// 按字节比例插值时，中文 3 字节 / emoji 4 字节字符的中间字节会被当成
-/// 落点——宿主拿去切字符串即 panic（被 `guard` 兜成 2001）。`is_char_boundary`
-/// 是 O(1)，一个字符最多回退 3 字节；超出章文本长度的偏移先钳到末尾
-/// （末尾本身是合法边界）。
-fn snap_to_char_boundary(off: u32, text: &str) -> u32 {
-    let mut o = (off as usize).min(text.len());
-    while o > 0 && !text.is_char_boundary(o) {
-        o -= 1;
-    }
-    o as u32
-}
-
 /// 页内 x → 字节偏移（纯函数，供 `rrk_hit_test` 与单测共用）。
 ///
-/// 按 run 真实像素宽 `width` 比例插值到字节区间（旧实现硬编码 20px/字 +
-/// 3 字节/字——西文与非默认字号下选区落点全错）。越界钳制：
-/// x 在行首前 → 行首；x 在最右 run 之后 → 行末；y 越界由调用方钳行后传入。
-/// `text` 是章正文，返回值保证落在合法 UTF-8 字符边界上。
+/// **深审 A2 彻底解（RLAY schema 3）**：查页内 **cluster 边界表**——
+/// 排版时把 parley 的字素边界连同其像素 x 一起写进 `TextRun.clusters`，
+/// 落点直接命中最近的合法 UTF-8 边界（parley 的 cluster 本就是字素边界），
+/// 因此**不再需要为吸附边界而载章**（旧实现每次 hit_test 都要过一次
+/// 内容级缓存三段式，miss 时整章 inflate + 清洗只为吸附几个字节）。
+///
+/// 旧实现按字节比例插值：中文 3 字节 / emoji 4 字节会落在字符中间，
+/// 宿主拿去切字符串即 panic（被 `guard` 兜成 2001）；比例插值在西文与
+/// 非默认字号下也整体偏移。
+///
+/// 越界钳制：x 在行首前 → 行首；x 在最右 run 之后 → 行末；
+/// y 越界由调用方钳行后传入。返回值恒为合法 UTF-8 字符边界。
 fn run_offset_at(
     x: f32,
     runs: &[rrk_model::TextRun],
     hit_line: u32,
     hit_range: (u32, u32),
-    text: &str,
 ) -> u32 {
-    let mut best = hit_range.0;
     let mut right_edge = f32::NEG_INFINITY;
+    let mut hit: Option<&rrk_model::TextRun> = None;
     for r in runs.iter() {
         if r.line != hit_line {
             continue;
@@ -1825,22 +2195,29 @@ fn run_offset_at(
         let edge = if r.width > 0.0 { r.x + r.width } else { f32::INFINITY };
         right_edge = right_edge.max(edge);
         if x >= r.x {
-            let len = r.range.1.saturating_sub(r.range.0);
-            let off = if r.width > 0.0 {
-                let ratio = ((x - r.x) / r.width).clamp(0.0, 1.0);
-                (ratio * len as f32) as u32
-            } else {
-                0 // v1 旧缓存无宽度：退化为 run 起点
-            };
-            best = (r.range.0 + off.min(len)).min(hit_range.1);
+            hit = Some(r);
         }
     }
-    let raw = if x > right_edge {
-        hit_range.1 // x 在本行最右 run 之后 → 行末
-    } else {
-        best
+    // x 越到本行最右 run 之后 → 行末（不落到最后一个 cluster 起点）
+    if x > right_edge {
+        return hit_range.1;
+    }
+    let Some(r) = hit else {
+        // x 在本行所有 run 之前 → 行首
+        return hit_range.0;
     };
-    snap_to_char_boundary(raw, text)
+    let clamp = |v: u32| v.clamp(r.range.0, r.range.1).clamp(hit_range.0, hit_range.1);
+    if r.clusters.is_empty() {
+        // 防御性：没有 cluster 表（旧 payload 已被 schema 丢弃，这里只防
+        // 手工构造的 run）→ 退回 run 起点，恒为合法边界。
+        return clamp(r.range.0);
+    }
+    // cluster 表按 x 升序：找最后一个 cx <= x_rel 的项 → 即落点左侧最近的
+    // 合法字符边界。
+    let x_rel = x - r.x;
+    let idx = r.clusters.partition_point(|(_, cx)| *cx <= x_rel);
+    let off = if idx == 0 { r.clusters[0].0 } else { r.clusters[idx - 1].0 };
+    clamp(off)
 }
 
 /// 页内命中测试：(页内 x, y) → 语义偏移（run 级粒度 + run 内比例）。
@@ -1851,15 +2228,8 @@ pub unsafe extern "C" fn rrk_hit_test(
     page_index: u32,
     x: f32,
     y: f32,
-    font_ptr: *const u8,
-    font_len: usize,
-    font_size: f32,
-    line_height: f32,
-    para_indent_em: f32,
-    align: u32,
-    width: f32,
-    height: f32,
-    dpr: f32,
+    style: StyleHandle,
+    viewport: ViewportHandle,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> u32 {
@@ -1867,8 +2237,8 @@ pub unsafe extern "C" fn rrk_hit_test(
         if out_ptr.is_null() || out_len.is_null() {
             return Err(set_kind(RrkError::invalid("空指针")));
         }
-        let style = style_from_raw(font_ptr, font_len, font_size, line_height, para_indent_em, align)?;
-        let vp = rrk_model::Viewport { width, height, dpr };
+        let style = style_spec_of(style)?;
+        let vp = viewport_of(viewport)?;
         let pages = layout_pages_cached(handle, chapter_id, &style, &vp)?;
         let page = pages
             .get(page_index as usize)
@@ -1887,22 +2257,10 @@ pub unsafe extern "C" fn rrk_hit_test(
             }
             y_cursor += l.height;
         }
-        // 吸附到 UTF-8 字符边界需要章正文。走内容级缓存三段式（与
-        // `rrk_load_chapter` 同口径）：锁内查缓存 → miss 出锁载章 → 锁内回填，
-        // 不在内核锁内做 inflate/清洗。这是 RLAY 带 cluster 边界数组之前的
-        // 过渡方案；届时可去掉这次载章，改查页内边界表。
-        let (book, cached, key) =
-            with_kernel(|k| k.chapter_lookup(handle, chapter_id).map_err(set_kind))?;
-        let content = match cached {
-            Some(c) => c,
-            None => {
-                let c = book.load_chapter(chapter_id).map_err(set_kind)?;
-                with_kernel(|k| Ok(k.chapter_store(key, &c)))?;
-                c
-            }
-        };
-        // run 内比例（纯函数抽取，单测钉住；见 run_offset_at 文档）
-        let best = run_offset_at(x, &page.runs, hit_line, hit_range, &content.text);
+        // 深审 A2 彻底解：查页内 cluster 边界表定位，**不载章**
+        // （旧实现每次 hit_test 都要过一次内容级缓存三段式，miss 时整章
+        // inflate + 清洗，只为把字节偏移吸附到字符边界）。
+        let best = run_offset_at(x, &page.runs, hit_line, hit_range);
         let mut out = String::with_capacity(64);
         out.push_str(&format!(
             "{{\"offset\":{},\"line\":{},\"range\":[{},{}]}}",
@@ -1947,20 +2305,13 @@ pub extern "C" fn rrk_layout_cancel_book(handle: BookHandle) -> u32 {
 pub unsafe extern "C" fn rrk_prefetch(
     handle: BookHandle,
     chapter_id: u32,
-    font_ptr: *const u8,
-    font_len: usize,
-    font_size: f32,
-    line_height: f32,
-    para_indent_em: f32,
-    align: u32,
-    width: f32,
-    height: f32,
-    dpr: f32,
+    style: StyleHandle,
+    viewport: ViewportHandle,
 ) -> u32 {
     guard(|| {
         // 当前章与相邻章各排一遍（走缓存链路自动落盘/保护；只排版，不产 JSON、不持内核锁）
-        let style = style_from_raw(font_ptr, font_len, font_size, line_height, para_indent_em, align)?;
-        let vp = rrk_model::Viewport { width, height, dpr };
+        let style = style_spec_of(style)?;
+        let vp = viewport_of(viewport)?;
         for target in [chapter_id.saturating_sub(1), chapter_id, chapter_id + 1] {
             let _ = layout_pages_cached(handle, target, &style, &vp);
         }
