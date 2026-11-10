@@ -18,8 +18,10 @@ import 'package:ffi/ffi.dart';
 /// v10 = rrk_load_headings（issue #13：章标题块轻量出口）；
 /// v11 = rrk_layout_cancel_book（按书取消；并发契约加固 + hit_test 精度）；
 /// v12 = rrk_open_bytes（内存开书）/ rrk_open_index_cache_configure
-///       （open 索引缓存独立开关）/ rrk_cache_set_disk_limit（磁盘配额）。
-const int kRrkAbiVersion = 12;
+///       （open 索引缓存独立开关）/ rrk_cache_set_disk_limit（磁盘配额）；
+/// v13 = 排版参数句柄化（rrk_style_* / rrk_viewport_*）：四个排版出口签名改为
+///       只接 (style, viewport) 句柄；另加段落语义角色（blocks JSON 增 role 字段）。
+const int kRrkAbiVersion = 13;
 
 /// 内核错误（错误码语义见 rrk_model::RrkErrorKind）。
 class RrkException implements Exception {
@@ -79,22 +81,40 @@ typedef _SearchChapterNative = Uint32 Function(Uint64, Uint32, Pointer<Utf8>, In
     Uint32, Uint32, Uint32, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
 typedef _SearchChapterDart = int Function(int, int, Pointer<Utf8>, int, int, int, int,
     Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
-typedef _PagesNative = Uint32 Function(Uint64, Uint32, Pointer<Utf8>, IntPtr, Float, Float,
-    Float, Uint32, Float, Float, Float, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
-typedef _PagesDart = int Function(int, int, Pointer<Utf8>, int, double, double, double, int,
-    double, double, double, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
-typedef _PageAtNative = Uint32 Function(Uint64, Uint32, Uint32, Pointer<Utf8>, IntPtr, Float,
-    Float, Float, Uint32, Float, Float, Float, Pointer<Uint32>);
-typedef _PageAtDart = int Function(int, int, int, Pointer<Utf8>, int, double, double, double,
-    int, double, double, double, Pointer<Uint32>);
-typedef _HitNative = Uint32 Function(Uint64, Uint32, Uint32, Float, Float, Pointer<Utf8>,
-    IntPtr, Float, Float, Float, Uint32, Float, Float, Float, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
-typedef _HitDart = int Function(int, int, int, double, double, Pointer<Utf8>, int, double,
-    double, double, int, double, double, double, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
-typedef _PrefetchNative = Uint32 Function(Uint64, Uint32, Pointer<Utf8>, IntPtr, Float, Float,
-    Float, Uint32, Float, Float, Float);
-typedef _PrefetchDart = int Function(int, int, Pointer<Utf8>, int, double, double, double,
-    int, double, double, double);
+// ABI 13：排版参数句柄化——四个排版出口只接 (style, viewport) 两个句柄。
+typedef _PagesNative = Uint32 Function(Uint64, Uint32, Uint64, Uint64,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PagesDart = int Function(int, int, int, int, Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PageAtNative = Uint32 Function(Uint64, Uint32, Uint32, Uint64, Uint64, Pointer<Uint32>);
+typedef _PageAtDart = int Function(int, int, int, int, int, Pointer<Uint32>);
+typedef _HitNative = Uint32 Function(Uint64, Uint32, Uint32, Float, Float, Uint64, Uint64,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _HitDart = int Function(int, int, int, double, double, int, int,
+    Pointer<Pointer<Uint8>>, Pointer<IntPtr>);
+typedef _PrefetchNative = Uint32 Function(Uint64, Uint32, Uint64, Uint64);
+typedef _PrefetchDart = int Function(int, int, int, int);
+typedef _StyleCreateNative = Uint64 Function(Pointer<Utf8>, IntPtr, Float, Float, Float, Uint32);
+typedef _StyleCreateDart = int Function(Pointer<Utf8>, int, double, double, double, int);
+typedef _StyleDestroyNative = Uint32 Function(Uint64);
+typedef _StyleDestroyDart = int Function(int);
+typedef _StyleSetFontFamilyNative = Uint32 Function(Uint64, Pointer<Utf8>, IntPtr);
+typedef _StyleSetFontFamilyDart = int Function(int, Pointer<Utf8>, int);
+typedef _StyleSetFontSizeNative = Uint32 Function(Uint64, Float);
+typedef _StyleSetFontSizeDart = int Function(int, double);
+typedef _StyleSetLineHeightNative = Uint32 Function(Uint64, Float);
+typedef _StyleSetLineHeightDart = int Function(int, double);
+typedef _StyleSetIndentNative = Uint32 Function(Uint64, Float);
+typedef _StyleSetIndentDart = int Function(int, double);
+typedef _StyleSetAlignNative = Uint32 Function(Uint64, Uint32);
+typedef _StyleSetAlignDart = int Function(int, int);
+typedef _ViewportCreateNative = Uint64 Function(Float, Float, Float);
+typedef _ViewportCreateDart = int Function(double, double, double);
+typedef _ViewportDestroyNative = Uint32 Function(Uint64);
+typedef _ViewportDestroyDart = int Function(int);
+typedef _ViewportSetSizeNative = Uint32 Function(Uint64, Float, Float);
+typedef _ViewportSetSizeDart = int Function(int, double, double);
+typedef _ViewportSetDprNative = Uint32 Function(Uint64, Float);
+typedef _ViewportSetDprDart = int Function(int, double);
 typedef _CacheCfgNative = Uint32 Function(Pointer<Utf8>, IntPtr, IntPtr);
 typedef _CacheCfgDart = int Function(Pointer<Utf8>, int, int);
 typedef _RenderNative = Uint32 Function(
@@ -194,6 +214,26 @@ class _Bindings {
         pageAt = lib.lookupFunction<_PageAtNative, _PageAtDart>('rrk_page_at'),
         hitTest = lib.lookupFunction<_HitNative, _HitDart>('rrk_hit_test'),
         prefetch = lib.lookupFunction<_PrefetchNative, _PrefetchDart>('rrk_prefetch'),
+        styleCreate = lib.lookupFunction<_StyleCreateNative, _StyleCreateDart>('rrk_style_create'),
+        styleDestroy = lib.lookupFunction<_StyleDestroyNative, _StyleDestroyDart>('rrk_style_destroy'),
+        styleSetFontFamily = lib.lookupFunction<_StyleSetFontFamilyNative, _StyleSetFontFamilyDart>(
+            'rrk_style_set_font_family'),
+        styleSetFontSize =
+            lib.lookupFunction<_StyleSetFontSizeNative, _StyleSetFontSizeDart>('rrk_style_set_font_size'),
+        styleSetLineHeight = lib.lookupFunction<_StyleSetLineHeightNative, _StyleSetLineHeightDart>(
+            'rrk_style_set_line_height'),
+        styleSetParaIndentEm = lib.lookupFunction<_StyleSetIndentNative, _StyleSetIndentDart>(
+            'rrk_style_set_para_indent_em'),
+        styleSetAlign =
+            lib.lookupFunction<_StyleSetAlignNative, _StyleSetAlignDart>('rrk_style_set_align'),
+        viewportCreate =
+            lib.lookupFunction<_ViewportCreateNative, _ViewportCreateDart>('rrk_viewport_create'),
+        viewportDestroy =
+            lib.lookupFunction<_ViewportDestroyNative, _ViewportDestroyDart>('rrk_viewport_destroy'),
+        viewportSetSize =
+            lib.lookupFunction<_ViewportSetSizeNative, _ViewportSetSizeDart>('rrk_viewport_set_size'),
+        viewportSetDpr =
+            lib.lookupFunction<_ViewportSetDprNative, _ViewportSetDprDart>('rrk_viewport_set_dpr'),
         cacheConfigure =
             lib.lookupFunction<_CacheCfgNative, _CacheCfgDart>('rrk_cache_configure'),
         renderPage = lib.lookupFunction<_RenderNative, _RenderDart>('rrk_render_page'),
@@ -245,6 +285,19 @@ class _Bindings {
   final _PageAtDart pageAt;
   final _HitDart hitTest;
   final _PrefetchDart prefetch;
+
+  // ABI 13：样式/视口句柄
+  final _StyleCreateDart styleCreate;
+  final _StyleDestroyDart styleDestroy;
+  final _StyleSetFontFamilyDart styleSetFontFamily;
+  final _StyleSetFontSizeDart styleSetFontSize;
+  final _StyleSetLineHeightDart styleSetLineHeight;
+  final _StyleSetIndentDart styleSetParaIndentEm;
+  final _StyleSetAlignDart styleSetAlign;
+  final _ViewportCreateDart viewportCreate;
+  final _ViewportDestroyDart viewportDestroy;
+  final _ViewportSetSizeDart viewportSetSize;
+  final _ViewportSetDprDart viewportSetDpr;
   final _CacheCfgDart cacheConfigure;
   final _RenderDart renderPage;
   final _BufFreeDart bufFree;
@@ -279,6 +332,116 @@ _Bindings get _bindings {
 // ---------------------------------------------------------------------------
 // 引擎
 // ---------------------------------------------------------------------------
+
+/// 排版样式句柄（ABI 13）。
+///
+/// 不透明句柄：宿主只管创建/改字段/释放，不解释其内部。**建议整本复用同一份**
+/// —— 换字号、换字体族、改对齐都是改句柄（setter），不需要重建。
+class RrkStyle {
+  RrkStyle._(this._b, this.handle);
+
+  final _Bindings _b;
+  final int handle;
+
+  /// 创建样式句柄（初始字段一次性给全；之后用 setter 改）。
+  factory RrkStyle({
+    String fontFamily = '',
+    double fontSize = 18.0,
+    double lineHeight = 1.6,
+    double paraIndentEm = 2.0,
+    int align = 0,
+  }) {
+    final b = _bindings;
+    final fontPtr = fontFamily.toNativeUtf8();
+    try {
+      final h = b.styleCreate(fontPtr, utf8.encode(fontFamily).length, fontSize, lineHeight,
+          paraIndentEm, align);
+      if (h == 0) throw RrkEngine._lastError(b);
+      return RrkStyle._(b, h);
+    } finally {
+      malloc.free(fontPtr);
+    }
+  }
+
+  /// 释放句柄（幂等）。
+  void dispose() {
+    if (handle != 0) {
+      _b.styleDestroy(handle);
+    }
+  }
+
+  /// 字体族（空串 = 系统字体栈）。
+  void setFontFamily(String fontFamily) {
+    final fontPtr = fontFamily.toNativeUtf8();
+    try {
+      final code = _b.styleSetFontFamily(handle, fontPtr, utf8.encode(fontFamily).length);
+      if (code != 0) throw RrkEngine._lastError(_b);
+    } finally {
+      malloc.free(fontPtr);
+    }
+  }
+
+  /// 字号（pt）。
+  void setFontSize(double fontSize) {
+    final code = _b.styleSetFontSize(handle, fontSize);
+    if (code != 0) throw RrkEngine._lastError(_b);
+  }
+
+  /// 行高倍数。
+  void setLineHeight(double lineHeight) {
+    final code = _b.styleSetLineHeight(handle, lineHeight);
+    if (code != 0) throw RrkEngine._lastError(_b);
+  }
+
+  /// 首行缩进 em 数（0 = 不缩进）。
+  void setParaIndentEm(double em) {
+    final code = _b.styleSetParaIndentEm(handle, em);
+    if (code != 0) throw RrkEngine._lastError(_b);
+  }
+
+  /// 对齐（0=Start 1=Center 2=End 3=Justify）。
+  void setAlign(int align) {
+    final code = _b.styleSetAlign(handle, align);
+    if (code != 0) throw RrkEngine._lastError(_b);
+  }
+}
+
+/// 排版视口句柄（ABI 13）：CSS 像素尺寸 + dpr。
+///
+/// 窗口旋转 / 分屏改 [setSize]，不重建句柄。
+class RrkViewport {
+  RrkViewport._(this._b, this.handle);
+
+  final _Bindings _b;
+  final int handle;
+
+  /// 创建视口句柄。
+  factory RrkViewport({double width = 390.0, double height = 842.0, double dpr = 3.0}) {
+    final b = _bindings;
+    final h = b.viewportCreate(width, height, dpr);
+    if (h == 0) throw RrkEngine._lastError(b);
+    return RrkViewport._(b, h);
+  }
+
+  /// 释放句柄（幂等）。
+  void dispose() {
+    if (handle != 0) {
+      _b.viewportDestroy(handle);
+    }
+  }
+
+  /// 更新视口尺寸（CSS 像素）。
+  void setSize(double width, double height) {
+    final code = _b.viewportSetSize(handle, width, height);
+    if (code != 0) throw RrkEngine._lastError(_b);
+  }
+
+  /// 更新 dpr。
+  void setDpr(double dpr) {
+    final code = _b.viewportSetDpr(handle, dpr);
+    if (code != 0) throw RrkEngine._lastError(_b);
+  }
+}
 
 class RrkEngine {
   /// 加载原生内核库并校验 ABI 版本。
@@ -1083,58 +1246,37 @@ class RrkBook {
   }
 
   /// 排版一章 → 页数组（几何模式）。
-  List<ReaderPage> pagesOf(
-    int chapterId, {
-    String fontFamily = '',
-    double fontSize = 18.0,
-    double lineHeight = 1.6,
-    double paraIndentEm = 2.0,
-    int align = 0,
-    double width = 390.0,
-    double height = 842.0,
-    double dpr = 3.0,
-  }) {
+  ///
+  /// ABI 13：排版参数走 [RrkStyle] / [RrkViewport] 句柄。宿主应复用同一份
+  /// 句柄（换字号 = 改句柄，不是重建），避免每次调用重建。
+  List<ReaderPage> pagesOf(int chapterId, RrkStyle style, RrkViewport viewport) {
     _check();
     final b = _bindings;
     final outPtr = malloc<Pointer<Uint8>>();
     final outLen = malloc<IntPtr>();
-    final fontPtr = fontFamily.toNativeUtf8();
     try {
-      final code = b.pagesJson(_handle, chapterId, fontPtr, utf8.encode(fontFamily).length, fontSize,
-          lineHeight, paraIndentEm, align, width, height, dpr, outPtr, outLen);
+      final code = b.pagesJson(_handle, chapterId, style.handle, viewport.handle, outPtr, outLen);
       if (code != 0) _throwCode(code);
       final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '[]';
       return (jsonDecode(json) as List<dynamic>)
           .map((e) => ReaderPage._fromJson(e as Map<String, dynamic>))
           .toList();
     } finally {
-      malloc.free(fontPtr);
       malloc.free(outPtr);
       malloc.free(outLen);
     }
   }
 
   /// 语义偏移 → 页下标（进度恢复；缓存命中免排版）。
-  int pageAt(int chapterId, int charOffset,
-      {String fontFamily = '',
-      double fontSize = 18.0,
-      double lineHeight = 1.6,
-      double paraIndentEm = 2.0,
-      int align = 0,
-      double width = 390.0,
-      double height = 842.0,
-      double dpr = 3.0}) {
+  int pageAt(int chapterId, int charOffset, RrkStyle style, RrkViewport viewport) {
     _check();
     final b = _bindings;
-    final fontPtr = fontFamily.toNativeUtf8();
     final out = malloc<Uint32>();
     try {
-      final code = b.pageAt(_handle, chapterId, charOffset, fontPtr, utf8.encode(fontFamily).length,
-          fontSize, lineHeight, paraIndentEm, align, width, height, dpr, out);
+      final code = b.pageAt(_handle, chapterId, charOffset, style.handle, viewport.handle, out);
       if (code != 0) _throwCode(code);
       return out.value;
     } finally {
-      malloc.free(fontPtr);
       malloc.free(out);
     }
   }
@@ -1236,53 +1378,30 @@ class RrkBook {
 
   /// 页内命中测试（页内 x,y → 语义偏移，run 级粒度）。
   (int offset, int line) hitTest(int chapterId, int pageIndex, double x, double y,
-      {String fontFamily = '',
-      double fontSize = 18.0,
-      double lineHeight = 1.6,
-      double paraIndentEm = 2.0,
-      int align = 0,
-      double width = 390.0,
-      double height = 842.0,
-      double dpr = 3.0}) {
+      RrkStyle style,
+      RrkViewport viewport) {
     _check();
     final b = _bindings;
-    final fontPtr = fontFamily.toNativeUtf8();
     final outPtr = malloc<Pointer<Uint8>>();
     final outLen = malloc<IntPtr>();
     try {
-      final code = b.hitTest(_handle, chapterId, pageIndex, x, y, fontPtr, utf8.encode(fontFamily).length,
-          fontSize, lineHeight, paraIndentEm, align, width, height, dpr, outPtr, outLen);
+      final code = b.hitTest(_handle, chapterId, pageIndex, x, y, style.handle, viewport.handle, outPtr, outLen);
       if (code != 0) _throwCode(code);
       final json = RrkEngine._takeBuffer(b, outPtr.value, outLen.value) ?? '{}';
       final m = jsonDecode(json) as Map<String, dynamic>;
       return (m['offset'] as int, m['line'] as int);
     } finally {
-      malloc.free(fontPtr);
       malloc.free(outPtr);
       malloc.free(outLen);
     }
   }
 
   /// 远跳预取：预热本章 + 相邻章（走缓存链路）。
-  void prefetch(int chapterId,
-      {String fontFamily = '',
-      double fontSize = 18.0,
-      double lineHeight = 1.6,
-      double paraIndentEm = 2.0,
-      int align = 0,
-      double width = 390.0,
-      double height = 842.0,
-      double dpr = 3.0}) {
+  void prefetch(int chapterId, RrkStyle style, RrkViewport viewport) {
     _check();
     final b = _bindings;
-    final fontPtr = fontFamily.toNativeUtf8();
-    try {
-      final code = b.prefetch(_handle, chapterId, fontPtr, utf8.encode(fontFamily).length, fontSize,
-          lineHeight, paraIndentEm, align, width, height, dpr);
-      if (code != 0) _throwCode(code);
-    } finally {
-      malloc.free(fontPtr);
-    }
+    final code = b.prefetch(_handle, chapterId, style.handle, viewport.handle);
+    if (code != 0) _throwCode(code);
   }
 
   /// 整页栅格化（PDF 原版页）→ RGBA + 尺寸。

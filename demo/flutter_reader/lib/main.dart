@@ -62,6 +62,15 @@ class _ReaderHomePageState extends State<ReaderHomePage> with WidgetsBindingObse
   bool _isPdf = false;
   final _controller = PageController();
 
+  // ABI 13：排版参数走样式/视口句柄（整本复用同一份，改设置 = 改句柄）
+  RrkStyle? _style;
+  RrkViewport? _viewport;
+
+  RrkStyle get _styleHandle =>
+      _style ??= RrkStyle(fontFamily: _fontFamily, fontSize: _fontSize);
+  RrkViewport get _viewportHandle => _viewport ??=
+      RrkViewport(width: 390, height: 842, dpr: 3.0);
+
   File get _progressFile =>
       File('${Directory.systemTemp.path}/rrk_reader_progress.json');
 
@@ -117,13 +126,8 @@ class _ReaderHomePageState extends State<ReaderHomePage> with WidgetsBindingObse
           _chapterId = m['chapter'] as int;
           final offset = m['offset'] as int;
           _reloadPages();
-          final media = MediaQuery.of(context);
-          final page = _book!.pageAt(_chapterId, offset,
-              fontFamily: _fontFamily,
-              fontSize: _fontSize,
-              width: media.size.width,
-              height: media.size.height,
-              dpr: media.devicePixelRatio);
+          final page = _book!.pageAt(
+              _chapterId, offset, _styleHandle, _viewportHandle);
           if (_controller.hasClients) _controller.jumpToPage(page);
           setState(() => _pageIndex = page);
           return;
@@ -155,21 +159,17 @@ class _ReaderHomePageState extends State<ReaderHomePage> with WidgetsBindingObse
       return;
     }
     final content = book.loadChapter(_chapterId);
-    final pages = book.pagesOf(
-      _chapterId,
-      fontFamily: _fontFamily,
-      fontSize: _fontSize,
-      width: media.size.width,
-      height: media.size.height,
-      dpr: media.devicePixelRatio,
-    );
+    // 视口随窗口尺寸变化 → 改句柄（不重建）
+    _viewportHandle
+      ..setSize(media.size.width, media.size.height)
+      ..setDpr(media.devicePixelRatio);
+    // 样式随用户设置变化 → 改句柄（不重建）
+    _styleHandle
+      ..setFontFamily(_fontFamily)
+      ..setFontSize(_fontSize);
+    final pages = book.pagesOf(_chapterId, _styleHandle, _viewportHandle);
     // 远跳预取：当前 + 相邻章（保护窗口）
-    book.prefetch(_chapterId,
-        fontFamily: _fontFamily,
-        fontSize: _fontSize,
-        width: media.size.width,
-        height: media.size.height,
-        dpr: media.devicePixelRatio);
+    book.prefetch(_chapterId, _styleHandle, _viewportHandle);
     setState(() {
       _chapterText = content.text;
       _pages = pages.map(PageData.fromReaderPage).toList();
@@ -302,7 +302,7 @@ class _ReaderHomePageState extends State<ReaderHomePage> with WidgetsBindingObse
                 Navigator.pop(context);
                 setState(() => _chapterId = c.id);
                 _reloadPages();
-                _book?.prefetch(_chapterId);
+                _book?.prefetch(_chapterId, _styleHandle, _viewportHandle);
               },
             ),
         ],

@@ -49,8 +49,12 @@ void main(List<String> args) {
   final cover = book.cover();
   print('封面: ${cover == null ? "无" : "${cover.length} 字节"}');
 
+  // ABI 13：排版参数走样式/视口句柄（宿主应复用同一份句柄）
+  final style = RrkStyle(fontFamily: '', fontSize: 18.0, lineHeight: 1.6, paraIndentEm: 2.0);
+  final viewport = RrkViewport(width: 390, height: 842, dpr: 3.0);
+
   if (chapters.isNotEmpty) {
-    final pages = book.pagesOf(chapters.length > 1 ? 1 : 0, width: 390, height: 842);
+    final pages = book.pagesOf(chapters.length > 1 ? 1 : 0, style, viewport);
     print('pagesOf: ${pages.length} 页');
     for (final pg in pages.take(2)) {
       print('  页 ${pg.index}: ${pg.lines.length} 行 / ${pg.runs.length} run '
@@ -60,12 +64,31 @@ void main(List<String> args) {
 
   if (chapters.isNotEmpty) {
     final t0 = Stopwatch()..start();
-    final again = book.pagesOf(chapters.length > 1 ? 1 : 0, width: 390, height: 842);
+    final again = book.pagesOf(chapters.length > 1 ? 1 : 0, style, viewport);
     final cachedMs = t0.elapsedMicroseconds / 1000.0;
-    final page = book.pageAt(chapters.length > 1 ? 1 : 0, again.first.start, width: 390, height: 842);
+    final page = book.pageAt(chapters.length > 1 ? 1 : 0, again.first.start, style, viewport);
     print('缓存命中 pagesOf: ${again.length} 页（${cachedMs.toStringAsFixed(1)} ms）; '
-        'pageAt(start)=${page}');
+        'pageAt(start)=$page');
+
+    // 句柄 setter 生效性：改字号 → 排版结果应变化（样式 hash 变 → 缓存失效）
+    style.setFontSize(24.0);
+    final big = book.pagesOf(chapters.length > 1 ? 1 : 0, style, viewport);
+    print('setFontSize(24) 后: ${big.length} 页（原 ${again.length} 页）');
+    style.setFontSize(18.0);
+
+    // 视口 setter 生效性：改宽度 → 页数变化
+    viewport.setSize(768, 500);
+    final wide = book.pagesOf(chapters.length > 1 ? 1 : 0, style, viewport);
+    print('setSize(768x500) 后: ${wide.length} 页');
+    viewport.setSize(390, 842);
+
+    // hitTest：走 cluster 边界表（不载章）
+    final hit = book.hitTest(chapters.length > 1 ? 1 : 0, 0, 10.0, 10.0, style, viewport);
+    print('hitTest(10,10): offset=${hit.$1} line=${hit.$2}');
   }
+
+  style.dispose();
+  viewport.dispose();
 
   book.close();
 
