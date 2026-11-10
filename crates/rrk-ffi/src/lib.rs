@@ -993,6 +993,9 @@ mod tests {
     /// 回归 §二.3：布局结束（drop）后从登记表移除，不泄漏。
     #[test]
     fn layout_run_unregisters_on_drop() {
+        // 全局登记表的测试串行锁：本用例断言 len() 前后相等，并发的
+        // LayoutRun::begin/drop 会改计数 → 偶发红（与 cancel_* 两用例同类）。
+        let _g = lock_recover(&LAYOUT_TABLE_TEST_LOCK);
         let before = lock_recover(&LAYOUTS_ACTIVE).len();
         {
             let _r = LayoutRun::begin(33);
