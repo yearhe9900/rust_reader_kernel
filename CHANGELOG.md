@@ -63,6 +63,17 @@ C 头文件与预编译原生库必须同步升级。
 - **模型变体普查（深审 C6）**：`Inline` / `Block` 新增无通配 `variant_name`；
   `rrk-layout::layout_inlines` 改穷举 `match`（行内图显式分支，不再被
   `if let` 静默丢弃）；新增单测钉住「每个变体至少被一条降维管线消费」。
+- **按需读取抽象（深审 B1 ②，批次 5，无 ABI 变更）**：新增 `rrk-source` crate，
+  定义 `ByteSource` trait（`len` + `read_at`）与两个实现——`FileSource`
+  （`seek+read` 定位读，路径源不再 `std::fs::read` 整包入堆）与 `MemSource`
+  （切片零拷贝）。`ContentSource::to_source()` 把路径/内存源统一转成按需源；
+  `ContentSource::content_fingerprint()` 改走**流式**全量哈希——峰值内存只有
+  1 MiB 块，与整包哈希**同值**（路径/内存源共享缓存键）。`ZipArchive` 从持有
+  整包 `Arc<[u8]>` 改为**只驻留中央目录**，条目数据按需 `read_at` + inflate
+  （读完即弃）。EPUB/CBZ 改走此路径：实测 37 MiB CBZ 开书 RSS 增量从 ≈100%
+  （整包驻留）降到 0.72%（272 KiB），**约 137× 下降**；2GB CBZ 不再 OOM。
+  新增多个回归：按需读不整包拉取、路径/内存源指纹同值、路径/内存开书内容一致、
+  计数源证明「开书+读 1 条」请求量远小于整包。
 
 ### Changed
 
@@ -75,6 +86,10 @@ C 头文件与预编译原生库必须同步升级。
   `.lock().unwrap()`（含测试模块），新增源码扫描测试禁止回潮；`CONTRIBUTING`
   明确写清 **panic clippy 红线只作用于 `rrk-ffi`**，CI 另加全 workspace clippy
   （不启用 FFI 专属红线），消除门禁口径歧义。
+- **`ContentSource::read_all` 降级为「整包驻留，仅小文件用」（批次 5）**：
+  大文件（尤其 CBZ）必须由 `to_source()` + 按需读替代，否则整包入堆 OOM；
+  `read_all` 调用点加 ⚠️ 注释，MOBI/PDF/TXT 暂保留整包（解析模型为顺序扫全文件，
+  留待后续批次；EPUB/CBZ 已迁按需读）。
 
 ### Fixed
 
@@ -96,14 +111,17 @@ C 头文件与预编译原生库必须同步升级。
   列表/引用/代码/表格不带；`<br>` 与行内 `<img>` 切出的后续段自动不重复缩进。
   不动 `Block` 模型（段落语义角色的彻底解留待 ABI 版本窗口）。
 
-验证：`cargo test --workspace` 全绿（Unreleased 累计新增 11 个回归测试：
+验证：`cargo test --workspace` 全绿（Unreleased 累计新增 16 个回归测试：
 内存开书对拍 / 磁盘配额裁剪 / open 索引开关解绑 / 配额出口可调用 /
 缓冲长度自记（2 例）/ 忙槽跳过 / 锁纪律与红线声明扫描（2 例）/
-模型变体普查 / 200 章规模化语料）；FFI clippy 红线、全 workspace clippy、`cbindgen --verify` 头文件漂移校验、`dart analyze`、
-`bash scripts/check-abi.sh` 全部通过；`dart run example/smoke.dart` 在 Windows
-上用 TXT / EPUB / CBZ 三种样张走通全链路，含 ABI 12 三个新出口与内存开书按
-扩展名嗅探。`scripts/corpus_check.sh` 另在 7.1MB / 1152 章真实 EPUB 上实跑
-首 / 中 / 尾章抽样通过。
+模型变体普查 / 200 章规模化语料 / 按需读不整包拉取 / 计数源证明按需读 /
+路径-内存源指纹同值（2 例：EPUB+CBZ）/ 路径-内存开书内容一致（EPUB+CBZ））；
+FFI clippy 红线、全 workspace clippy、`cbindgen --verify` 头文件漂移校验、
+`dart analyze`、`bash scripts/check-abi.sh` 全部通过；`dart run example/smoke.dart`
+在 Windows 上用 TXT / EPUB / CBZ 三种样张走通全链路，含 ABI 13 句柄 API
+（`RrkStyle`/`RrkViewport` setter 与 `hitTest` 不载章）。`scripts/corpus_check.sh`
+另在 7.1MB / 1152 章真实 EPUB 与本地生成的 37 MiB / 60 页大 CBZ 上实跑首 / 中 /
+尾章抽样通过；`rrk-inspect --mem` 实测大 CBZ 开书 RSS 增量仅 272 KiB（占书 0.72%）。
 
 ## [0.4.0] - 2026-11-04
 
