@@ -816,6 +816,7 @@ dependencies = [
  "rrk-format",
  "rrk-markup",
  "rrk-model",
+ "rrk-source",
  "rrk-txt",
 ]
 

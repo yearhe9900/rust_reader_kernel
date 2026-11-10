@@ -11,4 +11,5 @@ rrk-format.workspace = true
 rrk-cache.workspace = true
 rrk-markup.workspace = true
 rrk-txt.workspace = true
+rrk-source.workspace = true
 encoding_rs.workspace = true
