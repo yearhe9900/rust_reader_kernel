@@ -861,6 +861,7 @@ dependencies = [
  "rrk-cache",
  "rrk-format",
  "rrk-model",
+ "rrk-source",
 ]
 
 [[package]]

@@ -319,13 +319,25 @@ impl TxtBook {
     /// 解码 + 分章 + 逻辑块切分；章表（open 索引）按内容 key 持久化——
     /// 重开命中免 scan_lines 全书扫描与逻辑块切分（open 期免重建）。
     pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
-        let bytes = src.read_all()?;
-        if bytes.len() > 512 * 1024 * 1024 {
+        // 批次 5：内容版本指纹走流式全量哈希（峰值 1 MiB，与整包哈希同值，
+        // 路径/内存源共享缓存键）。TXT 解码需要全文，故内容仍整包读入——
+        // 读取与指纹统一走 to_source()/SourceReader 按需读路径。
+        let content_hash = src.content_fingerprint()?;
+        let source = src.to_source()?;
+        if source.len() > 512 * 1024 * 1024 {
             return Err(RrkError::new(
                 rrk_model::RrkErrorKind::ResourceLimit,
                 "TXT 超过 512MB 上限",
             ));
         }
+        // 读入解码所需全部字节（SourceReader 按需读路径；解码后 raw 即弃，
+        // 稳定态内存 = 解码后的 text）。
+        let mut bytes = Vec::with_capacity(source.len() as usize);
+        {
+            let mut reader = rrk_source::SourceReader::new(source);
+            std::io::Read::read_to_end(&mut reader, &mut bytes)?;
+        }
+        let bytes = Arc::<[u8]>::from(bytes);
         let head = &bytes[..bytes.len().min(64 * 1024)];
         let guess = detect_encoding(head);
         let text = decode_text(&bytes, guess)?;
@@ -335,7 +347,6 @@ impl TxtBook {
             .map(|n| n.rsplit_once('.').map(|(s, _)| s).unwrap_or(n).to_string())
             .unwrap_or_else(|| "未命名".to_string());
 
-        let content_hash = rrk_format::content_fingerprint(&bytes);
         let entries = {
             let key = CacheKey::content(content_hash, CacheKind::OpenTxt);
             cache
@@ -864,5 +875,55 @@ mod tests {
         cache.save(&key, b"garbage-not-a-payload");
         let book = TxtBook::parse_with_cache(&src, &cache).unwrap();
         assert!(!book.entries.is_empty(), "损坏载荷应丢弃重算");
+    }
+
+    /// 批次 5（TXT）：**路径源与内存源的指纹必须同值**——流式指纹
+    /// （`content_fingerprint`）与整包哈希一致，否则同一本书走两条路开会
+    /// 命中不同缓存（读旧内容）。
+    #[test]
+    fn path_and_memory_sources_share_fingerprint() {
+        let bytes = "序言\n\n第一章 开始\n\n正文一\n\n第二章 继续\n\n正文二\n".as_bytes();
+        let dir = std::env::temp_dir().join("rrk_txt_fp");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 唯一文件名：并行测试不抢句柄（Windows 尤甚）
+        let path = dir.join(format!("t_fp_{}.txt", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+
+        let path_src = ContentSource::from_path(&path);
+        let mem_src =
+            ContentSource::from_bytes(Some("t.txt".into()), Arc::<[u8]>::from(bytes.to_vec()));
+        assert_eq!(
+            path_src.content_fingerprint().unwrap(),
+            mem_src.content_fingerprint().unwrap(),
+            "路径源（流式哈希）与内存源（整包哈希）指纹必须一致"
+        );
+        assert_eq!(
+            path_src.content_fingerprint().unwrap(),
+            rrk_format::content_fingerprint(bytes),
+            "流式指纹须与整包指纹同值"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 批次 5（TXT）：路径开书（按需读路径）与内存开书的**内容完全一致**。
+    #[test]
+    fn path_and_memory_open_agree() {
+        let bytes = "序言\n\n第一章 开始\n\n这是正文内容。\n".as_bytes();
+        let dir = std::env::temp_dir().join("rrk_txt_path");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("t_open_{}.txt", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+
+        let from_path = TxtBook::parse(&ContentSource::from_path(&path)).unwrap();
+        let from_mem = TxtBook::parse(&ContentSource::from_bytes(
+            Some("t.txt".into()),
+            Arc::<[u8]>::from(bytes.to_vec()),
+        ))
+        .unwrap();
+
+        assert_eq!(from_path.meta().content_hash, from_mem.meta().content_hash);
+        assert_eq!(from_path.text, from_mem.text, "路径开书与内存开书的正文必须一致");
+        assert_eq!(from_path.entries, from_mem.entries);
+        std::fs::remove_file(&path).ok();
     }
 }
