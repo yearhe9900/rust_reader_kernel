@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+**ABI 12 → 13**（**破坏性**：四个排版出口签名改为只接样式/视口句柄）：
+
+- `rrk_style_create` / `rrk_style_destroy` / `rrk_style_set_font_family` /
+  `rrk_style_set_font_size` / `rrk_style_set_line_height` /
+  `rrk_style_set_para_indent_em` / `rrk_style_set_align`
+- `rrk_viewport_create` / `rrk_viewport_destroy` / `rrk_viewport_set_size` /
+  `rrk_viewport_set_dpr`
+- `rrk_pages_json` / `rrk_page_at` / `rrk_hit_test` / `rrk_prefetch`
+  签名由「9 个排版参数」改为「(style, viewport) 两个句柄」
+
+宿主侧：Dart 封装 `kRrkAbiVersion = 13`，新增 `RrkStyle` / `RrkViewport` 两个
+不透明句柄类；`pagesOf` / `pageAt` / `hitTest` / `prefetch` 改为接句柄。
+C 头文件与预编译原生库必须同步升级。
+
 **ABI 11 → 12**（增量：新符号 `rrk_open_bytes` / `rrk_open_index_cache_configure` /
 `rrk_cache_set_disk_limit`，既有符号与语义不变）：Dart 封装
 （`kRrkAbiVersion = 12`）、C 头文件与预编译原生库必须同步升级。

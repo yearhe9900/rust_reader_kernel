@@ -85,6 +85,28 @@
 布局 / 内容级 / open 索引三类缓存默认均不落盘：内核不擅自创建缓存目录，
 落盘策略由宿主显式开启（红线）。配额出口只设上限、不会自己创建目录。
 
+**排版参数面（v13，破坏性）**：
+
+四个排版出口（`rrk_pages_json` / `rrk_page_at` / `rrk_hit_test` /
+`rrk_prefetch`）的签名由「9 个排版参数」改为「`(style, viewport)` 两个句柄」：
+
+| 出口 | 语义 |
+|------|------|
+| `rrk_style_create(font, size, lh, indent, align)` | 创建样式句柄（**0 = 失败**，错误详情仍走 `rrk_last_error`）；`rrk_style_destroy` 释放 |
+| `rrk_style_set_font_family` / `_font_size` / `_line_height` / `_para_indent_em` / `_align` | 改样式字段——**加新样式字段 = 加 setter，四个出口签名不动**（这正是句柄化的目的） |
+| `rrk_viewport_create(w, h, dpr)` / `rrk_viewport_destroy` | 创建/释放视口句柄 |
+| `rrk_viewport_set_size` / `_set_dpr` | 改视口（窗口旋转 / 分屏，不重建句柄） |
+
+要点：
+
+- 句柄**不透明**（`uint64_t`），宿主不解释其内部；`0` 永远非法；
+- 句柄同样带 **generation**（ABA 防护）：销毁后槽位被复用，旧句柄值不同、
+  且旧句柄**不再有效**（返回错误，不是读到别人的样式）；
+- 建议宿主**整本复用同一份样式/视口句柄**：改设置 = 调 setter，不要重建；
+- 句柄表是进程级全局，可跨线程使用（内部互斥保护）；
+- v12 及以前的四个出口签名已**移除**——宿主必须同步升级封装与原生库
+  （`RrkEngine.init` 相等校验，无灰度窗口）。
+
 ## 6. 坐标系速查
 
 | 坐标 | 定义 | 相互转换 |
