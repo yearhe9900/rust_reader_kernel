@@ -139,12 +139,12 @@ impl EpubBook {
     /// open 索引（entries + toc_raw）按内容 key 持久化——重开命中免
     /// nav/NCX 解析、标题回填与正文前缀探测（open 期免重建）。
     pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
-        let bytes = src.read_all()?;
-        // 内容版本指纹须在 bytes 被 ZipArchive::parse 消耗前，取原始文件全量：
-        // 旧口径只哈希 OPF 前 64KB，正文改动不会让持久化缓存失效，
-        // 重开会命中旧章表/旧章文本（用户读到旧内容）。
-        let content_hash = rrk_format::content_fingerprint(&bytes);
-        let zip = Arc::new(ZipArchive::parse(bytes)?);
+        // 批次 5（深审 B1 ②）：**按需读取**——不把整本书读进内存。
+        // - 内容版本指纹走**流式**全量哈希（与整包哈希同值）：任意字节变动
+        //   必失效（保证缓存不读旧内容），但峰值内存只有 1 MiB 块；
+        // - zip 只驻留中央目录，章正文按需读、按需解压。
+        let content_hash = src.content_fingerprint()?;
+        let zip = Arc::new(ZipArchive::open(src.to_source()?)?);
 
         // DRM 探测：正文被加密 → 明确拒绝（字体伪装除外，P0 一律拒绝 EncryptedData）
         if let Some(enc) = zip.entry("META-INF/encryption.xml") {
@@ -1282,6 +1282,69 @@ mod tests {
         let items = parse_nav_toc(xml);
         let titles: Vec<_> = items.iter().map(|i| i.title.as_str()).collect();
         assert_eq!(titles, vec!["第一章", "无type宽容"], "landmarks/page-list 应被过滤: {titles:?}");
+    }
+
+    /// 批次 5（深审 B1 ②）：**路径源与内存源的指纹必须同值**——
+    /// 否则同一本书走两条路开会命中不同缓存（读旧内容）。
+    #[test]
+    fn path_and_memory_sources_share_fingerprint() {
+        let bytes = build_zip(&[
+            ("META-INF/container.xml", CONTAINER.as_bytes()),
+            ("OEBPS/content.opf", OPF.as_bytes()),
+            ("OEBPS/text/ch1.xhtml", "<html><body><p>测试</p></body></html>".as_bytes()),
+        ]);
+        let dir = std::env::temp_dir().join("rrk_epub_fp");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 唯一文件名：测试并行跑时同名文件会互相覆盖/抢句柄（Windows 尤甚）
+        let path = dir.join(format!("t_fp_{}.epub", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let path_src = ContentSource::from_path(&path);
+        let mem_src = ContentSource::from_bytes(
+            Some("t.epub".to_string()),
+            Arc::<[u8]>::from(bytes.clone().into_boxed_slice()),
+        );
+        assert_eq!(
+            path_src.content_fingerprint().unwrap(),
+            mem_src.content_fingerprint().unwrap(),
+            "路径源（流式哈希）与内存源（整包哈希）指纹必须一致"
+        );
+        // 且与整包口径同值
+        assert_eq!(
+            path_src.content_fingerprint().unwrap(),
+            rrk_format::content_fingerprint(&bytes),
+            "流式指纹须与整包指纹同值"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 批次 5：路径开书（按需读）与内存开书的**内容完全一致**。
+    #[test]
+    fn path_and_memory_open_agree() {
+        let bytes = build_zip(&[
+            ("META-INF/container.xml", CONTAINER.as_bytes()),
+            ("OEBPS/content.opf", OPF.as_bytes()),
+            ("OEBPS/text/ch1.xhtml", "<html><body><p>测试正文</p></body></html>".as_bytes()),
+            ("OEBPS/images/pic.png", b"\x89PNG-fake"),
+        ]);
+        let dir = std::env::temp_dir().join("rrk_epub_path");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("t_open_{}.epub", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let from_path = EpubBook::parse(&ContentSource::from_path(&path)).unwrap();
+        let from_mem = EpubBook::parse(&ContentSource::from_bytes(
+            Some("t.epub".to_string()),
+            Arc::<[u8]>::from(bytes.clone().into_boxed_slice()),
+        ))
+        .unwrap();
+
+        assert_eq!(from_path.meta().content_hash, from_mem.meta().content_hash);
+        assert_eq!(from_path.chapters().unwrap().len(), from_mem.chapters().unwrap().len());
+        let a = from_path.load_chapter(0).unwrap();
+        let b = from_mem.load_chapter(0).unwrap();
+        assert_eq!(a.text, b.text, "路径开书与内存开书的正文必须一致");
+        std::fs::remove_file(&path).ok();
     }
 
     /// 回归（深审 A1）：**OPF 逐字节不变、只改章节正文**时，内容版本指纹必须改变。

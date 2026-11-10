@@ -746,6 +746,7 @@ version = "0.4.0"
 dependencies = [
  "rrk-cache",
  "rrk-model",
+ "rrk-source",
 ]
 
 [[package]]
@@ -845,6 +846,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rrk-source"
+version = "0.4.0"
+dependencies = [
+ "rrk-model",
+]
+
+[[package]]
 name = "rrk-txt"
 version = "0.4.0"
 dependencies = [
@@ -862,6 +870,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "rrk-model",
+ "rrk-source",
 ]
 
 [[package]]

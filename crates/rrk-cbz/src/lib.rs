@@ -222,11 +222,13 @@ impl CbzBook {
     /// 页表（open 索引：页序 + 尺寸表）按内容 key 持久化——重开命中免
     /// `collect_pages`（归一化/去重/自然序）与逐页尺寸头探测（限流 inflate）。
     pub fn parse_with_cache(src: &ContentSource, cache: &dyn IndexCache) -> RrkResult<Self> {
-        let bytes = src.read_all()?;
-        // 全量内容版本指纹（含所有页字节）：只取前 1MB 时，改后面的页
-        // 不会让持久化页表缓存失效。
-        let content_hash = rrk_format::content_fingerprint(&bytes);
-        let zip = Arc::new(ZipArchive::parse(bytes)?);
+        // 批次 5（深审 B1 ②）：**按需读取**——2GB CBZ 的 OOM 根因就是
+        // `std::fs::read` 整包入堆。现在：
+        // - 内容版本指纹走**流式**全量哈希（与整包哈希同值）：含所有页字节，
+        //   改后面的页必让持久化页表缓存失效，但峰值内存只有 1 MiB 块；
+        // - zip 只驻留中央目录，页图片按需读、按需解压（读一张即弃）。
+        let content_hash = src.content_fingerprint()?;
+        let zip = Arc::new(ZipArchive::open(src.to_source()?)?);
 
         let key = CacheKey::content(content_hash, CacheKind::OpenCbz);
         let (pages, sizes) = match cache
@@ -475,6 +477,37 @@ impl BookSource for CbzBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 批次 5：路径开书（按需读）与内存开书的**内容与指纹完全一致**。
+    #[test]
+    fn path_and_memory_open_agree() {
+        let bytes = build_cbz(&["a.png", "b.png"]);
+        let dir = std::env::temp_dir().join("rrk_cbz_path");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("t_open_{}.cbz", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let from_path = CbzBook::parse(&ContentSource::from_path(&path)).unwrap();
+        let from_mem = CbzBook::parse(&ContentSource::from_bytes(
+            Some("t.cbz".to_string()),
+            Arc::<[u8]>::from(bytes.clone().into_boxed_slice()),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            rrk_format::BookSource::meta(&from_path).content_hash,
+            rrk_format::BookSource::meta(&from_mem).content_hash
+        );
+        assert_eq!(
+            rrk_format::BookSource::chapters(&from_path).unwrap().len(),
+            rrk_format::BookSource::chapters(&from_mem).unwrap().len()
+        );
+        // 页资源字节也要一致（CBZ 的资源 key 口径是 "page:<下标>"）
+        let a = from_path.load_resource(&ResourceKey("page:0".into())).unwrap();
+        let b = from_mem.load_resource(&ResourceKey("page:0".into())).unwrap();
+        assert_eq!(a.data.as_ref(), b.data.as_ref());
+        std::fs::remove_file(&path).ok();
+    }
 
     /// 造一个最小 **stored**（不压缩）zip：本地头 + 数据 + 中央目录 + EOCD。
     /// 只为页表口径用例服务，不引 zip 编码依赖。

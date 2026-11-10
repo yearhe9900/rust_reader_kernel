@@ -7,5 +7,6 @@ description = "Rust 阅读内核：自研 zip 随机读（EPUB/CBZ 共用；仅 
 
 [dependencies]
 rrk-model.workspace = true
+rrk-source.workspace = true
 flate2.workspace = true
 encoding_rs.workspace = true

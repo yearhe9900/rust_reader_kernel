@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! rrk-inspect <书路径> [--toc] [--chapter N] [--blocks N] [--weights]
-//!            [--search 词] [--bm25 词] [--render N --out x.png]
+//!            [--search 词] [--bm25 词] [--render N --out x.png] [--mem]
 //! ```
 //!
 //! 输出：元数据 / 目录 / 章索引 / 指定章的 Block 流预览，附耗时打点。
@@ -16,6 +16,8 @@ use rrk_format::{BookSource, ContentSource, FormatRegistry};
 use rrk_model::{Block, ChapterKind, Inline};
 use rrk_search::{search_text, Bm25, Bm25Builder, SearchOptions, SearchSession};
 use rrk_txt::TxtAdapter;
+
+mod mem;
 
 fn build_registry() -> FormatRegistry {
     let mut reg = FormatRegistry::new();
@@ -71,12 +73,17 @@ fn run() -> Result<(), String> {
         .find(|w| w[0] == "--bm25")
         .map(|w| w[1].clone());
 
+    // 内存基线（批次 5）：开书前后的 RSS 增量 vs 书大小
+    let show_mem = args.iter().any(|a| a == "--mem");
+
     let reg = build_registry();
     let src = ContentSource::from_path(path);
 
+    let rss_before = if show_mem { mem::current_rss() } else { None };
     let t0 = Instant::now();
     let book: Arc<dyn BookSource> = Arc::from(reg.open(&src).map_err(|e| e.to_string())?);
     let open_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let rss_after = if show_mem { mem::current_rss() } else { None };
 
     let meta = book.meta();
     println!("== 书目 ==");
@@ -92,6 +99,30 @@ fn run() -> Result<(), String> {
     println!("格式      : {}", meta.format);
     println!("内容哈希  : {:016x}", meta.content_hash);
     println!("打开耗时  : {open_ms:.1} ms");
+
+    if show_mem {
+        let size = mem::file_size(std::path::Path::new(path));
+        println!("\n== 内存基线 ==");
+        if let Some(sz) = size {
+            println!("书大小    : {}", mem::human(sz));
+        }
+        match (rss_before, rss_after) {
+            (Some(b), Some(a)) => {
+                let delta = a.saturating_sub(b);
+                println!("开书 RSS  : {} → {}", mem::human(b), mem::human(a));
+                println!("RSS 增量  : {}", mem::human(delta));
+                if let Some(sz) = size {
+                    if sz > 0 {
+                        println!(
+                            "占书比例  : {:.2}%（整包驻留口径 ≈ 100%）",
+                            delta as f64 * 100.0 / sz as f64
+                        );
+                    }
+                }
+            }
+            _ => println!("RSS       : 本平台不可用（不伪造数字）"),
+        }
+    }
 
     let t1 = Instant::now();
     let chapters = book.chapters().map_err(|e| e.to_string())?;

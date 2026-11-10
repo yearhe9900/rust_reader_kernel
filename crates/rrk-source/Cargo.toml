@@ -1,0 +1,9 @@
+[package]
+name = "rrk-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust 阅读内核：内容源抽象（按需读取 ByteSource：路径 seek+read / 内存切片）"
+
+[dependencies]
+rrk-model.workspace = true

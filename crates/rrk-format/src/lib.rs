@@ -40,7 +40,37 @@ impl ContentSource {
         }
     }
 
-    /// 读入全部字节（P0 简化实现；mmap 化在 P2 落盘档接入）。
+    /// 转成**按需读取**的源（批次 5）。
+    ///
+    /// - 路径源 → [`rrk_source::FileSource`]：`seek + read` 定位读，
+    ///   **整包不驻留**（2GB CBZ 的 OOM 根因就是 `std::fs::read`）；
+    /// - 内存源 → [`rrk_source::MemSource`]：切片零拷贝。
+    ///
+    /// 指纹改用 [`rrk_source::fingerprint_of`]（流式增量哈希，与整包哈希同值），
+    /// 因此「不整包驻留」与「任意字节变动必失效」两个要求同时成立。
+    pub fn to_source(&self) -> RrkResult<Arc<dyn rrk_source::ByteSource>> {
+        match self {
+            ContentSource::Path(p) => {
+                Ok(Arc::new(rrk_source::FileSource::open(p)?) as Arc<dyn rrk_source::ByteSource>)
+            }
+            ContentSource::Bytes { data, .. } => {
+                Ok(Arc::new(rrk_source::MemSource::new(Arc::clone(data)))
+                    as Arc<dyn rrk_source::ByteSource>)
+            }
+        }
+    }
+
+    /// 内容指纹（**流式**：峰值内存 = 1 MiB 块，与文件大小无关）。
+    ///
+    /// 与 [`content_fingerprint`]（整包）**同值**——路径源与内存源共享缓存键。
+    pub fn content_fingerprint(&self) -> RrkResult<u64> {
+        let src = self.to_source()?;
+        rrk_source::fingerprint_of(src.as_ref())
+    }
+
+    /// 读入全部字节（**整包驻留**，仅小文件/确需整包的场景用）。
+    ///
+    /// ⚠️ 大文件请改用 [`ContentSource::to_source`] + 按需读。
     pub fn read_all(&self) -> RrkResult<Arc<[u8]>> {
         match self {
             ContentSource::Path(p) => {
