@@ -29,6 +29,14 @@ C 头文件与预编译原生库必须同步升级。
 但 `content_hash` 口径改变会让**已落盘的旧缓存自动失效重算一次**——
 这是预期行为，无需宿主迁移。
 
+**PDF 暂停、入口关闭**（核心能力下线，**无 ABI 变更**）：内核
+`shared_registry()` 不再注册 `PdfAdapter`，inspect CLI 同步关闭——开 PDF 返回
+`[1002] 无法识别的格式`，所有 PDF 能力（open / meta / toc / 页级视图 / 栅格化 /
+资源封面）随之不可达。`rrk-pdf` crate 代码保留（**暂停非删除**），恢复时在
+kernel `shared_registry()` 与 inspect `build_registry()` 重新 `register` 即可。
+EPUB/TXT/MOBI/AZW3/CBZ 不受影响（CBZ 的 `as_paged()` 页级出口照常）。
+CI 移除 `rrk-inspect fixtures/sample.pdf` 冒烟行。
+
 ### Added
 
 - **内存开书（深审 B1）**：`rrk_open_bytes(data, len, name, name_len)` 把

@@ -28,11 +28,11 @@ jobs:
       - name: 全 workspace clippy（不启用 FFI 专属红线，口径见 CONTRIBUTING §架构约束 6）
         run: cargo clippy --workspace --no-deps
       - name: rrk-inspect 冒烟（样张）
+        # PDF 暂停、入口关闭：不再冒烟 fixtures/sample.pdf（inspect 已打不开 PDF）
         run: |
           cargo build --release -p rrk-inspect
           ./target/release/rrk-inspect fixtures/sample.epub >/dev/null
           ./target/release/rrk-inspect fixtures/sample.cbz >/dev/null
-          ./target/release/rrk-inspect fixtures/sample.pdf >/dev/null
       - name: 规模化语料回归（深审 C4：200 章嵌套目录 + 内链 + 索引往返）
         # 有版权真书不入库；本测试用确定性生成的合成大书挡索引重建类回归
         run: cargo test -p rrk-epub corpus_scale -- --nocapture

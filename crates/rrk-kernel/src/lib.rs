@@ -17,7 +17,6 @@ use rrk_model::{
     flatten_blocks_spans, Block, BookKind, ChapterContent, ChapterEntry, ChapterKind, Inline,
     RrkError, RrkResult, TocNode,
 };
-use rrk_pdf::PdfAdapter;
 use rrk_search::{search_text, Bm25, Bm25Builder, SearchOptions, SearchPage, SearchSession};
 use rrk_txt::TxtAdapter;
 
@@ -149,7 +148,10 @@ pub fn shared_registry() -> &'static FormatRegistry {
         registry.register(Box::new(MobiAdapter));
         // 页级格式也进统一句柄：重排视图（页=章）+ 固定版式视图（as_paged）
         registry.register(Box::new(CbzAdapter));
-        registry.register(Box::new(PdfAdapter));
+        // PDF 暂停、入口关闭（核心能力下线）：不注册 PdfAdapter → detect 不命中，
+        // 开 PDF 返回「无法识别的格式」，所有 PDF 能力（open/meta/toc/页级/栅格化/
+        // 资源）随之不可达。rrk-pdf crate 代码保留（暂停非删除）；恢复时在此
+        // 重新 register(Box::new(rrk_pdf::PdfAdapter)) +顶部 use 即可。
         registry
     })
 }

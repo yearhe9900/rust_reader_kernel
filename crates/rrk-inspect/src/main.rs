@@ -25,7 +25,8 @@ fn build_registry() -> FormatRegistry {
     reg.register(Box::new(TxtAdapter));
     reg.register(Box::new(rrk_mobi::MobiAdapter));
     reg.register(Box::new(rrk_cbz::CbzAdapter));
-    reg.register(Box::new(rrk_pdf::PdfAdapter));
+    // PDF 暂停、入口关闭（与内核 shared_registry 同口径）：不注册 PdfAdapter，
+    // inspect 打不开 PDF（样张冒烟随之移除）。恢复时重新 register 即可。
     reg
 }
 
